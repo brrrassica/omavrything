@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "id": "omavrything",
+  "name": "omavrything",
+  "version": "0.1.0",
+  "author": "omavrything",
+  "description": "Instant, index-backed file search for Omarchy (Everything for Linux)",
+  "kinds": ["bar-widget", "overlay", "service"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "barWidget": "SearchBar.qml",
+    "overlay": "SearchOverlay.qml",
+    "service": "Service.qml"
+  },
+  "barWidget": {
+    "displayName": "omavrything search",
+    "description": "Instant file search",
+    "category": "Utilities",
+    "allowMultiple": false,
+    "defaultSection": "center",
+    "defaults": {
+      "width": 520,
+      "maxResults": 8
+    },
+    "schema": [
+      { "key": "width", "type": "number", "label": "Result window width" },
+      { "key": "maxResults", "type": "number", "label": "Max results" }
+    ]
+  }
+}

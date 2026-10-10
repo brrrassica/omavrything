@@ -33,6 +33,25 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
+## Shell plugin (omarchy-shell)
+
+The search UI is an `omarchy-shell` plugin (Quickshell/QML). Install and enable
+it with:
+
+```sh
+scripts/install-plugin.sh
+omarchy plugin enable omavrything --section center
+```
+
+Then bind a hotkey in `~/.config/hypr/bindings.lua`:
+
+```lua
+o.bind("SUPER + SHIFT + SPACE", "Search files", "omarchy-shell omavrything focus")
+```
+
+See [`docs/omarchy-shell-integration.md`](docs/omarchy-shell-integration.md) for
+the plugin structure and the focus constraint that shapes it.
+
 ## Target platform
 
 Omarchy Quattro (4.x) only, maybe several versions up. Hyprland, `omarchy-shell` (Quickshell), Arch Linux.
