@@ -13,6 +13,11 @@ set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 src="$here/shell/omavrything"
+# A packaged install places this helper in /usr/bin and the plugin in
+# /usr/share/omavrything/shell/omavrything, so fall back to that layout.
+if [[ ! -f "$src/manifest.json" && -f /usr/share/omavrything/shell/omavrything/manifest.json ]]; then
+  src=/usr/share/omavrything/shell/omavrything
+fi
 dest="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/omavrything"
 
 if [[ ! -f "$src/manifest.json" ]]; then
@@ -25,15 +30,18 @@ cp -f "$src"/*.qml "$src"/manifest.json "$dest"/
 echo "Installed plugin to $dest"
 
 # The settings menu reads and writes the daemon config through the `omavry` CLI,
-# so it must be on PATH. Link the release binary into ~/.local/bin for dev use.
+# so it must be on PATH. Link the release binary into ~/.local/bin for dev use;
+# a packaged install already provides `omavry` on PATH, so use that instead.
 cli="$here/target/release/omavry"
 if [[ -x "$cli" ]]; then
   bindir="${XDG_BIN_HOME:-$HOME/.local/bin}"
   mkdir -p "$bindir"
   ln -sf "$cli" "$bindir/omavry"
   echo "Linked $bindir/omavry -> $cli"
+elif command -v omavry >/dev/null 2>&1; then
+  echo "Using omavry from PATH: $(command -v omavry)"
 else
-  echo "warning: $cli not found; build it with 'cargo build --release -p omavrything-cli'" >&2
+  echo "warning: omavry not found; build it with 'cargo build --release -p omavrything-cli'" >&2
 fi
 
 # Restart the shell so the new QML is compiled and loaded.

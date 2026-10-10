@@ -1,0 +1,47 @@
+# pacman install scriptlet for the omavrything package.
+#
+# Creates the dedicated `omavrything` user/group from the sysusers drop-in and
+# reloads systemd so the new unit is visible. The daemon is deliberately not
+# enabled: the user decides whether to run it as a system service or as a user
+# process (see docs/install.md).
+
+post_install() {
+  systemd-sysusers
+  systemctl daemon-reload
+  cat <<'EOF'
+==> omavrything installed.
+
+To use the search UI, install the omarchy-shell plugin for your user:
+
+    omavrything-install-plugin
+    omarchy plugin enable omavrything --section center
+
+To run the daemon as a hardened system service:
+
+    sudo systemctl enable --now omavrythingd
+    sudo usermod -aG omavrything "$USER"   # so the shell can reach the socket
+
+Log out and back in (or run `newgrp omavrything`) for the group change to
+take effect. See /usr/share/doc/omavrything/install.md for the full setup.
+EOF
+}
+
+post_upgrade() {
+  systemd-sysusers
+  systemctl daemon-reload
+  cat <<'EOF'
+==> omavrything upgraded.
+
+If the daemon is running as a system service, restart it to pick up the new
+binary:
+
+    sudo systemctl restart omavrythingd
+
+Re-run `omavrything-install-plugin` to refresh the shell plugin, then restart
+the shell so the new QML is compiled.
+EOF
+}
+
+pre_remove() {
+  systemctl stop omavrythingd.service 2>/dev/null || true
+}

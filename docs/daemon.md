@@ -210,9 +210,21 @@ socket search path unaffected; `--no-dbus` disables the interface.
 ## CLI
 
 ```sh
-omavry search "report 2024"   # Unix socket
-omavry status                 # D-Bus
+omavry search "report 2024"        # Unix socket; prints matching paths
+omavry search --json "report 2024" # the full JSON response, for scripting
+omavry status                      # D-Bus; key: value lines
+omavry status --json               # the status map as JSON
+omavry rescan                      # rescan all roots (D-Bus, polkit)
+omavry rescan --root /home/sam     # rescan one configured root
+omavry mount <uuid>                # mount + index an NTFS partition (D-Bus, polkit)
+omavry config get [--json]         # the current configuration
+omavry config set <key> <value>    # set a value (D-Bus, polkit)
 ```
+
+`search` and `status` are read-only; `rescan`, `mount`, and `config set` are
+gated by the `org.omarchy.omavrything.control` polkit action and prompt for
+authentication. Every subcommand exits non-zero on failure, so it composes with
+shell scripts.
 
 ## Live updates
 

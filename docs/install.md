@@ -98,4 +98,6 @@ intervals, then `sudo systemctl restart omavrythingd`. See
 - [`omarchy-shell-integration.md`](omarchy-shell-integration.md) — the plugin
   structure and the focus constraint that shapes it.
 - [`daemon.md`](daemon.md) — the daemon, its flags, and the socket protocol.
-- [`troubleshooting.md`](troubleshooting.md) — common issues (coming soon).
+- [`search-syntax.md`](search-syntax.md) — the query syntax and ranking.
+- [`troubleshooting.md`](troubleshooting.md) — common issues (socket
+  permissions, inotify limits, NTFS mounts).

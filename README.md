@@ -41,11 +41,13 @@ optional D-Bus control interface.
 
 - [`docs/install.md`](docs/install.md) — installation and setup.
 - [`docs/daemon.md`](docs/daemon.md) — the daemon, its flags, and the socket protocol.
+- [`docs/search-syntax.md`](docs/search-syntax.md) — query syntax and ranking.
 - [`docs/omarchy-shell-integration.md`](docs/omarchy-shell-integration.md) — the shell plugin.
 - [`docs/architecture.md`](docs/architecture.md) — technical design.
 - [`docs/decisions.md`](docs/decisions.md) — decision log (ADRs).
 - [`docs/development.md`](docs/development.md) — build, test, and profiling.
 - [`docs/memory-optimization.md`](docs/memory-optimization.md) — memory model and optimization analysis.
+- [`docs/troubleshooting.md`](docs/troubleshooting.md) — common issues (socket, inotify, NTFS).
 
 ## Target platform
 

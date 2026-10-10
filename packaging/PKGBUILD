@@ -1,0 +1,94 @@
+# Maintainer: omavrything contributors <omavrything@example.com>
+#
+# AUR PKGBUILD for omavrything, the index-backed file search for Omarchy
+# Quattro (4.x). It installs:
+#
+#   * the `omavrythingd` daemon and the `omavry` CLI,
+#   * the systemd unit and the dedicated `omavrything` sysuser,
+#   * the D-Bus system-bus policy and the polkit control action,
+#   * the default `/etc/omavrything/config.toml`,
+#   * the `omarchy-shell` plugin and its install helper.
+#
+# The shell plugin is installed system-wide under /usr/share/omavrything/shell
+# and copied into the user's config by `omavrything-install-plugin` (see the
+# post-install message). The daemon is not enabled automatically: the user
+# chooses whether to run it as a system service or as a user process.
+#
+# Before publishing, replace the placeholder checksum with the real one:
+#
+#   updpkgsums
+#
+# and regenerate the AUR metadata:
+#
+#   makepkg --printsrcinfo > .SRCINFO
+
+pkgname=omavrything
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Instant, index-backed file search for Omarchy Quattro, inspired by Voidtools Everything"
+arch=('x86_64' 'aarch64')
+url="https://github.com/omavrything/omavrything"
+license=('MIT')
+depends=('gcc-libs' 'glibc')
+makedepends=('cargo' 'rust')
+provides=('omavrything')
+conflicts=('omavrything-git')
+options=('!lto')
+install="$pkgname.install"
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "$pkgname-$pkgver"
+  export CARGO_TARGET_DIR=target
+  cargo build --release --locked --workspace
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  export CARGO_TARGET_DIR=target
+  # Unit tests only: the integration test starts a daemon and binds a socket,
+  # which is not reliable inside a clean chroot.
+  cargo test --release --locked --workspace --lib --bins
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+
+  # Binaries.
+  install -Dm755 target/release/omavrythingd "$pkgdir/usr/bin/omavrythingd"
+  install -Dm755 target/release/omavry "$pkgdir/usr/bin/omavry"
+
+  # systemd unit and the dedicated user/group.
+  install -Dm644 data/systemd/omavrythingd.service \
+    "$pkgdir/usr/lib/systemd/system/omavrythingd.service"
+  install -Dm644 data/sysusers/omavrything.conf \
+    "$pkgdir/usr/lib/sysusers.d/omavrything.conf"
+
+  # D-Bus system-bus policy and the polkit control action.
+  install -Dm644 data/dbus/org.omarchy.omavrything.conf \
+    "$pkgdir/usr/share/dbus-1/system.d/org.omarchy.omavrything.conf"
+  install -Dm644 data/polkit/org.omarchy.omavrything.policy \
+    "$pkgdir/usr/share/polkit-1/actions/org.omarchy.omavrything.policy"
+
+  # Default configuration (a backup is kept on upgrade by pacman).
+  install -Dm644 data/config/config.toml "$pkgdir/etc/omavrything/config.toml"
+
+  # The omarchy-shell plugin, installed system-wide. The install helper copies
+  # it into ~/.config/omarchy/plugins/omavrything/.
+  install -d "$pkgdir/usr/share/omavrything/shell/omavrything"
+  install -m644 shell/omavrything/manifest.json \
+    shell/omavrything/SearchBar.qml \
+    shell/omavrything/SearchOverlay.qml \
+    shell/omavrything/Service.qml \
+    "$pkgdir/usr/share/omavrything/shell/omavrything/"
+
+  # The plugin install helper, exposed on PATH as omavrything-install-plugin.
+  install -Dm755 scripts/install-plugin.sh \
+    "$pkgdir/usr/bin/omavrything-install-plugin"
+
+  # License and documentation.
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -d "$pkgdir/usr/share/doc/$pkgname"
+  install -m644 README.md docs/*.md "$pkgdir/usr/share/doc/$pkgname/"
+}

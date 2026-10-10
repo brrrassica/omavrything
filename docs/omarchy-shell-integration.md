@@ -58,6 +58,41 @@ o.bind("SUPER + ALT + SPACE", "Search files", "omarchy-shell omavrything focus")
 
 `SUPER + ALT + SPACE` is reassigned from the Omarchy "Apps menu" binding.
 
+### Ready-to-paste binding examples
+
+Pick one and paste it into `~/.config/hypr/bindings.lua`, then reload Hyprland
+(`hyprctl reload`). `hl.unbind` first releases the key from whatever Omarchy
+bound it to; drop that line if the key is free.
+
+```lua
+-- Default: reassign the Omarchy "Apps menu" binding.
+hl.unbind("SUPER + ALT + SPACE")
+o.bind("SUPER + ALT + SPACE", "Search files", "omarchy-shell omavrything focus")
+
+-- Reassign the application launcher (SUPER + SPACE).
+hl.unbind("SUPER + SPACE")
+o.bind("SUPER + SPACE", "Search files", "omarchy-shell omavrything focus")
+
+-- A free key: SUPER + F.
+o.bind("SUPER + F", "Search files", "omarchy-shell omavrything focus")
+
+-- A free key: SUPER + SHIFT + F.
+o.bind("SUPER + SHIFT + F", "Search files", "omarchy-shell omavrything focus")
+```
+
+The command is the same for every binding: `omarchy-shell omavrything focus`
+summons the overlay and focuses the input. To check that the IPC target is
+alive:
+
+```sh
+omarchy-shell omavrything ping
+```
+
+If a binding does nothing, confirm the plugin is enabled
+(`omarchy plugin enable omavrything --section center`) and that the shell was
+restarted after installing it — a plugin rescan alone does not recompile the
+QML. See [`troubleshooting.md`](troubleshooting.md#the-search-bar-does-not-appear).
+
 ## Install and enable
 
 ```sh
