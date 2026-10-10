@@ -20,9 +20,18 @@ impl SocketClient {
         Ok(Self { stream, reader })
     }
 
-    /// Connect to the daemon at the default socket path.
+    /// Connect to the daemon, preferring the system socket and falling back to
+    /// the per-user runtime socket when the system socket is absent or
+    /// inaccessible (e.g. the caller is not in the `omavrything` group).
     pub fn connect_default() -> std::io::Result<Self> {
-        Self::connect(&default_socket_path())
+        let system = PathBuf::from("/run/omavrything/omavrything.sock");
+        match Self::connect(&system) {
+            Ok(client) => Ok(client),
+            Err(system_err) => match Self::connect(&user_socket_path()) {
+                Ok(client) => Ok(client),
+                Err(_) => Err(system_err),
+            },
+        }
     }
 
     /// Run a search and return the response.
@@ -54,6 +63,11 @@ pub fn default_socket_path() -> PathBuf {
     if system.exists() {
         return system;
     }
+    user_socket_path()
+}
+
+/// The per-user runtime socket path.
+fn user_socket_path() -> PathBuf {
     match std::env::var_os("XDG_RUNTIME_DIR") {
         Some(dir) => PathBuf::from(dir).join("omavrything.sock"),
         None => PathBuf::from("/tmp/omavrything.sock"),

@@ -8,17 +8,20 @@
 
 mod config;
 mod dbus;
+mod ntfs;
 mod peer;
 mod polkit;
 
 use std::ffi::CString;
+use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use omavrything_core::VERSION;
@@ -46,6 +49,10 @@ const WATCH_POLL: Duration = Duration::from_millis(500);
 const DEFAULT_SNAPSHOT_INTERVAL: u64 = 300;
 /// The group that may use the system socket.
 const SOCKET_GROUP: &str = "omavrything";
+
+/// Serializes snapshot writes between the periodic writer and the shutdown
+/// handler, which share a fixed temp path.
+static SNAPSHOT_LOCK: Mutex<()> = Mutex::new(());
 
 fn main() {
     let args = Args::parse();
@@ -111,6 +118,9 @@ fn main() {
         args.watch,
     ));
     let identities = Arc::new(RwLock::new(identities));
+    let policy = Arc::new(Mutex::new(ntfs::NtfsPolicy::load(
+        ntfs::default_policy_path(),
+    )));
 
     // Index events are forwarded to the D-Bus signal task. If D-Bus is
     // disabled the receiver is dropped and sends are ignored.
@@ -152,7 +162,14 @@ fn main() {
         let index = Arc::clone(&index);
         let config = Arc::clone(&config);
         let events = event_tx.clone();
-        std::thread::spawn(move || dbus::run(index, config, started, event_rx, events));
+        let policy = Arc::clone(&policy);
+        std::thread::spawn(move || dbus::run(index, config, started, event_rx, events, policy));
+    }
+
+    if args.ntfs {
+        let index = Arc::clone(&index);
+        let policy = Arc::clone(&policy);
+        std::thread::spawn(move || run_ntfs_startup(index, policy));
     }
 
     // A stale socket from a previous run would make bind() fail.
@@ -161,6 +178,17 @@ fn main() {
             eprintln!("failed to create {}: {err}", parent.display());
         }
     }
+    // Refuse to start a second daemon on the same socket.
+    let _singleton = match acquire_singleton(&args.socket) {
+        Ok(file) => file,
+        Err(err) => {
+            eprintln!(
+                "another omavrythingd appears to be running on {}: {err}",
+                args.socket.display()
+            );
+            std::process::exit(1);
+        }
+    };
     let _ = std::fs::remove_file(&args.socket);
     let listener = match UnixListener::bind(&args.socket) {
         Ok(listener) => listener,
@@ -235,6 +263,43 @@ fn prepare_socket(path: &Path) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Acquire an exclusive lock on `<socket>.lock` so only one daemon runs per
+/// socket. The returned `File` must be kept alive for the process lifetime.
+fn acquire_singleton(socket: &Path) -> io::Result<File> {
+    let lock_path = with_lock_suffix(socket);
+    let file = File::create(&lock_path)?;
+    // SAFETY: `file` is a valid open fd; `flock` has no other preconditions.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(file)
+}
+
+/// The lock-file path for a socket path.
+fn with_lock_suffix(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".lock");
+    PathBuf::from(s)
+}
+
+/// Query the systemd login1 idle hint. Returns `None` when login1 is
+/// unavailable, in which case the caller must not treat it as a veto.
+fn login1_idle_hint(rt: &tokio::runtime::Runtime) -> Option<bool> {
+    rt.block_on(async {
+        let connection = zbus::Connection::system().await.ok()?;
+        let proxy = zbus::Proxy::new(
+            &connection,
+            "org.freedesktop.login1",
+            "/org/freedesktop/login1",
+            "org.freedesktop.login1.Manager",
+        )
+        .await
+        .ok()?;
+        proxy.get_property::<bool>("IdleHint").await.ok()
+    })
 }
 
 /// Watch the indexed roots with inotify and apply events to the index.
@@ -318,6 +383,12 @@ fn run_scheduler(
 ) {
     let mut monitor = IdleMonitor::new(IdleThresholds::default());
     let mut scheduler = RescanScheduler::new(Duration::from_secs(config.scan_interval().max(1)));
+    // A current-thread runtime for the login1 idle-hint query. If it cannot be
+    // built, the hint is simply unavailable.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok();
     loop {
         std::thread::sleep(Duration::from_secs(5));
         let interval = config.scan_interval();
@@ -325,19 +396,28 @@ fn run_scheduler(
             continue;
         }
         scheduler.set_interval(Duration::from_secs(interval));
-        let idle = monitor.is_idle();
+        // The login1 hint is a secondary signal: when unavailable it does not
+        // veto a rescan.
+        let login1_idle = rt.as_ref().and_then(login1_idle_hint).unwrap_or(true);
+        let idle = monitor.is_idle() && login1_idle;
         if scheduler.should_rescan(Instant::now(), idle) {
             eprintln!("idle: rescanning roots");
             let _ = events.send(IndexEvent::ScanProgress {
                 phase: "start".into(),
                 entries: 0,
             });
+            config.set_scanning(true);
             let scan = config.scan();
+            // Rescan a clone and swap it in so searches are not blocked on a
+            // long write lock.
             let (report, entries) = {
-                let mut idx = write_index(&index);
-                let report = rescan_into_index(&mut idx, &scan);
-                (report, idx.len() as u64)
+                let mut working = Index::clone(&read_index(&index));
+                let report = rescan_into_index(&mut working, &scan);
+                let entries = working.len() as u64;
+                *write_index(&index) = working;
+                (report, entries)
             };
+            config.set_scanning(false);
             eprintln!(
                 "rescan: +{} entries, -{} stale, {} unreadable",
                 report.entries, report.skipped, report.errors
@@ -347,6 +427,44 @@ fn run_scheduler(
                 entries,
             });
             let _ = events.send(IndexEvent::Changed { entries });
+        }
+    }
+}
+
+/// Detect NTFS partitions at startup: auto-mount and index previously indexed
+/// ones, and log newly seen ones as offers.
+fn run_ntfs_startup(index: Arc<RwLock<Index>>, policy: Arc<Mutex<ntfs::NtfsPolicy>>) {
+    {
+        let p = policy.lock().unwrap_or_else(|e| e.into_inner());
+        if !p.is_empty() {
+            eprintln!("ntfs: {} previously indexed partition(s)", p.len());
+        }
+    }
+    let partitions = omavrything_ntfs::list_ntfs_partitions();
+    for part in &partitions {
+        let uuid = part.uuid.clone().unwrap_or_default();
+        let known = {
+            let p = policy.lock().unwrap_or_else(|e| e.into_inner());
+            !uuid.is_empty() && p.is_known(&uuid)
+        };
+        // A partition that is already mounted is indexed; an unmounted one is
+        // auto-mounted only if it was previously indexed, otherwise offered.
+        let mounted = ntfs::existing_mount_point(&part.device).is_some();
+        if !known && !mounted {
+            eprintln!(
+                "ntfs: new partition {} ({}) — use MountNtfs to index it",
+                part.device.display(),
+                part.label.as_deref().unwrap_or("no label")
+            );
+            continue;
+        }
+        match ntfs::mount_index_and_remember(&index, &policy, part) {
+            Ok(mount_point) => eprintln!(
+                "ntfs: indexed {} at {}",
+                part.device.display(),
+                mount_point.display()
+            ),
+            Err(err) => eprintln!("ntfs: failed to index {}: {err}", part.device.display()),
         }
     }
 }
@@ -365,9 +483,16 @@ fn run_snapshot(
             continue;
         }
         std::thread::sleep(Duration::from_secs(interval));
-        let idx = read_index(&index);
-        let ids = read_identities(&identities);
-        if let Err(e) = snapshot::save(&idx, &ids, &path) {
+        // Compact and encode under the lock, then write outside it so the
+        // inotify writer is not blocked on disk I/O.
+        let bytes = {
+            let mut idx = write_index(&index);
+            idx.compact();
+            let ids = read_identities(&identities);
+            snapshot::encode(&idx, &ids)
+        };
+        let _guard = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = snapshot::write_atomic(&bytes, &path) {
             eprintln!("snapshot save failed: {e}");
         }
     }
@@ -392,7 +517,8 @@ extern "C" fn handle_shutdown_signal(_sig: libc::c_int) {
 /// Install a SIGTERM/SIGINT handler that writes a snapshot and exits cleanly.
 ///
 /// A self-pipe is used: the signal handler (which must be async-signal-safe)
-/// only writes a byte, and a dedicated thread performs the snapshot write.
+/// only writes a byte, and a dedicated thread performs the snapshot write. The
+/// handler is installed process-wide; it does not block the signals.
 fn install_shutdown_handler(
     index: Arc<RwLock<Index>>,
     identities: Arc<RwLock<Vec<RootIdentity>>>,
@@ -434,9 +560,13 @@ fn install_shutdown_handler(
         }
         eprintln!("shutdown signal received");
         if let Some(path) = &snapshot {
-            let idx = read_index(&index);
-            let ids = read_identities(&identities);
-            match snapshot::save(&idx, &ids, path) {
+            let bytes = {
+                let idx = read_index(&index);
+                let ids = read_identities(&identities);
+                snapshot::encode(&idx, &ids)
+            };
+            let _guard = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            match snapshot::write_atomic(&bytes, path) {
                 Ok(()) => eprintln!("snapshot written to {}", path.display()),
                 Err(e) => eprintln!("snapshot save failed: {e}"),
             }
@@ -456,7 +586,7 @@ fn serve(stream: UnixStream, index: Arc<RwLock<Index>>) {
     let mut reader = BufReader::new(read_half);
 
     loop {
-        let line = match read_line_bounded(&mut reader, MAX_LINE_BYTES) {
+        let line = match read_line_bounded(&mut reader, MAX_LINE_BYTES, READ_TIMEOUT) {
             Ok(Some(line)) => line,
             Ok(None) => break,
             Err(_) => break,
@@ -515,11 +645,23 @@ fn write_response(writer: &mut UnixStream, response: &Response) -> io::Result<()
 }
 
 /// Read one newline-terminated line, up to `max` bytes. Returns `Ok(None)` at
-/// EOF. A line longer than `max` is an error, so the connection is dropped
-/// rather than buffering unbounded input.
-fn read_line_bounded<R: BufRead>(reader: &mut R, max: usize) -> io::Result<Option<String>> {
+/// EOF. A line longer than `max`, or a request that takes longer than
+/// `deadline` in total, is an error, so the connection is dropped rather than
+/// buffering unbounded input or letting a slow client hold a slot.
+fn read_line_bounded<R: BufRead>(
+    reader: &mut R,
+    max: usize,
+    deadline: Duration,
+) -> io::Result<Option<String>> {
+    let start = Instant::now();
     let mut buf: Vec<u8> = Vec::new();
     loop {
+        if start.elapsed() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "request deadline exceeded",
+            ));
+        }
         let mut byte = [0u8; 1];
         match reader.read(&mut byte) {
             Ok(0) => {
@@ -569,6 +711,7 @@ struct Args {
     snapshot: Option<PathBuf>,
     snapshot_interval: u64,
     dbus: bool,
+    ntfs: bool,
 }
 
 impl Args {
@@ -582,6 +725,7 @@ impl Args {
         let mut snapshot = Some(default_snapshot_path());
         let mut snapshot_interval = DEFAULT_SNAPSHOT_INTERVAL;
         let mut dbus = true;
+        let mut ntfs = true;
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -620,6 +764,7 @@ impl Args {
                     }
                 }
                 "--no-dbus" => dbus = false,
+                "--no-ntfs" => ntfs = false,
                 "-h" | "--help" => {
                     print_help();
                     std::process::exit(0);
@@ -642,6 +787,7 @@ impl Args {
             snapshot,
             snapshot_interval,
             dbus,
+            ntfs,
         }
     }
 
@@ -719,6 +865,52 @@ fn print_help() {
            --no-snapshot         Disable snapshot persistence\n\
            --snapshot-interval <s>  Snapshot write interval in seconds (0 disables; default 300)\n\
            --no-dbus             Disable the D-Bus control interface\n\
+           --no-ntfs             Disable NTFS partition detection and indexing\n\
            -h, --help            Show this help"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn singleton_lock_is_exclusive() {
+        let dir =
+            std::env::temp_dir().join(format!("omavrything-singleton-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("omavrything.sock");
+
+        let first = acquire_singleton(&sock).unwrap();
+        assert!(acquire_singleton(&sock).is_err());
+        drop(first);
+        // Once released, the lock can be re-acquired.
+        assert!(acquire_singleton(&sock).is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_line_bounded_enforces_deadline() {
+        let mut reader = std::io::Cursor::new(b"no newline here".to_vec());
+        let err = read_line_bounded(&mut reader, 1024, Duration::ZERO).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn read_line_bounded_rejects_overlong_lines() {
+        let mut reader = std::io::Cursor::new(b"aaaaaaaaaa\n".to_vec());
+        let err = read_line_bounded(&mut reader, 4, Duration::from_secs(30)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn read_line_bounded_reads_a_line() {
+        let mut reader = std::io::Cursor::new(b"hello\nworld\n".to_vec());
+        let line = read_line_bounded(&mut reader, 1024, Duration::from_secs(30))
+            .unwrap()
+            .unwrap();
+        assert_eq!(line, "hello");
+    }
 }

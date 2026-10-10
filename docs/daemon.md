@@ -14,6 +14,7 @@ scripts/run-daemon.sh --no-watch                   # disable inotify live update
 scripts/run-daemon.sh --scan-interval 1800         # idle-gated rescan every 30 min
 scripts/run-daemon.sh --snapshot /tmp/idx.snap     # custom snapshot path
 scripts/run-daemon.sh --no-snapshot                # disable persistence
+scripts/run-daemon.sh --no-ntfs                    # disable NTFS detection/indexing
 ```
 
 Roots are either explicit (`--root`, repeatable) or discovered from the mount
@@ -30,9 +31,12 @@ The socket defaults to `/run/omavrything/omavrything.sock` when running as root
 (the M9 system service) and `$XDG_RUNTIME_DIR/omavrything.sock` (falling back to
 `/tmp/omavrything.sock`) otherwise. It is created mode `0660` and, as root,
 group `omavrything`. Every connection is checked with `SO_PEERCRED`: root, the
-daemon's own uid, and members of the `omavrything` group are allowed. The daemon
-prints the indexed entry count, the roots and their filesystem kinds, and the
-socket path on startup.
+daemon's own uid, and members of the `omavrything` group are allowed. A single
+daemon per socket is enforced with an exclusive `flock` on `<socket>.lock`, so a
+second instance refuses to start. Each request must complete within 30 seconds
+and be at most 64 KiB, so a slow or oversized client cannot hold a connection
+slot. The daemon prints the indexed entry count, the roots and their filesystem
+kinds, and the socket path on startup.
 
 ## Protocol
 
@@ -80,21 +84,37 @@ Control and status are exposed on the system bus as
 
 | Method | Description |
 | --- | --- |
-| `GetStatus` | version, entries, roots, uptime |
-| `Rescan(root)` | rescan all roots (empty `root`) or one root; returns entries added |
+| `GetStatus` | version, entries, roots, memory, scan state, uptime |
+| `Rescan(root)` | rescan all roots (empty `root`) or one configured root; returns entries added |
 | `GetConfig` | the current configuration |
-| `SetConfig(key, value)` | set `excludes`, `scan_interval`, or `snapshot_interval` |
+| `SetConfig(key, value)` | set `excludes`, `scan_interval`, or `snapshot_interval`; changing `excludes` triggers a rescan |
 | `ListRoots` | the indexed roots |
-| `MountNtfs(uuid)` | mount an NTFS partition (M8) |
+| `MountNtfs(uuid)` | mount an NTFS partition and index it via the MFT; returns the mount point |
+
+A rescan runs against a clone of the index that is swapped in on completion, so
+socket searches keep serving the previous index instead of blocking on a long
+write lock. A non-empty `root` must be one of the configured roots.
 
 Signals: `IndexChanged(entries)` and `ScanProgress(phase, entries)`.
 
 The read-only methods are open to all; `Rescan`, `SetConfig`, and `MountNtfs`
-are gated by the `org.omarchy.omavrything.control` polkit action. The bus policy
-is in `data/dbus/org.omarchy.omavrything.conf` and the polkit action in
-`data/polkit/org.omarchy.omavrything.policy`. If the system bus is unavailable
-the daemon logs and continues, leaving the socket search path unaffected;
-`--no-dbus` disables the interface.
+are gated by the `org.omarchy.omavrything.control` polkit action.
+
+The daemon can only own the well-known name if the system-bus policy is
+installed. Without it the daemon logs `Request to own name refused by policy`
+and continues serving the socket search path. Install the policy and the polkit
+action, then reload D-Bus:
+
+```sh
+sudo install -Dm644 data/dbus/org.omarchy.omavrything.conf \
+  /usr/share/dbus-1/system.d/org.omarchy.omavrything.conf
+sudo install -Dm644 data/polkit/org.omarchy.omavrything.policy \
+  /usr/share/polkit-1/actions/org.omarchy.omavrything.policy
+sudo systemctl reload dbus
+```
+
+If the system bus is unavailable the daemon logs and continues, leaving the
+socket search path unaffected; `--no-dbus` disables the interface.
 
 ## Client library
 
@@ -130,7 +150,9 @@ inotify entirely.
 
 The index is snapshotted to disk so a restart warm-starts instead of rescanning
 everything. The snapshot is written on a timer (`--snapshot-interval`, default
-300 s; 0 disables) and on a clean `SIGTERM`/`SIGINT` shutdown.
+300 s; 0 disables) and on a clean `SIGTERM`/`SIGINT` shutdown. Writes are
+serialized between the timer and the shutdown handler, and the index is compacted
+before encoding so tombstones are not persisted and their memory is reclaimed.
 
 The default path is `/var/lib/omavrything/index.snapshot` when running as root
 (the M9 system service) and `$XDG_STATE_HOME/omavrything/index.snapshot`
@@ -148,8 +170,34 @@ filesystem kind changed — or that are new — are rescanned; roots that are no
 longer configured are dropped. A snapshot that fails to load triggers a full
 cold scan.
 
+## NTFS
+
+NTFS partitions are detected with `blkid` (falling back to a boot-sector OEM
+check) and indexed by reading the **MFT directly from the raw device** — no
+mount is required for indexing. The reader is a pure-Rust implementation in
+`omavrything-ntfs` (ADR-006's documented alternative to libntfs-ng FFI): it
+parses the boot sector, reads the `$MFT` record to obtain the MFT's run list,
+then walks every MFT record and reconstructs paths from `$FILE_NAME` parent
+references.
+
+Mounting prefers **udisks2** (`udisksctl mount -o ro`) so the desktop sees the
+partition, and falls back to a private read-only **`ntfs3`** mount at
+`/run/omavrything/ntfs/<uuid>`.
+
+The **auto-mount policy** remembers previously indexed partitions by UUID in a
+state file (`/var/lib/omavrything/ntfs.state` as root, else
+`$XDG_STATE_HOME/omavrything/ntfs.state`). At startup, a remembered partition is
+auto-mounted and indexed; a newly seen one is only logged as an offer and is
+indexed on demand via `MountNtfs`. `--no-ntfs` disables detection entirely.
+
 ## Current limitations
 
 - The daemon runs as the user; the root system service arrives later (M9).
-- NTFS partitions are not yet read via the MFT (M8); `MountNtfs` is a stub.
-- The login1 idle hint is not yet consulted.
+- The D-Bus control interface is only reachable when the daemon owns the
+  well-known name, which the bus policy permits for root only; a user-run daemon
+  therefore serves the socket search path but not D-Bus control until M9.
+- NTFS live updates use the periodic rescan; USN journal parsing is deferred to
+  v0.2 (ADR-006).
+- An NTFS root is validated by its mount point's device identity, so if the
+  partition is not mounted at startup its MFT-indexed entries are dropped and
+  re-indexed when it is mounted again.

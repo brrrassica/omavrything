@@ -14,7 +14,11 @@ path = "src/main.rs"
 
 [dependencies]
 omavrything-core.workspace = true
+omavrything-ntfs.workspace = true
 serde_json = { workspace = true }
 libc = { workspace = true }
 zbus = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+omavrything-ntfs = { workspace = true, features = ["test-image"] }

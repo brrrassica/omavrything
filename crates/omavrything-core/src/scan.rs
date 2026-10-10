@@ -167,14 +167,22 @@ pub fn rescan_into_index(index: &mut Index, config: &ScanConfig) -> ScanReport {
         }
     }
 
-    let stale: Vec<PathBuf> = index
+    let mut stale: Vec<PathBuf> = index
         .iter()
         .map(|(i, _)| PathBuf::from(index.path(i)))
         .filter(|p| roots.iter().any(|(r, _)| p.starts_with(r)) && !current.contains(p))
         .collect();
+    // Removing a directory tombstones its whole subtree, so drop descendants of
+    // an already-removed path to avoid redundant O(n) scans.
+    stale.sort();
+    let mut removed: Vec<PathBuf> = Vec::new();
     for p in stale {
+        if removed.iter().any(|r| p.starts_with(r)) {
+            continue;
+        }
         if index.remove(&p) {
             report.skipped += 1;
+            removed.push(p);
         }
     }
 

@@ -539,6 +539,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "omavrything-core",
+ "omavrything-ntfs",
  "serde_json",
  "tokio",
  "zbus",

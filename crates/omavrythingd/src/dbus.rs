@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use omavrything_core::index::Index;
@@ -16,6 +16,7 @@ use zbus::interface;
 use zbus::object_server::SignalEmitter;
 
 use crate::config::SharedConfig;
+use crate::ntfs::{self, NtfsPolicy};
 use crate::polkit;
 
 /// The well-known bus name.
@@ -38,6 +39,7 @@ pub struct Manager {
     config: Arc<SharedConfig>,
     started: Instant,
     events: UnboundedSender<IndexEvent>,
+    policy: Arc<Mutex<NtfsPolicy>>,
 }
 
 impl Manager {
@@ -46,25 +48,29 @@ impl Manager {
         config: Arc<SharedConfig>,
         started: Instant,
         events: UnboundedSender<IndexEvent>,
+        policy: Arc<Mutex<NtfsPolicy>>,
     ) -> Self {
         Self {
             index,
             config,
             started,
             events,
+            policy,
         }
     }
 }
 
 #[interface(name = "org.omarchy.omavrything.Manager")]
 impl Manager {
-    /// Daemon status: version, entries, roots, uptime.
+    /// Daemon status: version, entries, roots, memory, scan state, uptime.
     async fn get_status(&self) -> HashMap<String, String> {
         let index = self.index.read().unwrap_or_else(|e| e.into_inner());
         let mut map = HashMap::new();
         map.insert("version".into(), omavrything_core::VERSION.into());
         map.insert("entries".into(), index.len().to_string());
         map.insert("roots".into(), index.roots().len().to_string());
+        map.insert("memory_bytes".into(), index.memory_bytes().to_string());
+        map.insert("scanning".into(), self.config.scanning().to_string());
         map.insert(
             "uptime_secs".into(),
             self.started.elapsed().as_secs().to_string(),
@@ -80,37 +86,13 @@ impl Manager {
         #[zbus(connection)] connection: &zbus::Connection,
     ) -> zbus::fdo::Result<u64> {
         authorize(&header, connection).await?;
-        let _ = self.events.send(IndexEvent::ScanProgress {
-            phase: "start".into(),
-            entries: 0,
-        });
-        let index = Arc::clone(&self.index);
-        let config = Arc::clone(&self.config);
-        let added = tokio::task::spawn_blocking(move || {
-            let scan = config.scan();
-            let mut idx = index.write().unwrap_or_else(|e| e.into_inner());
-            let report = if root.is_empty() {
-                rescan_into_index(&mut idx, &scan)
-            } else {
-                let sub = ScanConfig {
-                    roots: vec![PathBuf::from(&root)],
-                    excludes: scan.excludes.clone(),
-                    skip_pseudo: scan.skip_pseudo,
-                };
-                rescan_into_index(&mut idx, &sub)
-            };
-            report.entries as u64
-        })
+        run_rescan(
+            Arc::clone(&self.index),
+            Arc::clone(&self.config),
+            self.events.clone(),
+            &root,
+        )
         .await
-        .unwrap_or(0);
-
-        let entries = self.index.read().unwrap_or_else(|e| e.into_inner()).len() as u64;
-        let _ = self.events.send(IndexEvent::ScanProgress {
-            phase: "done".into(),
-            entries,
-        });
-        let _ = self.events.send(IndexEvent::Changed { entries });
-        Ok(added)
     }
 
     /// The current configuration.
@@ -129,7 +111,20 @@ impl Manager {
         authorize(&header, connection).await?;
         self.config
             .set(&key, &value)
-            .map_err(zbus::fdo::Error::InvalidArgs)
+            .map_err(zbus::fdo::Error::InvalidArgs)?;
+        // Changing the excludes changes what should be indexed; reconcile now so
+        // newly excluded paths stop being served without waiting for the next
+        // scheduled rescan.
+        if key == "excludes" {
+            let _ = run_rescan(
+                Arc::clone(&self.index),
+                Arc::clone(&self.config),
+                self.events.clone(),
+                "",
+            )
+            .await;
+        }
+        Ok(())
     }
 
     /// The indexed roots.
@@ -143,17 +138,34 @@ impl Manager {
             .collect()
     }
 
-    /// Mount an NTFS partition by UUID (implemented in M8).
+    /// Mount an NTFS partition by UUID and index it via the MFT. Returns the
+    /// mount point.
     async fn mount_ntfs(
         &self,
         uuid: String,
         #[zbus(header)] header: zbus::message::Header<'_>,
         #[zbus(connection)] connection: &zbus::Connection,
-    ) -> zbus::fdo::Result<()> {
+    ) -> zbus::fdo::Result<String> {
         authorize(&header, connection).await?;
-        Err(zbus::fdo::Error::NotSupported(format!(
-            "NTFS mounting arrives in M8 (uuid {uuid})"
-        )))
+        let partition = omavrything_ntfs::list_ntfs_partitions()
+            .into_iter()
+            .find(|p| p.uuid.as_deref() == Some(uuid.as_str()))
+            .ok_or_else(|| {
+                zbus::fdo::Error::InvalidArgs(format!("no NTFS partition with uuid {uuid}"))
+            })?;
+
+        let index = Arc::clone(&self.index);
+        let policy = Arc::clone(&self.policy);
+        let mount_point = tokio::task::spawn_blocking(move || {
+            ntfs::mount_index_and_remember(&index, &policy, &partition)
+        })
+        .await
+        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+        .map_err(zbus::fdo::Error::Failed)?;
+
+        let entries = self.index.read().unwrap_or_else(|e| e.into_inner()).len() as u64;
+        let _ = self.events.send(IndexEvent::Changed { entries });
+        Ok(mount_point.display().to_string())
     }
 
     /// Emitted when the index changes.
@@ -167,6 +179,71 @@ impl Manager {
         phase: String,
         entries: u64,
     ) -> zbus::Result<()>;
+}
+
+/// Rescan all roots (empty `root`) or a single root, returning entries added.
+///
+/// The rescan runs against a clone of the index which is swapped in on
+/// completion, so socket searches keep serving the previous index instead of
+/// blocking on a long write lock. A non-empty `root` must be one of the
+/// configured roots; otherwise the scan would inject records for an unmanaged
+/// root that the snapshot loader never validates or drops.
+async fn run_rescan(
+    index: Arc<RwLock<Index>>,
+    config: Arc<SharedConfig>,
+    events: UnboundedSender<IndexEvent>,
+    root: &str,
+) -> zbus::fdo::Result<u64> {
+    if !root.is_empty() {
+        let known = index
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .roots()
+            .iter()
+            .any(|r| r.path == root);
+        if !known {
+            return Err(zbus::fdo::Error::InvalidArgs(format!(
+                "unknown root: {root}"
+            )));
+        }
+    }
+
+    let _ = events.send(IndexEvent::ScanProgress {
+        phase: "start".into(),
+        entries: 0,
+    });
+    config.set_scanning(true);
+
+    let root = root.to_string();
+    let task_index = Arc::clone(&index);
+    let task_config = Arc::clone(&config);
+    let added = tokio::task::spawn_blocking(move || {
+        let scan = task_config.scan();
+        let mut working = task_index.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let report = if root.is_empty() {
+            rescan_into_index(&mut working, &scan)
+        } else {
+            let sub = ScanConfig {
+                roots: vec![PathBuf::from(&root)],
+                excludes: scan.excludes.clone(),
+                skip_pseudo: scan.skip_pseudo,
+            };
+            rescan_into_index(&mut working, &sub)
+        };
+        *task_index.write().unwrap_or_else(|e| e.into_inner()) = working;
+        report.entries as u64
+    })
+    .await
+    .unwrap_or(0);
+
+    config.set_scanning(false);
+    let entries = index.read().unwrap_or_else(|e| e.into_inner()).len() as u64;
+    let _ = events.send(IndexEvent::ScanProgress {
+        phase: "done".into(),
+        entries,
+    });
+    let _ = events.send(IndexEvent::Changed { entries });
+    Ok(added)
 }
 
 /// Authorize a control call via polkit.
@@ -198,6 +275,7 @@ pub fn run(
     started: Instant,
     mut events: tokio::sync::mpsc::UnboundedReceiver<IndexEvent>,
     event_tx: UnboundedSender<IndexEvent>,
+    policy: Arc<Mutex<NtfsPolicy>>,
 ) {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -219,7 +297,7 @@ pub fn run(
             }
         };
 
-        let manager = Manager::new(index, config, started, event_tx);
+        let manager = Manager::new(index, config, started, event_tx, policy);
         if let Err(e) = connection.object_server().at(OBJECT_PATH, manager).await {
             eprintln!("dbus: failed to register object: {e}");
             return;
@@ -253,4 +331,32 @@ pub fn run(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use omavrything_core::index::FsKind;
+    use std::path::Path;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    #[tokio::test]
+    async fn rescan_rejects_an_unknown_root() {
+        let mut index = Index::new();
+        index.add_root(Path::new("/known"), FsKind::Other);
+        let index = Arc::new(RwLock::new(index));
+        let config = Arc::new(SharedConfig::new(
+            ScanConfig::default(),
+            900,
+            300,
+            None,
+            true,
+        ));
+        let (tx, _rx) = unbounded_channel();
+
+        let err = run_rescan(Arc::clone(&index), config, tx, "/unknown")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, zbus::fdo::Error::InvalidArgs(_)));
+    }
 }

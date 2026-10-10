@@ -23,7 +23,7 @@ the MFT for NTFS partitions.
 | Component | Artifact | Role |
 | --- | --- | --- |
 | `omavrything-core` | library | Index, search, scanner, IPC protocol. |
-| `omavrything-ntfs` | library | libntfs-ng FFI for MFT/USN. |
+| `omavrything-ntfs` | library | Pure-Rust NTFS MFT reader and partition detection. |
 | `omavrythingd` | binary | Root system daemon. |
 | `omavrything-cli` | binary (`omavry`) | CLI client. |
 | `omavrything` shell plugin | QML | Search bar + results overlay. |

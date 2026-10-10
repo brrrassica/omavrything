@@ -2,7 +2,7 @@
 //!
 //! Idleness is measured from `/proc/loadavg` (1-minute load), `/proc/stat`
 //! (CPU idle fraction), and `/proc/diskstats` (in-flight I/O). The systemd
-//! login1 idle hint is a secondary signal wired in a later milestone (M7).
+//! login1 idle hint is a secondary signal consulted by the daemon, not here.
 
 use std::time::{Duration, Instant};
 

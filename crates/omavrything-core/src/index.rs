@@ -104,7 +104,7 @@ pub struct SearchOutcome {
 }
 
 /// The in-memory index.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Index {
     records: Vec<FileRecord>,
     names: Vec<u8>,
@@ -140,6 +140,75 @@ impl Index {
     /// The raw records, for snapshot serialization.
     pub(crate) fn records(&self) -> &[FileRecord] {
         &self.records
+    }
+
+    /// An estimate of the heap memory held by the index, in bytes.
+    ///
+    /// Counts the record vector, both arenas, and a rough per-entry cost for the
+    /// path map (the key bytes plus `HashMap` overhead). Used for `GetStatus`.
+    pub fn memory_bytes(&self) -> u64 {
+        let records = self.records.len() * std::mem::size_of::<FileRecord>();
+        let arenas = self.names.len() + self.paths.len();
+        // Each map entry owns a boxed path (already counted in `paths`) plus the
+        // hash-table slot and the `Box`/`u32` bookkeeping.
+        let map = self.by_path.len() * (std::mem::size_of::<u32>() + 16);
+        (records + arenas + map) as u64
+    }
+
+    /// Rebuild the arenas and record vector, dropping tombstones and reclaiming
+    /// their bytes. Record indices change, so `parent` links and the path map are
+    /// remapped. A no-op when there are no tombstones.
+    pub fn compact(&mut self) {
+        if !self.records.iter().any(|r| r.is_deleted()) {
+            return;
+        }
+
+        let mut remap = vec![u32::MAX; self.records.len()];
+        let mut records = Vec::with_capacity(self.live);
+        let mut names = Vec::with_capacity(self.names.len());
+        let mut paths = Vec::with_capacity(self.paths.len());
+
+        for (i, rec) in self.records.iter().enumerate() {
+            if rec.is_deleted() {
+                continue;
+            }
+            remap[i] = records.len() as u32;
+
+            let name_off = names.len() as u32;
+            names.extend_from_slice(self.name_bytes(rec));
+            let path_off = paths.len() as u32;
+            paths.extend_from_slice(self.path_bytes(rec));
+
+            let parent = if rec.parent == u32::MAX {
+                u32::MAX
+            } else {
+                remap[rec.parent as usize]
+            };
+            records.push(FileRecord {
+                parent,
+                name_off,
+                name_len: rec.name_len,
+                path_off,
+                path_len: rec.path_len,
+                size: rec.size,
+                mtime: rec.mtime,
+                depth: rec.depth,
+                flags: rec.flags,
+            });
+        }
+
+        self.records = records;
+        self.names = names;
+        self.paths = paths;
+        self.by_path.clear();
+        for (i, rec) in self.records.iter().enumerate() {
+            let start = rec.path_off as usize;
+            let end = start + rec.path_len as usize;
+            let key = String::from_utf8_lossy(&self.paths[start..end])
+                .into_owned()
+                .into_boxed_str();
+            self.by_path.insert(key, i as u32);
+        }
     }
 
     /// The name arena, for snapshot serialization.
@@ -194,18 +263,22 @@ impl Index {
     }
 
     /// Insert a root directory record and register the mount point.
+    ///
+    /// Idempotent: re-adding a root must not create a duplicate record, and the
+    /// recorded filesystem kind is refreshed if it changed (e.g. a device was
+    /// reformatted between runs).
     pub fn add_root(&mut self, path: &Path, fs_kind: FsKind) -> u32 {
-        // Idempotent: re-adding a root must not create a duplicate record.
         let idx = match self.find(path) {
             Some(idx) => idx,
             None => self.insert(path, true, 0, 0),
         };
         let path_str = path.to_string_lossy().into_owned();
-        if !self.roots.iter().any(|r| r.path == path_str) {
-            self.roots.push(Root {
+        match self.roots.iter_mut().find(|r| r.path == path_str) {
+            Some(root) => root.fs_kind = fs_kind,
+            None => self.roots.push(Root {
                 path: path_str,
                 fs_kind,
-            });
+            }),
         }
         idx
     }
@@ -819,6 +892,39 @@ mod tests {
         let out = index.search("new.txt", 10, 0);
         assert_eq!(out.hits.len(), 1);
         assert_eq!(out.hits[0].size, 1);
+    }
+
+    #[test]
+    fn compact_reclaims_tombstones_and_remaps_parents() {
+        let mut index = Index::new();
+        index.add_root(Path::new("/"), FsKind::Other);
+        index.insert(Path::new("/home"), true, 0, 0);
+        index.insert(Path::new("/home/a.txt"), false, 1, 0);
+        index.insert(Path::new("/home/b.txt"), false, 2, 0);
+        assert!(index.remove(Path::new("/home/a.txt")));
+        assert_eq!(index.len(), 3); // root, home, b.txt
+
+        index.compact();
+        assert_eq!(index.len(), 3);
+        assert_eq!(index.records().len(), 3);
+        assert!(index.find(Path::new("/home/a.txt")).is_none());
+
+        let home = index.find(Path::new("/home")).unwrap();
+        let b = index.find(Path::new("/home/b.txt")).unwrap();
+        assert_eq!(index.path(b), "/home/b.txt");
+        // Parent links are remapped to the compacted record indices.
+        assert_eq!(index.record(b).parent, home);
+        assert_eq!(index.search("b.txt", 10, 0).hits.len(), 1);
+    }
+
+    #[test]
+    fn compact_is_a_noop_without_tombstones() {
+        let mut index = Index::new();
+        index.insert(Path::new("/a.txt"), false, 1, 0);
+        let before = index.records().len();
+        index.compact();
+        assert_eq!(index.records().len(), before);
+        assert_eq!(index.len(), 1);
     }
 
     #[test]

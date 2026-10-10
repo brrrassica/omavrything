@@ -8,4 +8,8 @@ authors.workspace = true
 repository.workspace = true
 description = "NTFS MFT and USN journal access for omavrything (libntfs-ng FFI)"
 
+[features]
+# Exposes the synthetic NTFS image builder for integration tests.
+test-image = []
+
 [dependencies]

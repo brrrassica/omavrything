@@ -161,9 +161,28 @@ pub fn encode(index: &Index, identities: &[RootIdentity]) -> Vec<u8> {
     }
 
     let records = index.records();
-    put_u32(&mut out, records.len() as u32);
-    for rec in records {
-        put_u32(&mut out, rec.parent);
+    // Tombstones are not persisted, so the snapshot stays proportional to the
+    // live set. Build a remap so `parent` links stay valid in the compacted
+    // record list.
+    let mut remap = vec![u32::MAX; records.len()];
+    let mut live = 0u32;
+    for (i, rec) in records.iter().enumerate() {
+        if !rec.is_deleted() {
+            remap[i] = live;
+            live += 1;
+        }
+    }
+    put_u32(&mut out, live);
+    for rec in records.iter() {
+        if rec.is_deleted() {
+            continue;
+        }
+        let parent = if rec.parent == u32::MAX {
+            u32::MAX
+        } else {
+            remap[rec.parent as usize]
+        };
+        put_u32(&mut out, parent);
         put_u32(&mut out, rec.name_off);
         put_u32(&mut out, rec.name_len);
         put_u32(&mut out, rec.path_off);
@@ -252,13 +271,23 @@ pub fn decode(bytes: &[u8]) -> Result<(Index, Vec<RootIdentity>), SnapshotError>
 /// Write a snapshot atomically, keeping the previous one as `<path>.prev`.
 pub fn save(index: &Index, identities: &[RootIdentity], path: &Path) -> io::Result<()> {
     let bytes = encode(index, identities);
+    write_atomic(&bytes, path)
+}
+
+/// Write `bytes` to `path` atomically: a temp file, `fsync`, `rename`, and a
+/// parent-directory `fsync` so the rename itself is durable. The previous
+/// snapshot is kept as `<path>.prev`.
+///
+/// Callers that may run concurrently (the periodic writer and the shutdown
+/// handler) must serialize their calls; the temp path is fixed.
+pub fn write_atomic(bytes: &[u8], path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let tmp = with_suffix(path, ".tmp");
     {
         let mut file = File::create(&tmp)?;
-        file.write_all(&bytes)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
     }
     // Keep the previous snapshot as a fallback.
@@ -266,6 +295,12 @@ pub fn save(index: &Index, identities: &[RootIdentity], path: &Path) -> io::Resu
         let _ = fs::rename(path, with_suffix(path, ".prev"));
     }
     fs::rename(&tmp, path)?;
+    // Make the rename durable: fsync the containing directory.
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
     Ok(())
 }
 
@@ -315,19 +350,23 @@ pub fn warm_start(config: &ScanConfig, snapshot_path: &Path) -> WarmStartResult 
         .collect();
 
     let mut report = ScanReport::default();
-    let mut identities = Vec::new();
+    // Identity per configured root path, keyed by path so the final vector can be
+    // emitted in `index.roots()` order (which may differ from the config order).
+    let mut id_by_path: HashMap<String, RootIdentity> = HashMap::new();
     let mut rescanned = 0usize;
 
     for (path, kind) in &roots {
         let path_str = path.to_string_lossy().into_owned();
-        let current = root_identity(path);
-        let valid = match (current, stored.get(&path_str)) {
-            (Some(cur), Some((stored_kind, stored_id))) => cur == *stored_id && kind == stored_kind,
-            _ => false,
+        // A root that no longer exists is dropped rather than registered as an
+        // empty phantom root.
+        let Some(current) = root_identity(path) else {
+            index.remove(path);
+            continue;
         };
-        if valid {
-            identities.push(current.unwrap());
-        } else {
+        let valid = stored
+            .get(&path_str)
+            .is_some_and(|(stored_kind, stored_id)| current == *stored_id && kind == stored_kind);
+        if !valid {
             // Drop the stale subtree and re-walk this root.
             index.remove(path);
             let sub = ScanConfig {
@@ -339,17 +378,12 @@ pub fn warm_start(config: &ScanConfig, snapshot_path: &Path) -> WarmStartResult 
             report.entries += sub_report.entries;
             report.errors += sub_report.errors;
             rescanned += 1;
-            if let Some(id) = current {
-                identities.push(id);
-            }
         }
+        id_by_path.insert(path_str, current);
     }
 
-    // Drop roots that are no longer configured.
-    let keep: HashSet<String> = roots
-        .iter()
-        .map(|(path, _)| path.to_string_lossy().into_owned())
-        .collect();
+    // Drop roots that are no longer configured (or no longer exist).
+    let keep: HashSet<String> = id_by_path.keys().cloned().collect();
     let stale: Vec<PathBuf> = index
         .roots()
         .iter()
@@ -360,6 +394,19 @@ pub fn warm_start(config: &ScanConfig, snapshot_path: &Path) -> WarmStartResult 
         index.remove(path);
     }
     index.retain_roots(&keep);
+
+    // Emit identities aligned with `index.roots()` so a later `encode` zips them
+    // correctly even if the config order changed between runs.
+    let identities: Vec<RootIdentity> = index
+        .roots()
+        .iter()
+        .map(|root| {
+            id_by_path.get(&root.path).copied().unwrap_or(RootIdentity {
+                device: 0,
+                generation: 0,
+            })
+        })
+        .collect();
 
     let outcome = if rescanned == 0 {
         WarmStart::Snapshot
@@ -692,6 +739,83 @@ mod tests {
         assert!(warm.index.find(&a.join("a.txt")).is_some());
         assert!(warm.index.find(&b.join("b.txt")).is_none());
         assert_eq!(warm.index.roots().len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn encode_omits_tombstones() {
+        let mut index = Index::new();
+        index.add_root(Path::new("/"), FsKind::Other);
+        index.insert(Path::new("/keep.txt"), false, 1, 0);
+        index.insert(Path::new("/gone.txt"), false, 2, 0);
+        assert!(index.remove(Path::new("/gone.txt")));
+
+        let ids = vec![RootIdentity {
+            device: 1,
+            generation: 0,
+        }];
+        let bytes = encode(&index, &ids);
+        let (back, _) = decode(&bytes).unwrap();
+
+        // Live records are the root and keep.txt; gone.txt is a tombstone.
+        assert_eq!(back.len(), 2);
+        assert!(back.find(Path::new("/keep.txt")).is_some());
+        assert!(back.find(Path::new("/gone.txt")).is_none());
+        // The snapshot holds only live records, not tombstones.
+        assert_eq!(back.records().len(), 2);
+    }
+
+    #[test]
+    fn warm_start_handles_reordered_roots() {
+        let dir = temp_dir("warm-reorder");
+        let a = dir.join("a");
+        let b = dir.join("b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        fs::write(a.join("a.txt"), b"x").unwrap();
+        fs::write(b.join("b.txt"), b"y").unwrap();
+        let snap = dir.join("index.snapshot");
+
+        let cold = warm_start(&ScanConfig::with_roots(vec![a.clone(), b.clone()]), &snap);
+        save(&cold.index, &cold.identities, &snap).unwrap();
+
+        // The config order is reversed; both roots are unchanged, so no rescan.
+        let warm = warm_start(&ScanConfig::with_roots(vec![b.clone(), a.clone()]), &snap);
+        assert_eq!(warm.outcome, WarmStart::Snapshot);
+        // Identities are aligned with the index's root order, not the config order.
+        assert_eq!(warm.identities.len(), warm.index.roots().len());
+        for (root, id) in warm.index.roots().iter().zip(warm.identities.iter()) {
+            assert_eq!(Some(*id), root_identity(Path::new(&root.path)));
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn warm_start_drops_missing_root() {
+        let dir = temp_dir("warm-missing");
+        let a = dir.join("a");
+        fs::create_dir_all(&a).unwrap();
+        fs::write(a.join("a.txt"), b"x").unwrap();
+        let snap = dir.join("index.snapshot");
+
+        let cold = warm_start(&ScanConfig::with_roots(vec![a.clone()]), &snap);
+        save(&cold.index, &cold.identities, &snap).unwrap();
+
+        // `a` still exists; the second root does not and must not be registered.
+        let missing = dir.join("does-not-exist");
+        let warm = warm_start(
+            &ScanConfig::with_roots(vec![a.clone(), missing.clone()]),
+            &snap,
+        );
+        assert!(
+            warm.index
+                .roots()
+                .iter()
+                .all(|r| r.path != missing.to_string_lossy())
+        );
+        assert_eq!(warm.identities.len(), warm.index.roots().len());
 
         let _ = fs::remove_dir_all(&dir);
     }

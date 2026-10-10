@@ -21,8 +21,8 @@ pub trait Manager {
     fn set_config(&self, key: &str, value: &str) -> zbus::Result<()>;
     /// The indexed roots.
     fn list_roots(&self) -> zbus::Result<Vec<String>>;
-    /// Mount an NTFS partition by UUID (M8).
-    fn mount_ntfs(&self, uuid: &str) -> zbus::Result<()>;
+    /// Mount an NTFS partition by UUID and index it; returns the mount point.
+    fn mount_ntfs(&self, uuid: &str) -> zbus::Result<String>;
 
     /// Emitted when the index changes.
     #[zbus(signal)]
@@ -70,8 +70,8 @@ impl DbusClient {
         self.proxy.list_roots().await
     }
 
-    /// Mount an NTFS partition by UUID.
-    pub async fn mount_ntfs(&self, uuid: &str) -> zbus::Result<()> {
+    /// Mount an NTFS partition by UUID and index it; returns the mount point.
+    pub async fn mount_ntfs(&self, uuid: &str) -> zbus::Result<String> {
         self.proxy.mount_ntfs(uuid).await
     }
 }

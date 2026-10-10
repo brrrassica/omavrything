@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use omavrything_core::scan::ScanConfig;
 
@@ -15,6 +15,8 @@ pub struct SharedConfig {
     snapshot_interval: AtomicU64,
     snapshot: Option<PathBuf>,
     watch: bool,
+    /// Whether a scan/rescan is currently in progress.
+    scanning: AtomicBool,
 }
 
 impl SharedConfig {
@@ -31,7 +33,18 @@ impl SharedConfig {
             snapshot_interval: AtomicU64::new(snapshot_interval),
             snapshot,
             watch,
+            scanning: AtomicBool::new(false),
         }
+    }
+
+    /// Whether a scan/rescan is currently in progress.
+    pub fn scanning(&self) -> bool {
+        self.scanning.load(Ordering::Relaxed)
+    }
+
+    /// Mark a scan as started or finished.
+    pub fn set_scanning(&self, value: bool) {
+        self.scanning.store(value, Ordering::Relaxed);
     }
 
     /// A snapshot of the current scan configuration.
@@ -107,6 +120,7 @@ impl SharedConfig {
                 .unwrap_or_default(),
         );
         map.insert("watch".into(), self.watch.to_string());
+        map.insert("scanning".into(), self.scanning().to_string());
         map
     }
 }
@@ -149,8 +163,20 @@ mod tests {
             "snapshot_interval",
             "snapshot",
             "watch",
+            "scanning",
         ] {
             assert!(map.contains_key(key), "missing {key}");
         }
+    }
+
+    #[test]
+    fn scanning_flag_toggles_and_is_reported() {
+        let c = cfg();
+        assert!(!c.scanning());
+        c.set_scanning(true);
+        assert!(c.scanning());
+        assert_eq!(c.as_map().get("scanning").map(String::as_str), Some("true"));
+        c.set_scanning(false);
+        assert!(!c.scanning());
     }
 }
