@@ -5,9 +5,21 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The request method. Only `Search` exists in v0.1; the discriminator is
+/// present now so control methods can be added without a breaking change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Method {
+    #[default]
+    Search,
+}
+
 /// A search request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
+    /// The request method. Defaults to `search` when omitted.
+    #[serde(default)]
+    pub method: Method,
     /// The query string. Space-separated terms are ANDed.
     pub q: String,
     /// Maximum number of results to return. Defaults to 100, capped at 1000.
@@ -41,6 +53,22 @@ pub struct Response {
     pub results: Vec<ResultItem>,
     pub total: usize,
     pub took_ms: u64,
+    /// Set when the request could not be served (e.g. malformed JSON). Absent
+    /// on success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl Response {
+    /// An error response carrying no results.
+    pub fn error(message: impl Into<String>) -> Self {
+        Self {
+            results: Vec::new(),
+            total: 0,
+            took_ms: 0,
+            error: Some(message.into()),
+        }
+    }
 }
 
 /// The default result cap when a request omits `limit`.
@@ -74,6 +102,35 @@ mod tests {
     }
 
     #[test]
+    fn method_defaults_to_search_and_parses_explicitly() {
+        let req: Request = serde_json::from_str(r#"{"q":"x"}"#).unwrap();
+        assert_eq!(req.method, Method::Search);
+
+        let req: Request = serde_json::from_str(r#"{"method":"search","q":"x"}"#).unwrap();
+        assert_eq!(req.method, Method::Search);
+
+        assert!(serde_json::from_str::<Request>(r#"{"method":"bogus","q":"x"}"#).is_err());
+    }
+
+    #[test]
+    fn error_response_omits_error_on_success() {
+        let ok = Response {
+            results: Vec::new(),
+            total: 0,
+            took_ms: 0,
+            error: None,
+        };
+        let json = serde_json::to_string(&ok).unwrap();
+        assert!(!json.contains("error"));
+
+        let err = Response::error("bad request");
+        let json = serde_json::to_string(&err).unwrap();
+        assert!(json.contains("bad request"));
+        let back: Response = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.error.as_deref(), Some("bad request"));
+    }
+
+    #[test]
     fn offset_defaults_to_zero() {
         let req: Request = serde_json::from_str(r#"{"q":"x"}"#).unwrap();
         assert_eq!(req.effective_offset(), 0);
@@ -100,6 +157,7 @@ mod tests {
             }],
             total: 1,
             took_ms: 3,
+            error: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: Response = serde_json::from_str(&json).unwrap();

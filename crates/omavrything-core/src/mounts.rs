@@ -103,7 +103,10 @@ pub fn fs_kind(fs_type: &str) -> FsKind {
         "xfs" => FsKind::Xfs,
         "f2fs" => FsKind::F2fs,
         "vfat" | "fat" | "msdos" | "exfat" => FsKind::Vfat,
-        "ntfs" | "ntfs3" | "fuseblk" => FsKind::Ntfs,
+        "ntfs" | "ntfs3" => FsKind::Ntfs,
+        // `fuseblk` is generic (ntfs-3g, exfat, …); NTFS detection uses
+        // libblkid in M8, so do not guess here.
+        "fuseblk" => FsKind::Other,
         _ => FsKind::Other,
     }
 }
@@ -137,12 +140,30 @@ pub fn is_pseudo_fs(fs_type: &str) -> bool {
             | "rpc_pipefs"
             | "nsfs"
             | "efivarfs"
+            // Network and remote filesystems: traversing them is slow and can
+            // block, so they are never auto-indexed.
+            | "nfs"
+            | "nfs4"
+            | "cifs"
+            | "smb3"
+            | "9p"
+            | "ceph"
+            | "glusterfs"
+            | "afs"
+            | "davfs"
+            | "davfs2"
+            | "fuse.sshfs"
+            | "fuse.rclone"
+            | "fuse.smbnetfs"
     )
 }
 
 /// Whether a mount point is a pseudo path that should not be indexed.
 pub fn is_pseudo_mount_point(path: &Path) -> bool {
-    const PSEUDO: &[&str] = &["/proc", "/sys", "/dev", "/run", "/var/run", "/var/lock"];
+    // `/run` is deliberately *not* excluded: udisks2 mounts removable media
+    // (including NTFS) under `/run/media/<user>/<volume>`, which must be
+    // discoverable. The `/run` tmpfs itself is excluded by `is_pseudo_fs`.
+    const PSEUDO: &[&str] = &["/proc", "/sys", "/dev"];
     PSEUDO
         .iter()
         .any(|p| path == Path::new(p) || path.starts_with(p))
@@ -202,6 +223,7 @@ tmpfs /run tmpfs rw,nosuid,nodev,relatime,size=3276800k 0 0
         assert_eq!(fs_kind("f2fs"), FsKind::F2fs);
         assert_eq!(fs_kind("vfat"), FsKind::Vfat);
         assert_eq!(fs_kind("ntfs3"), FsKind::Ntfs);
+        assert_eq!(fs_kind("fuseblk"), FsKind::Other);
         assert_eq!(fs_kind("zfs"), FsKind::Other);
     }
 
@@ -210,13 +232,18 @@ tmpfs /run tmpfs rw,nosuid,nodev,relatime,size=3276800k 0 0
         assert!(is_pseudo_fs("proc"));
         assert!(is_pseudo_fs("tmpfs"));
         assert!(is_pseudo_fs("cgroup2"));
+        assert!(is_pseudo_fs("nfs"));
+        assert!(is_pseudo_fs("cifs"));
         assert!(!is_pseudo_fs("btrfs"));
         assert!(!is_pseudo_fs("ntfs3"));
+        assert!(!is_pseudo_fs("zfs"));
 
         assert!(is_pseudo_mount_point(Path::new("/proc")));
         assert!(is_pseudo_mount_point(Path::new("/sys/fs/cgroup")));
         assert!(!is_pseudo_mount_point(Path::new("/process")));
         assert!(!is_pseudo_mount_point(Path::new("/home")));
+        // Removable media under /run must remain discoverable.
+        assert!(!is_pseudo_mount_point(Path::new("/run/media/sam/MyDrive")));
     }
 
     #[test]

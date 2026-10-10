@@ -8,7 +8,7 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
 use omavrything_core::VERSION;
-use omavrything_core::protocol::{Request, Response};
+use omavrything_core::protocol::{Method, Request, Response};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -44,6 +44,7 @@ fn search(query: &str) -> i32 {
     };
 
     let request = Request {
+        method: Method::Search,
         q: query.to_string(),
         limit: Some(50),
         offset: None,
@@ -68,6 +69,11 @@ fn search(query: &str) -> i32 {
             return 1;
         }
     };
+
+    if let Some(err) = &response.error {
+        eprintln!("error: {err}");
+        return 1;
+    }
 
     for item in &response.results {
         println!("{}", item.path);

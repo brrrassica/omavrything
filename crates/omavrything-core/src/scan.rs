@@ -10,6 +10,7 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::UNIX_EPOCH;
 
 use rayon::prelude::*;
@@ -65,6 +66,8 @@ pub struct ScanReport {
     pub roots: usize,
     pub entries: usize,
     pub skipped: usize,
+    /// Directories that could not be read during traversal.
+    pub errors: usize,
 }
 
 /// Build a fresh index by scanning the configured roots.
@@ -87,10 +90,12 @@ pub fn scan_into_index(index: &mut Index, config: &ScanConfig) -> ScanReport {
 
     // Walk every root in parallel, collecting entries into one buffer.
     let collected: Mutex<Vec<WalkEntry>> = Mutex::new(Vec::new());
+    let errors = AtomicUsize::new(0);
     roots.par_iter().for_each(|(root, _)| {
         let root_dev = fs::metadata(root).map(|m| m.dev()).ok();
-        walk(root, root_dev, &excludes, &collected);
+        walk(root, root_dev, &excludes, &collected, &errors);
     });
+    report.errors = errors.load(Ordering::Relaxed);
     let mut entries = collected.into_inner().unwrap_or_default();
 
     // A parent path is always a strict prefix of its children, so sorting by
@@ -115,7 +120,8 @@ pub fn scan_subtree(index: &mut Index, root: &Path, config: &ScanConfig) {
     let excludes = GlobSet::new(&config.excludes);
     let root_dev = fs::metadata(root).map(|m| m.dev()).ok();
     let collected: Mutex<Vec<WalkEntry>> = Mutex::new(Vec::new());
-    walk(root, root_dev, &excludes, &collected);
+    let errors = AtomicUsize::new(0);
+    walk(root, root_dev, &excludes, &collected, &errors);
 
     let mut entries = collected.into_inner().unwrap_or_default();
     entries.sort_by(|a, b| a.path.cmp(&b.path));
@@ -136,10 +142,12 @@ pub fn rescan_into_index(index: &mut Index, config: &ScanConfig) -> ScanReport {
     let mut report = ScanReport::default();
 
     let collected: Mutex<Vec<WalkEntry>> = Mutex::new(Vec::new());
+    let errors = AtomicUsize::new(0);
     roots.par_iter().for_each(|(root, _)| {
         let root_dev = fs::metadata(root).map(|m| m.dev()).ok();
-        walk(root, root_dev, &excludes, &collected);
+        walk(root, root_dev, &excludes, &collected, &errors);
     });
+    report.errors = errors.load(Ordering::Relaxed);
     let mut entries = collected.into_inner().unwrap_or_default();
     entries.sort_by(|a, b| a.path.cmp(&b.path));
 
@@ -153,6 +161,9 @@ pub fn rescan_into_index(index: &mut Index, config: &ScanConfig) -> ScanReport {
         if index.find(&e.path).is_none() {
             index.insert_with_flags(&e.path, e.is_dir, e.is_symlink, e.size, e.mtime);
             report.entries += 1;
+        } else {
+            // Refresh metadata for entries that changed without an inotify event.
+            index.update_metadata(&e.path, e.size, e.mtime);
         }
     }
 
@@ -206,7 +217,13 @@ fn fs_kind_for_path(mounts: &[Mount], path: &Path) -> FsKind {
 /// Recursively walk `dir`, appending entries to `out`. Directories on a
 /// different device than `root_dev` are not crossed, and excluded paths are
 /// pruned.
-fn walk(dir: &Path, root_dev: Option<u64>, excludes: &GlobSet, out: &Mutex<Vec<WalkEntry>>) {
+fn walk(
+    dir: &Path,
+    root_dev: Option<u64>,
+    excludes: &GlobSet,
+    out: &Mutex<Vec<WalkEntry>>,
+    errors: &AtomicUsize,
+) {
     let mut subdirs: Vec<PathBuf> = Vec::new();
     let mut batch: Vec<WalkEntry> = Vec::new();
 
@@ -256,6 +273,8 @@ fn walk(dir: &Path, root_dev: Option<u64>, excludes: &GlobSet, out: &Mutex<Vec<W
                 subdirs.push(path);
             }
         }
+    } else {
+        errors.fetch_add(1, Ordering::Relaxed);
     }
 
     if !batch.is_empty() {
@@ -264,7 +283,7 @@ fn walk(dir: &Path, root_dev: Option<u64>, excludes: &GlobSet, out: &Mutex<Vec<W
 
     subdirs
         .into_par_iter()
-        .for_each(|d| walk(&d, root_dev, excludes, out));
+        .for_each(|d| walk(&d, root_dev, excludes, out, errors));
 }
 
 #[cfg(test)]

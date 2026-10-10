@@ -57,7 +57,7 @@ pub struct FileRecord {
     /// Offset of the basename into the name arena.
     pub name_off: u32,
     /// Byte length of the basename.
-    pub name_len: u16,
+    pub name_len: u32,
     /// Offset of the full path into the path arena.
     pub path_off: u32,
     /// Byte length of the full path.
@@ -143,11 +143,18 @@ impl Index {
 
     /// Insert a root directory record and register the mount point.
     pub fn add_root(&mut self, path: &Path, fs_kind: FsKind) -> u32 {
-        let idx = self.insert(path, true, 0, 0);
-        self.roots.push(Root {
-            path: path.to_string_lossy().into_owned(),
-            fs_kind,
-        });
+        // Idempotent: re-adding a root must not create a duplicate record.
+        let idx = match self.find(path) {
+            Some(idx) => idx,
+            None => self.insert(path, true, 0, 0),
+        };
+        let path_str = path.to_string_lossy().into_owned();
+        if !self.roots.iter().any(|r| r.path == path_str) {
+            self.roots.push(Root {
+                path: path_str,
+                fs_kind,
+            });
+        }
         idx
     }
 
@@ -182,7 +189,7 @@ impl Index {
 
         let name_off = self.names.len() as u32;
         self.names.extend_from_slice(name.as_bytes());
-        let name_len = name.len().min(u16::MAX as usize) as u16;
+        let name_len = name.len() as u32;
 
         let path_off = self.paths.len() as u32;
         self.paths.extend_from_slice(path_str.as_bytes());
@@ -265,7 +272,13 @@ impl Index {
     /// append-only and record indices remain stable.
     pub fn remove(&mut self, path: &Path) -> bool {
         let key = path.to_string_lossy();
-        let prefix = format!("{key}/");
+        // For the filesystem root "/", the subtree prefix is "/" itself; for any
+        // other path it is "<key>/".
+        let prefix = if key.ends_with('/') {
+            key.to_string()
+        } else {
+            format!("{key}/")
+        };
         let key_bytes = key.as_bytes();
         let prefix_bytes = prefix.as_bytes();
 
@@ -354,13 +367,23 @@ impl Index {
                     .unwrap_or_default();
                 let off = self.names.len() as u32;
                 self.names.extend_from_slice(name.as_bytes());
-                (off, name.len().min(u16::MAX as usize) as u16)
+                (off, name.len() as u32)
             } else {
                 (rec.name_off, rec.name_len)
             };
 
             self.by_path
                 .remove(String::from_utf8_lossy(&old_path).as_ref());
+            // If the destination already exists (rename over an existing file or
+            // empty directory), tombstone the displaced record so it does not
+            // linger as a duplicate.
+            let existing = self.by_path.get(new_path.as_str()).copied();
+            if let Some(existing) = existing {
+                if existing != i && !self.records[existing as usize].is_deleted() {
+                    self.records[existing as usize].flags |= FLAG_DELETED;
+                    self.live -= 1;
+                }
+            }
             self.by_path.insert(new_path.into_boxed_str(), i);
 
             let rec = &mut self.records[i as usize];
@@ -475,10 +498,13 @@ impl Index {
 }
 
 /// A bounded top-N collector. Keeps the `limit` best-ranked records seen so far
-/// in a min-heap keyed by [`Rank`], so the root is always the worst of the set.
+/// in a min-heap keyed by `(Rank, Reverse<record index>)`, so the root is always
+/// the worst of the set. The record index is part of the key so that ties are
+/// broken deterministically (lower index wins), which keeps result ordering
+/// stable across the parallel scan.
 struct TopN {
     limit: usize,
-    heap: BinaryHeap<Reverse<(Rank, u32)>>,
+    heap: BinaryHeap<Reverse<(Rank, Reverse<u32>)>>,
 }
 
 impl TopN {
@@ -493,19 +519,20 @@ impl TopN {
         if self.limit == 0 {
             return;
         }
+        let key = (rank, Reverse(idx));
         if self.heap.len() < self.limit {
-            self.heap.push(Reverse((rank, idx)));
-        } else if let Some(Reverse((worst, _))) = self.heap.peek() {
-            if rank > *worst {
+            self.heap.push(Reverse(key));
+        } else if let Some(Reverse(worst)) = self.heap.peek() {
+            if key > *worst {
                 self.heap.pop();
-                self.heap.push(Reverse((rank, idx)));
+                self.heap.push(Reverse(key));
             }
         }
     }
 
     /// Merge another collector's candidates into this one.
     fn merge(&mut self, other: TopN) {
-        for Reverse((rank, idx)) in other.heap {
+        for Reverse((rank, Reverse(idx))) in other.heap {
             self.push(idx, rank);
         }
     }
@@ -515,9 +542,10 @@ impl TopN {
         let mut v: Vec<(u32, Rank)> = self
             .heap
             .into_iter()
-            .map(|Reverse((rank, idx))| (idx, rank))
+            .map(|Reverse((rank, Reverse(idx)))| (idx, rank))
             .collect();
-        v.sort_by_key(|a| Reverse(a.1));
+        // Best first; ties broken by ascending record index for determinism.
+        v.sort_by_key(|a| Reverse((a.1, Reverse(a.0))));
         v
     }
 }
@@ -702,5 +730,68 @@ mod tests {
         index.add_root(Path::new("/mnt/data"), FsKind::Ntfs);
         assert_eq!(index.roots().len(), 2);
         assert_eq!(index.roots()[1].fs_kind, FsKind::Ntfs);
+    }
+
+    #[test]
+    fn add_root_is_idempotent() {
+        let mut index = Index::new();
+        let a = index.add_root(Path::new("/mnt/data"), FsKind::Ntfs);
+        let b = index.add_root(Path::new("/mnt/data"), FsKind::Ntfs);
+        assert_eq!(a, b);
+        assert_eq!(index.len(), 1);
+        assert_eq!(index.roots().len(), 1);
+    }
+
+    #[test]
+    fn remove_root_slash_tombstones_the_whole_tree() {
+        let mut index = Index::new();
+        index.add_root(Path::new("/"), FsKind::Other);
+        index.insert(Path::new("/home/sam/a.txt"), false, 1, 0);
+        index.insert(Path::new("/etc/hosts"), false, 1, 0);
+        assert!(index.remove(Path::new("/")));
+        assert_eq!(index.len(), 0);
+        assert!(index.search("a.txt", 10, 0).hits.is_empty());
+    }
+
+    #[test]
+    fn rename_over_existing_does_not_leave_a_duplicate() {
+        let mut index = Index::new();
+        index.insert(Path::new("/home/sam/old.txt"), false, 1, 0);
+        index.insert(Path::new("/home/sam/new.txt"), false, 2, 0);
+
+        assert!(index.rename(
+            Path::new("/home/sam/old.txt"),
+            Path::new("/home/sam/new.txt")
+        ));
+        assert_eq!(index.len(), 1);
+        let out = index.search("new.txt", 10, 0);
+        assert_eq!(out.hits.len(), 1);
+        assert_eq!(out.hits[0].size, 1);
+    }
+
+    #[test]
+    fn parallel_scan_is_correct_and_bounded() {
+        // Above PARALLEL_THRESHOLD so the rayon path is exercised.
+        let mut index = Index::new();
+        let n = PARALLEL_THRESHOLD + 1_000;
+        for i in 0..n {
+            index.insert(
+                Path::new(&format!("/data/dir{:03}/file-{i:06}.txt", i % 100)),
+                false,
+                i as u64,
+                0,
+            );
+        }
+        let started = std::time::Instant::now();
+        let out = index.search("file-000123", 100, 0);
+        let elapsed = started.elapsed();
+        assert_eq!(out.total, 1);
+        assert_eq!(out.hits.len(), 1);
+        // A coarse regression gate: a linear scan of ~51k records must be far
+        // under this bound even in a debug build.
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "search took {elapsed:?}"
+        );
     }
 }

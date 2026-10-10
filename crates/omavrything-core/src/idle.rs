@@ -78,12 +78,47 @@ pub fn parse_diskstats(content: &str) -> u64 {
     let mut total = 0u64;
     for line in content.lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();
+        // Field 3 (index 2) is the device name; skip partitions so their
+        // in-flight I/O is not double-counted with the parent disk.
+        let Some(name) = fields.get(2) else { continue };
+        if is_partition(name) {
+            continue;
+        }
         // Field 12 (index 11) is "I/Os currently in progress".
         if let Some(v) = fields.get(11).and_then(|s| s.parse::<u64>().ok()) {
             total += v;
         }
     }
     total
+}
+
+/// Whether a `/proc/diskstats` device name is a partition rather than a whole
+/// disk (`sda1`, `vdb2`, `nvme0n1p1`, `mmcblk0p1`).
+fn is_partition(name: &str) -> bool {
+    // nvme0n1p1, mmcblk0p1: a 'p' preceded by a digit and followed by digits.
+    if let Some(pos) = name.rfind('p') {
+        let before = &name[..pos];
+        let after = &name[pos + 1..];
+        if !after.is_empty()
+            && after.bytes().all(|b| b.is_ascii_digit())
+            && before.bytes().last().is_some_and(|b| b.is_ascii_digit())
+        {
+            return true;
+        }
+    }
+    // sda1, vdb2, hdc3, xvda1: a known disk prefix, letters, then digits.
+    for prefix in ["xvd", "sd", "hd", "vd"] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            let digits = rest.trim_start_matches(|c: char| c.is_ascii_alphabetic());
+            if !digits.is_empty()
+                && digits.len() < rest.len()
+                && digits.bytes().all(|b| b.is_ascii_digit())
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Reads system activity and decides whether the system is idle.
@@ -121,21 +156,22 @@ impl IdleMonitor {
         let cpu = parse_cpu(&std::fs::read_to_string("/proc/stat").ok()?)?;
         let io_in_flight = parse_diskstats(&std::fs::read_to_string("/proc/diskstats").ok()?);
 
-        let cpu_idle = match self.prev_cpu {
-            Some(prev) if cpu.total > prev.total => {
-                let dt = cpu.total - prev.total;
-                let di = cpu.idle.saturating_sub(prev.idle);
-                di as f64 / dt as f64
-            }
-            _ => {
-                if cpu.total > 0 {
-                    cpu.idle as f64 / cpu.total as f64
-                } else {
-                    1.0
-                }
-            }
+        // The first call has no previous sample, so a delta cannot be computed;
+        // report "no snapshot" rather than a misleading since-boot average.
+        let Some(prev) = self.prev_cpu else {
+            self.prev_cpu = Some(cpu);
+            return None;
         };
         self.prev_cpu = Some(cpu);
+
+        let cpu_idle = if cpu.total > prev.total {
+            let dt = cpu.total - prev.total;
+            let di = cpu.idle.saturating_sub(prev.idle);
+            di as f64 / dt as f64
+        } else {
+            // Counters did not advance (or wrapped): treat as fully idle.
+            1.0
+        };
 
         Some(IdleSnapshot {
             load1,
@@ -192,13 +228,27 @@ mod tests {
     }
 
     #[test]
-    fn parses_diskstats_in_flight() {
+    fn parses_diskstats_in_flight_skipping_partitions() {
         // major minor name reads ... field 12 is in-flight I/O.
         let content = "\
    8       0 sda 100 0 2000 50 200 0 4000 80 3 120 0
    8       1 sda1 50 0 1000 20 100 0 2000 40 2 60 0
+ 259       0 nvme0n1 10 0 100 5 20 0 200 6 1 30 0
+ 259       1 nvme0n1p1 5 0 50 2 10 0 100 3 4 15 0
 ";
-        assert_eq!(parse_diskstats(content), 5);
+        // sda (3) + nvme0n1 (1); partitions sda1 and nvme0n1p1 are skipped.
+        assert_eq!(parse_diskstats(content), 4);
+    }
+
+    #[test]
+    fn identifies_partitions() {
+        assert!(is_partition("sda1"));
+        assert!(is_partition("vdb2"));
+        assert!(is_partition("nvme0n1p1"));
+        assert!(is_partition("mmcblk0p1"));
+        assert!(!is_partition("sda"));
+        assert!(!is_partition("nvme0n1"));
+        assert!(!is_partition("mmcblk0"));
     }
 
     #[test]
