@@ -1,0 +1,11 @@
+[package]
+name = "omavrything-ntfs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "NTFS MFT and USN journal access for omavrything (libntfs-ng FFI)"
+
+[dependencies]
