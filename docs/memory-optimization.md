@@ -14,12 +14,12 @@ proposals are **already implemented**. Per live record, steady state:
 | Component | Size / record | Notes |
 |---|---|---|
 | [`FileRecord`](../crates/omavrything-core/src/index.rs:57) | 20 B | u32 size/mtime/parent/path_off + u16 path_len + u8 depth/flags |
-| `paths` arena | ~70 B | **full path bytes** (the dominant term) |
+| `paths` arena | ~40 B | directory full paths + file basenames (deduplicated) |
 | [`PathIndex`](../crates/omavrything-core/src/index.rs:164) | ~9 B x load factor (~10 B) | `HashMap<u32, u32>` hash + index, no path copy |
-| **Total** | **~100 B/file** | ~300 MB for 3M files |
+| **Total** | **~70 B/file** | ~210 MB for 3M files |
 
-The basename is derived from the path (the bytes after the last `/`), so there
-is no separate `names` arena.
+Directories store their full path; files store only their basename and reference
+their parent, so a directory's path is not duplicated in every descendant.
 
 The gap to the observed ~700 MB RSS is explained by:
 
@@ -118,14 +118,32 @@ retention:
   tuple to 16 B; switching the key to a 32-bit hash makes it `(u32, u32)` (8 B),
   halving the map.
 - **`compact()` was a no-op without tombstones**, so a cold scan never shrank its
-  arenas. A new `Index::shrink()` reclaims the doubling slack after the scan or a
-  warm start, and `memory_bytes()` now reports capacity rather than length.
+  arenas. A new `Index::shrink()` reclaims the doubling slack after the scan, a
+  warm start, and NTFS indexing. `memory_bytes()` reports the used (resident)
+  size; `memory_breakdown()` exposes the per-component length and capacity.
 - **Allocator retention.** `malloc_trim(0)` does not reliably release per-thread
   glibc arenas, so the scan's transient buffers could stay resident. The daemon
   now calls `mallopt(M_ARENA_MAX, 1)` at startup so a single arena is trimmed.
 
 `FileRecord` was also shrunk from 32 to 20 bytes (`size`/`mtime` to `u32`,
 `path_len` to `u16`, `depth` to `u8`), bumping the snapshot format to v3.
+
+### Path dedup (P5)
+
+The paths arena was 73% of the index (432 MB of 593 MB) because every record
+stored its full path, so a directory's path was duplicated in every descendant.
+Directories now store their full path and files store only their basename,
+referencing their parent; a file's full path is reconstructed on demand. Search
+scans the parent path and basename as two slices (plus a boundary check for
+terms containing `/`), so it stays O(N). This cut the arena to ~122 MB and RSS
+from ~593 MB to ~293 MB. The snapshot format is now v4.
+
+### NTFS MFT streaming
+
+[`NtfsVolume::enumerate`](../crates/omavrything-ntfs/src/volume.rs:112) read the
+entire MFT into memory (`record_count × record_size`), which peaked at ~4 GB on
+the indexed volumes. It now reads the MFT in bounded 16 MB chunks, carrying a
+partial record across chunk boundaries, cutting the peak to ~836 MB.
 
 ## 6. Suggested execution plan
 

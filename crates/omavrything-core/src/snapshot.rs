@@ -31,7 +31,7 @@ use crate::index::{FileRecord, FsKind, Index, Root};
 use crate::scan::{ScanConfig, ScanReport, resolve_roots, scan, scan_into_index};
 
 const MAGIC: &[u8; 8] = b"OMAVSNAP";
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 
 /// A snapshot error.
 #[derive(Debug)]

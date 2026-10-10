@@ -532,10 +532,20 @@ pub(crate) fn run_ntfs_startup(index: Arc<RwLock<Index>>, policy: Arc<Mutex<ntfs
         }
     }
     // MFT parsing allocates large transient buffers and the re-index appends to
-    // the arenas; compact and return the freed pages before the daemon idles.
+    // the arenas; compact, reclaim the doubling slack, and return the freed pages
+    // before the daemon idles.
     {
         let mut idx = write_index(&index);
         idx.compact();
+        idx.shrink();
+        let b = idx.memory_breakdown();
+        info!(
+            records_len = b.records_len,
+            records_cap = b.records_cap,
+            paths_len = b.paths_len,
+            paths_cap = b.paths_cap,
+            "index shrunk after NTFS indexing"
+        );
     }
     trim_heap();
 }

@@ -71,6 +71,13 @@ impl Manager {
         map.insert("entries".into(), index.len().to_string());
         map.insert("roots".into(), index.roots().len().to_string());
         map.insert("memory_bytes".into(), index.memory_bytes().to_string());
+        let b = index.memory_breakdown();
+        map.insert("records_len".into(), b.records_len.to_string());
+        map.insert("records_cap".into(), b.records_cap.to_string());
+        map.insert("paths_len".into(), b.paths_len.to_string());
+        map.insert("paths_cap".into(), b.paths_cap.to_string());
+        map.insert("map_len".into(), b.map_len.to_string());
+        map.insert("map_cap_bytes".into(), b.map_cap_bytes.to_string());
         map.insert("scanning".into(), self.config.scanning().to_string());
         map.insert(
             "uptime_secs".into(),

@@ -321,13 +321,15 @@ pub fn apply_rescan(index: &mut Index, plan: RescanPlan) -> ScanReport {
 
     // Records under a root that the walk did not confirm are stale.
     let mut stale: Vec<PathBuf> = Vec::new();
+    let mut buf = String::new();
     for (i, rec) in index.records().iter().enumerate() {
         if rec.is_deleted() || seen[i] {
             continue;
         }
-        let p = index.path(i as u32);
-        if roots.iter().any(|(r, _)| Path::new(p).starts_with(r)) {
-            stale.push(PathBuf::from(p));
+        buf.clear();
+        index.write_path(i as u32, &mut buf);
+        if roots.iter().any(|(r, _)| Path::new(&buf).starts_with(r)) {
+            stale.push(PathBuf::from(&buf));
         }
     }
     // Removing a directory tombstones its whole subtree, so drop descendants of

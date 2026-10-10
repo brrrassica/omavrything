@@ -65,6 +65,53 @@ impl Term {
             None
         }
     }
+
+    /// The earliest position where this term matches the full path formed by
+    /// `parent` + `/` + `name`, if any.
+    ///
+    /// The index stores a file's basename separately from its parent directory's
+    /// path, so a term is matched against the two slices independently, plus the
+    /// separator between them (a term containing `/` can span the boundary).
+    pub fn find_in_file_path(&self, parent: &[u8], name: &[u8], sep: &[u8]) -> Option<usize> {
+        let mut best: Option<usize> = None;
+        if let Some(p) = self.find(parent) {
+            best = Some(p);
+        }
+        if let Some(p) = self.find(name) {
+            let pos = parent.len() + sep.len() + p;
+            best = Some(best.map_or(pos, |b| b.min(pos)));
+        }
+        if let Some(pos) = self.find_boundary(parent, name, sep) {
+            best = Some(best.map_or(pos, |b| b.min(pos)));
+        }
+        best
+    }
+
+    /// The position where this term spans the `parent`/`name` separator, if any.
+    ///
+    /// `sep` is `/` for a normal parent, or empty for the filesystem root `/`
+    /// (which already ends with a separator). Only ASCII terms are checked.
+    fn find_boundary(&self, parent: &[u8], name: &[u8], sep: &[u8]) -> Option<usize> {
+        let needle = self.ascii.as_ref()?;
+        for i in 0..=needle.len() {
+            if i + sep.len() > needle.len() {
+                break;
+            }
+            if &needle[i..i + sep.len()] != sep {
+                continue;
+            }
+            let left = &needle[..i];
+            let right = &needle[i + sep.len()..];
+            if parent.len() >= left.len()
+                && parent[parent.len() - left.len()..].eq_ignore_ascii_case(left)
+                && name.len() >= right.len()
+                && name[..right.len()].eq_ignore_ascii_case(right)
+            {
+                return Some(parent.len() - left.len());
+            }
+        }
+        None
+    }
 }
 
 /// Case-insensitive ASCII substring search over raw bytes.
@@ -176,6 +223,30 @@ mod tests {
     fn unicode_term_matches_case_insensitively() {
         let t = Term::new("ÜNÏCODE");
         assert_eq!(t.find("/tmp/ünïcode.txt".as_bytes()), Some(5));
+    }
+
+    #[test]
+    fn file_path_match_covers_parent_name_and_boundary() {
+        let parent = b"/home/sam/Documents";
+        let name = b"report.txt";
+
+        // Within the parent path.
+        assert_eq!(
+            Term::new("documents").find_in_file_path(parent, name, b"/"),
+            Some(10)
+        );
+        // Within the basename (position is offset past the separator).
+        assert_eq!(
+            Term::new("report").find_in_file_path(parent, name, b"/"),
+            Some(parent.len() + 1)
+        );
+        // Spanning the separator.
+        assert_eq!(
+            Term::new("documents/report").find_in_file_path(parent, name, b"/"),
+            Some(10)
+        );
+        // No match.
+        assert_eq!(Term::new("zzz").find_in_file_path(parent, name, b"/"), None);
     }
 
     #[test]

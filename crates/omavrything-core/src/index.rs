@@ -1,20 +1,22 @@
 //! Production in-memory index: arena-backed records with ranked substring
 //! search.
 //!
-//! Records live in a flat `Vec<FileRecord>`; full paths live in a single byte
-//! arena so a query scans contiguous memory. The basename is derived from the
-//! path (the bytes after the last `/`) rather than stored in a second arena, so
-//! there is no duplicate string storage. Directories are records too, so the
-//! tree can be reconstructed and subtree updates can splice.
+//! Records live in a flat `Vec<FileRecord>`; path bytes live in a single arena
+//! so a query scans contiguous memory. To avoid duplicating a directory's path
+//! in every descendant, **directories store their full path** while **files
+//! store only their basename** and reference their parent; a file's full path is
+//! `parent_path + "/" + basename`, reconstructed on demand. Directories are
+//! records too, so the tree can be reconstructed and subtree updates can splice.
 //!
 //! Deletions are tombstones (`FLAG_DELETED`): the arena is append-only, so a
 //! removed record's bytes are not reclaimed until a future compaction pass. A
 //! [`PathIndex`] maps full paths to record indices for O(1)
-//! insert/remove/rename lookups; it keys on a 64-bit hash of the path and
-//! confirms matches against the path arena, so it does **not** duplicate the
-//! path bytes (the previous `HashMap<Box<str>, u32>` did, and dominated the
+//! insert/remove/rename lookups; it keys on a 32-bit hash of the path and
+//! confirms matches against the reconstructed path, so it does **not** duplicate
+//! the path bytes (the previous `HashMap<Box<str>, u32>` did, and dominated the
 //! index's memory use).
 
+use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::Path;
@@ -180,6 +182,10 @@ impl PathIndex {
         }
     }
 
+    fn len(&self) -> usize {
+        self.main.len() + self.collisions.len()
+    }
+
     fn clear(&mut self) {
         self.main.clear();
         self.collisions.clear();
@@ -204,9 +210,7 @@ impl PathIndex {
     fn get(&self, key: &str, records: &[FileRecord], paths: &[u8]) -> Option<u32> {
         let h = fnv1a32(key.as_bytes());
         if let Some(&idx) = self.main.get(&h) {
-            let rec = &records[idx as usize];
-            let start = rec.path_off as usize;
-            if &paths[start..start + rec.path_len as usize] == key.as_bytes() {
+            if record_path_eq(&records[idx as usize], records, paths, key.as_bytes()) {
                 return Some(idx);
             }
         }
@@ -217,9 +221,7 @@ impl PathIndex {
     fn insert(&mut self, key: &str, idx: u32, records: &[FileRecord], paths: &[u8]) {
         let h = fnv1a32(key.as_bytes());
         let collides = self.main.get(&h).copied().is_some_and(|existing| {
-            let rec = &records[existing as usize];
-            let start = rec.path_off as usize;
-            &paths[start..start + rec.path_len as usize] != key.as_bytes()
+            !record_path_eq(&records[existing as usize], records, paths, key.as_bytes())
         });
         if collides {
             self.collisions.insert(key.into(), idx);
@@ -237,9 +239,7 @@ impl PathIndex {
     fn insert_bytes(&mut self, key: &[u8], idx: u32, records: &[FileRecord], paths: &[u8]) {
         let h = fnv1a32(key);
         let collides = self.main.get(&h).copied().is_some_and(|existing| {
-            let rec = &records[existing as usize];
-            let start = rec.path_off as usize;
-            &paths[start..start + rec.path_len as usize] != key
+            !record_path_eq(&records[existing as usize], records, paths, key)
         });
         if collides {
             self.collisions.insert(
@@ -255,9 +255,7 @@ impl PathIndex {
     fn remove(&mut self, key: &str, records: &[FileRecord], paths: &[u8]) {
         let h = fnv1a32(key.as_bytes());
         if let Some(&idx) = self.main.get(&h) {
-            let rec = &records[idx as usize];
-            let start = rec.path_off as usize;
-            if &paths[start..start + rec.path_len as usize] == key.as_bytes() {
+            if record_path_eq(&records[idx as usize], records, paths, key.as_bytes()) {
                 self.main.remove(&h);
                 return;
             }
@@ -290,6 +288,56 @@ fn mtime_to_u32(mtime: i64) -> u32 {
     mtime.clamp(0, u32::MAX as i64) as u32
 }
 
+/// Whether a record's stored bytes are its full path (directories and
+/// parentless records) rather than a basename (files with a parent).
+fn stores_full_path(rec: &FileRecord) -> bool {
+    rec.is_dir() || rec.parent == u32::MAX
+}
+
+/// The stored bytes of a record: the full path for directories and parentless
+/// records, the basename for files with a parent.
+fn stored_bytes<'a>(rec: &FileRecord, paths: &'a [u8]) -> &'a [u8] {
+    let start = rec.path_off as usize;
+    &paths[start..start + rec.path_len as usize]
+}
+
+/// Write a record's full path into `out`.
+fn write_full_path_bytes(
+    rec: &FileRecord,
+    records: &[FileRecord],
+    paths: &[u8],
+    out: &mut Vec<u8>,
+) {
+    if stores_full_path(rec) {
+        out.extend_from_slice(stored_bytes(rec, paths));
+    } else {
+        let parent = &records[rec.parent as usize];
+        let p = stored_bytes(parent, paths);
+        out.extend_from_slice(p);
+        // The filesystem root "/" already ends with a separator.
+        if !p.ends_with(b"/") {
+            out.push(b'/');
+        }
+        out.extend_from_slice(stored_bytes(rec, paths));
+    }
+}
+
+/// Whether `rec`'s full path equals `key`.
+fn record_path_eq(rec: &FileRecord, records: &[FileRecord], paths: &[u8], key: &[u8]) -> bool {
+    if stores_full_path(rec) {
+        stored_bytes(rec, paths) == key
+    } else {
+        let parent = &records[rec.parent as usize];
+        let p = stored_bytes(parent, paths);
+        let n = stored_bytes(rec, paths);
+        let sep = if p.ends_with(b"/") { 0 } else { 1 };
+        key.len() == p.len() + sep + n.len()
+            && key.starts_with(p)
+            && (sep == 0 || key[p.len()] == b'/')
+            && &key[p.len() + sep..] == n
+    }
+}
+
 /// The in-memory index.
 #[derive(Debug, Default, Clone)]
 pub struct Index {
@@ -298,6 +346,23 @@ pub struct Index {
     roots: Vec<Root>,
     by_path: PathIndex,
     live: usize,
+}
+
+/// A per-component breakdown of the index's memory, for diagnostics.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MemoryBreakdown {
+    /// Live record count.
+    pub records_len: usize,
+    /// Record vector capacity.
+    pub records_cap: usize,
+    /// Path arena bytes used.
+    pub paths_len: usize,
+    /// Path arena capacity.
+    pub paths_cap: usize,
+    /// Path map entries.
+    pub map_len: usize,
+    /// Path map estimated bytes.
+    pub map_cap_bytes: usize,
 }
 
 impl Index {
@@ -328,15 +393,31 @@ impl Index {
         &self.records
     }
 
-    /// An estimate of the heap memory held by the index, in bytes.
+    /// An estimate of the resident heap memory held by the index, in bytes.
     ///
-    /// Counts the **capacity** of the record vector, the path arena, and the path
-    /// map, so allocation slack is included. Used for `GetStatus`.
+    /// Counts the **used** bytes of the record vector, the path arena, and the
+    /// path map. A `Vec`'s spare capacity is not resident, so this tracks RSS
+    /// more closely than a capacity-based figure; the full breakdown (including
+    /// capacity) is available from [`Index::memory_breakdown`]. Used for
+    /// `GetStatus`.
     pub fn memory_bytes(&self) -> u64 {
-        let records = self.records.capacity() * std::mem::size_of::<FileRecord>();
-        let arenas = self.paths.capacity();
-        let map = self.by_path.capacity_bytes();
+        let records = self.records.len() * std::mem::size_of::<FileRecord>();
+        let arenas = self.paths.len();
+        let map =
+            self.by_path.len() * (std::mem::size_of::<u32>() + std::mem::size_of::<u32>() + 1);
         (records + arenas + map) as u64
+    }
+
+    /// A per-component breakdown of the index's memory, for diagnostics.
+    pub fn memory_breakdown(&self) -> MemoryBreakdown {
+        MemoryBreakdown {
+            records_len: self.records.len(),
+            records_cap: self.records.capacity(),
+            paths_len: self.paths.len(),
+            paths_cap: self.paths.capacity(),
+            map_len: self.by_path.len(),
+            map_cap_bytes: self.by_path.capacity_bytes(),
+        }
     }
 
     /// Rebuild the arenas and record vector, dropping tombstones and reclaiming
@@ -358,7 +439,7 @@ impl Index {
             remap[i] = records.len() as u32;
 
             let path_off = paths.len() as u32;
-            paths.extend_from_slice(self.path_bytes(rec));
+            paths.extend_from_slice(stored_bytes(rec, &self.paths));
 
             let parent = if rec.parent == u32::MAX {
                 u32::MAX
@@ -379,15 +460,12 @@ impl Index {
         self.records = records;
         self.paths = paths;
         self.by_path.clear();
+        let mut buf: Vec<u8> = Vec::new();
         for (i, rec) in self.records.iter().enumerate() {
-            let start = rec.path_off as usize;
-            let end = start + rec.path_len as usize;
-            self.by_path.insert_bytes(
-                &self.paths[start..end],
-                i as u32,
-                &self.records,
-                &self.paths,
-            );
+            buf.clear();
+            write_full_path_bytes(rec, &self.records, &self.paths, &mut buf);
+            self.by_path
+                .insert_bytes(&buf, i as u32, &self.records, &self.paths);
         }
         // The arena was pre-sized to its pre-compaction length, which still
         // includes the tombstones just dropped; release the excess capacity.
@@ -417,16 +495,15 @@ impl Index {
     pub(crate) fn from_parts(records: Vec<FileRecord>, paths: Vec<u8>, roots: Vec<Root>) -> Self {
         let mut by_path = PathIndex::with_capacity(records.len());
         let mut live = 0usize;
+        let mut buf: Vec<u8> = Vec::new();
         for (i, rec) in records.iter().enumerate() {
             if rec.is_deleted() {
                 continue;
             }
             live += 1;
-            let start = rec.path_off as usize;
-            let end = start + rec.path_len as usize;
-            if let Some(bytes) = paths.get(start..end) {
-                by_path.insert_bytes(bytes, i as u32, &records, &paths);
-            }
+            buf.clear();
+            write_full_path_bytes(rec, &records, &paths, &mut buf);
+            by_path.insert_bytes(&buf, i as u32, &records, &paths);
         }
         Self {
             records,
@@ -492,9 +569,20 @@ impl Index {
             .count()
             .min(u8::MAX as usize) as u8;
 
+        // Directories (and parentless records) store their full path; files with
+        // a parent store only their basename, so the parent's path is not
+        // duplicated in every child.
+        let bytes = path_str.as_bytes();
+        let stored: &[u8] = if is_dir || parent == u32::MAX {
+            bytes
+        } else {
+            let start = bytes.iter().rposition(|&b| b == b'/').map_or(0, |p| p + 1);
+            &bytes[start..]
+        };
+
         let path_off = self.paths.len() as u32;
-        self.paths.extend_from_slice(path_str.as_bytes());
-        let path_len = path_str.len().min(u16::MAX as usize) as u16;
+        self.paths.extend_from_slice(stored);
+        let path_len = stored.len().min(u16::MAX as usize) as u16;
 
         let mut flags = 0u8;
         if is_dir {
@@ -562,22 +650,46 @@ impl Index {
     }
 
     /// The full path of a record.
-    pub fn path(&self, idx: u32) -> &str {
+    ///
+    /// Borrowed for directories and parentless records; reconstructed (and thus
+    /// owned) for files, whose stored bytes are only the basename.
+    pub fn path(&self, idx: u32) -> Cow<'_, str> {
         let rec = &self.records[idx as usize];
-        let start = rec.path_off as usize;
-        std::str::from_utf8(&self.paths[start..start + rec.path_len as usize]).unwrap_or("")
+        if stores_full_path(rec) {
+            Cow::Borrowed(std::str::from_utf8(stored_bytes(rec, &self.paths)).unwrap_or(""))
+        } else {
+            let mut s = String::new();
+            self.write_path(idx, &mut s);
+            Cow::Owned(s)
+        }
     }
 
-    fn path_bytes(&self, rec: &FileRecord) -> &[u8] {
-        let start = rec.path_off as usize;
-        &self.paths[start..start + rec.path_len as usize]
+    /// Write the full path of a record into `out`, reusing its capacity.
+    pub fn write_path(&self, idx: u32, out: &mut String) {
+        let rec = &self.records[idx as usize];
+        if stores_full_path(rec) {
+            out.push_str(std::str::from_utf8(stored_bytes(rec, &self.paths)).unwrap_or(""));
+        } else {
+            let parent = &self.records[rec.parent as usize];
+            let p = std::str::from_utf8(stored_bytes(parent, &self.paths)).unwrap_or("");
+            out.push_str(p);
+            // The filesystem root "/" already ends with a separator.
+            if !p.ends_with('/') {
+                out.push('/');
+            }
+            out.push_str(std::str::from_utf8(stored_bytes(rec, &self.paths)).unwrap_or(""));
+        }
     }
 
-    /// The basename bytes of a record: the path bytes after the last `/`.
+    /// The basename bytes of a record.
     fn name_bytes(&self, rec: &FileRecord) -> &[u8] {
-        let path = self.path_bytes(rec);
-        let start = path.iter().rposition(|&b| b == b'/').map_or(0, |p| p + 1);
-        &path[start..]
+        if stores_full_path(rec) {
+            let path = stored_bytes(rec, &self.paths);
+            let start = path.iter().rposition(|&b| b == b'/').map_or(0, |p| p + 1);
+            &path[start..]
+        } else {
+            stored_bytes(rec, &self.paths)
+        }
     }
 
     /// Remove `path` and its subtree. Returns whether anything was removed.
@@ -597,12 +709,14 @@ impl Index {
         let prefix_bytes = prefix.as_bytes();
 
         let mut to_delete: Vec<u32> = Vec::new();
+        let mut buf: Vec<u8> = Vec::new();
         for (i, rec) in self.records.iter().enumerate() {
             if rec.is_deleted() {
                 continue;
             }
-            let p = self.path_bytes(rec);
-            if p == key_bytes || p.starts_with(prefix_bytes) {
+            buf.clear();
+            write_full_path_bytes(rec, &self.records, &self.paths, &mut buf);
+            if buf == key_bytes || buf.starts_with(prefix_bytes) {
                 to_delete.push(i as u32);
             }
         }
@@ -612,8 +726,14 @@ impl Index {
 
         for &i in &to_delete {
             self.records[i as usize].flags |= FLAG_DELETED;
-            let p = self.path_bytes(&self.records[i as usize]).to_vec();
-            self.map_remove(String::from_utf8_lossy(&p).as_ref());
+            buf.clear();
+            write_full_path_bytes(
+                &self.records[i as usize],
+                &self.records,
+                &self.paths,
+                &mut buf,
+            );
+            self.map_remove(String::from_utf8_lossy(&buf).as_ref());
         }
         self.live -= to_delete.len();
         true
@@ -629,6 +749,7 @@ impl Index {
         let old_bytes = old_key.as_bytes();
         let old_prefix_bytes = old_prefix.as_bytes();
 
+        let mut buf: Vec<u8> = Vec::new();
         let affected: Vec<u32> = self
             .records
             .iter()
@@ -637,8 +758,9 @@ impl Index {
                 if rec.is_deleted() {
                     return false;
                 }
-                let p = self.path_bytes(rec);
-                p == old_bytes || p.starts_with(old_prefix_bytes)
+                buf.clear();
+                write_full_path_bytes(rec, &self.records, &self.paths, &mut buf);
+                buf == old_bytes || buf.starts_with(old_prefix_bytes)
             })
             .map(|(i, _)| i as u32)
             .collect();
@@ -656,22 +778,15 @@ impl Index {
 
         for i in affected {
             let rec = self.records[i as usize];
-            let old_path = self.path_bytes(&rec).to_vec();
+            buf.clear();
+            write_full_path_bytes(&rec, &self.records, &self.paths, &mut buf);
+            let old_path = buf.clone();
             let new_path: String = if old_path == old_bytes {
                 new_key.to_string()
             } else {
                 let suffix = &old_path[old_prefix_bytes.len()..];
                 format!("{new_prefix}{}", String::from_utf8_lossy(suffix))
             };
-
-            let path_off = self.paths.len() as u32;
-            self.paths.extend_from_slice(new_path.as_bytes());
-            let path_len = new_path.len().min(u16::MAX as usize) as u16;
-            let depth = new_path
-                .bytes()
-                .filter(|&b| b == b'/')
-                .count()
-                .min(u8::MAX as usize) as u8;
 
             let is_exact = exact == Some(i);
 
@@ -688,12 +803,24 @@ impl Index {
             }
             self.map_insert(new_path.as_str(), i);
 
-            let rec = &mut self.records[i as usize];
-            rec.path_off = path_off;
-            rec.path_len = path_len;
-            rec.depth = depth;
+            // Directories (and parentless records) store their full path, which
+            // changes; files store only their basename, which does not.
+            if stores_full_path(&rec) {
+                let path_off = self.paths.len() as u32;
+                self.paths.extend_from_slice(new_path.as_bytes());
+                let path_len = new_path.len().min(u16::MAX as usize) as u16;
+                let depth = new_path
+                    .bytes()
+                    .filter(|&b| b == b'/')
+                    .count()
+                    .min(u8::MAX as usize) as u8;
+                let rec = &mut self.records[i as usize];
+                rec.path_off = path_off;
+                rec.path_len = path_len;
+                rec.depth = depth;
+            }
             if is_exact {
-                rec.parent = new_parent;
+                self.records[i as usize].parent = new_parent;
             }
         }
         true
@@ -778,18 +905,35 @@ impl Index {
         if rec.is_deleted() {
             return None;
         }
-        let path = self.path_bytes(rec);
         let mut first_pos = u32::MAX;
-        for term in q.terms() {
-            let pos = term.find(path)?;
-            first_pos = first_pos.min(pos as u32);
-        }
+        let path_len = if stores_full_path(rec) {
+            let path = stored_bytes(rec, &self.paths);
+            for term in q.terms() {
+                let pos = term.find(path)?;
+                first_pos = first_pos.min(pos as u32);
+            }
+            rec.path_len as u32
+        } else {
+            let parent = &self.records[rec.parent as usize];
+            let parent_path = stored_bytes(parent, &self.paths);
+            let name = stored_bytes(rec, &self.paths);
+            let sep: &[u8] = if parent_path.ends_with(b"/") {
+                b""
+            } else {
+                b"/"
+            };
+            for term in q.terms() {
+                let pos = term.find_in_file_path(parent_path, name, sep)?;
+                first_pos = first_pos.min(pos as u32);
+            }
+            parent.path_len as u32 + sep.len() as u32 + rec.path_len as u32
+        };
         let name = self.name_bytes(rec);
         let name_match = q.terms().iter().all(|t| t.find(name).is_some());
         Some(Rank {
             name_match,
             first_pos,
-            path_len: rec.path_len as u32,
+            path_len,
             depth: rec.depth as u16,
             mtime: rec.mtime as i64,
         })
@@ -834,7 +978,7 @@ impl Index {
     fn hit(&self, idx: u32) -> Hit {
         let rec = &self.records[idx as usize];
         Hit {
-            path: self.path(idx).to_string(),
+            path: self.path(idx).into_owned(),
             name: self.name(idx).to_string(),
             size: rec.size as u64,
             mtime: rec.mtime as i64,

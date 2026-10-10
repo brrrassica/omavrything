@@ -90,66 +90,77 @@ impl<R: Read + Seek> NtfsVolume<R> {
         self.record_count
     }
 
-    /// Read the whole MFT into memory.
-    fn read_mft(&mut self) -> io::Result<Vec<u8>> {
-        let cluster = self.boot.cluster_size();
-        let mut mft = Vec::with_capacity((self.record_count * self.record_size) as usize);
-        for &(lcn, len) in &self.mft_runs {
-            let offset = lcn * cluster;
-            let size = len * cluster;
-            self.reader.seek(SeekFrom::Start(offset))?;
-            let mut buf = vec![0u8; size as usize];
-            self.reader.read_exact(&mut buf)?;
-            mft.extend_from_slice(&buf);
-        }
-        Ok(mft)
-    }
+    /// The maximum number of MFT bytes read into memory at once.
+    const MFT_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 
     /// Enumerate every user file and directory in the volume.
     ///
     /// Metadata records (0..=15) are skipped. Paths are relative to the volume
     /// root and use `/` separators.
+    ///
+    /// The MFT is read in bounded chunks rather than all at once, so a
+    /// multi-gigabyte MFT does not have to be resident. A partial record at a
+    /// chunk boundary is carried into the next chunk.
     pub fn enumerate(&mut self) -> io::Result<Vec<NtfsEntry>> {
-        let mft = self.read_mft()?;
         let sector = self.boot.bytes_per_sector as usize;
         let record_size = self.record_size as usize;
+        let cluster = self.boot.cluster_size();
 
         // record number -> (parent, name, is_dir, size, mtime)
         let mut map: HashMap<u64, (u64, String, bool, u64, i64)> = HashMap::new();
-        for i in 0..self.record_count {
-            let start = (i * self.record_size) as usize;
-            let end = start + record_size;
-            if end > mft.len() {
-                break;
-            }
-            let mut rec = mft[start..end].to_vec();
-            if !mft::apply_fixups(&mut rec, sector) {
-                continue;
-            }
-            let Some(parsed) = mft::parse_record(&rec, i) else {
-                continue;
-            };
-            if !parsed.in_use {
-                continue;
-            }
-            if let Some(f) = parsed.file_name {
-                // The `$DATA` real size is authoritative for files; the
-                // `$FILE_NAME` size is a fallback (and is 0 for the DOS alias).
-                let size = if parsed.is_dir {
-                    0
-                } else if parsed.data_size > 0 {
-                    parsed.data_size
-                } else {
-                    f.real_size
-                };
-                // `$STANDARD_INFORMATION` is authoritative; `$FILE_NAME` is a
-                // secondary copy that can lag.
-                let mtime = if parsed.mtime != 0 {
-                    parsed.mtime
-                } else {
-                    f.mtime
-                };
-                map.insert(i, (f.parent, f.name, parsed.is_dir, size, mtime));
+
+        let chunk_bytes = (Self::MFT_CHUNK_BYTES / record_size).max(1) * record_size;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut number: u64 = 0;
+        for &(lcn, len) in &self.mft_runs {
+            let run_bytes = len * cluster;
+            let mut run_pos: u64 = 0;
+            while run_pos < run_bytes {
+                let want = (run_bytes - run_pos).min(chunk_bytes as u64) as usize;
+                let carry = buf.len();
+                buf.resize(carry + want, 0);
+                self.reader.seek(SeekFrom::Start(lcn * cluster + run_pos))?;
+                self.reader.read_exact(&mut buf[carry..])?;
+
+                let mut pos = 0;
+                while pos + record_size <= buf.len() {
+                    let n = number;
+                    number += 1;
+                    let mut rec = buf[pos..pos + record_size].to_vec();
+                    pos += record_size;
+                    if !mft::apply_fixups(&mut rec, sector) {
+                        continue;
+                    }
+                    let Some(parsed) = mft::parse_record(&rec, n) else {
+                        continue;
+                    };
+                    if !parsed.in_use {
+                        continue;
+                    }
+                    if let Some(f) = parsed.file_name {
+                        // The `$DATA` real size is authoritative for files; the
+                        // `$FILE_NAME` size is a fallback (and is 0 for the DOS
+                        // alias).
+                        let size = if parsed.is_dir {
+                            0
+                        } else if parsed.data_size > 0 {
+                            parsed.data_size
+                        } else {
+                            f.real_size
+                        };
+                        // `$STANDARD_INFORMATION` is authoritative; `$FILE_NAME`
+                        // is a secondary copy that can lag.
+                        let mtime = if parsed.mtime != 0 {
+                            parsed.mtime
+                        } else {
+                            f.mtime
+                        };
+                        map.insert(n, (f.parent, f.name, parsed.is_dir, size, mtime));
+                    }
+                }
+                // Keep the partial record (if any) for the next chunk.
+                buf.drain(..pos);
+                run_pos += want as u64;
             }
         }
 
