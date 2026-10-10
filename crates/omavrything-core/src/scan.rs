@@ -4,9 +4,12 @@
 //! Roots are either explicit (`ScanConfig::roots`) or discovered from the mount
 //! table. Each root is walked in parallel with rayon; directories on a different
 //! device (mount points) and directories matching an exclude glob are pruned.
-//! Collected entries are sorted by path so parents are inserted before children.
+//! Collected entries are held in a compact arena ([`WalkBuffer`]) and sorted by
+//! path so parents are inserted before children.
 
+use std::ffi::OsStr;
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -68,14 +71,81 @@ impl ScanConfig {
     }
 }
 
-/// One entry discovered by the walker.
-#[derive(Debug, Clone)]
-struct WalkEntry {
-    path: PathBuf,
-    is_dir: bool,
-    is_symlink: bool,
+/// One entry discovered by the walker, stored compactly.
+///
+/// The path is not owned: it lives in the shared [`WalkBuffer`] arena, and this
+/// record holds only its offset and length. This avoids one heap allocation per
+/// path (a `PathBuf` per entry), which dominated the scanner's transient memory.
+#[derive(Debug, Clone, Copy)]
+struct CompactEntry {
+    /// Offset of the path bytes into the buffer arena.
+    path_off: u32,
+    /// Byte length of the path.
+    path_len: u32,
     size: u64,
     mtime: i64,
+    is_dir: bool,
+    is_symlink: bool,
+}
+
+/// A compact, arena-backed collection of walked entries.
+///
+/// Paths are stored back-to-back in `arena`; each [`CompactEntry`] records its
+/// offset and length. Sorting compares arena slices, so the entries stay
+/// contiguous and allocation-free. The arena is capped at 4 GiB by the `u32`
+/// offsets, matching the index's own path arena.
+#[derive(Debug, Default)]
+struct WalkBuffer {
+    arena: Vec<u8>,
+    entries: Vec<CompactEntry>,
+}
+
+impl WalkBuffer {
+    /// Append one entry, copying its path bytes into the arena.
+    fn push(&mut self, path: &Path, is_dir: bool, is_symlink: bool, size: u64, mtime: i64) {
+        let bytes = path.as_os_str().as_bytes();
+        debug_assert!(
+            self.arena.len() <= u32::MAX as usize,
+            "walk arena exceeds 4 GiB"
+        );
+        let path_off = self.arena.len() as u32;
+        self.arena.extend_from_slice(bytes);
+        self.entries.push(CompactEntry {
+            path_off,
+            path_len: bytes.len() as u32,
+            size,
+            mtime,
+            is_dir,
+            is_symlink,
+        });
+    }
+
+    /// The path of an entry, borrowed from the arena.
+    fn path(&self, e: &CompactEntry) -> &Path {
+        let start = e.path_off as usize;
+        let bytes = &self.arena[start..start + e.path_len as usize];
+        Path::new(OsStr::from_bytes(bytes))
+    }
+
+    /// Sort entries by path, so parents precede their children.
+    fn sort(&mut self) {
+        let Self { arena, entries } = self;
+        entries.sort_by(|a, b| {
+            let pa = &arena[a.path_off as usize..(a.path_off + a.path_len) as usize];
+            let pb = &arena[b.path_off as usize..(b.path_off + b.path_len) as usize];
+            pa.cmp(pb)
+        });
+    }
+
+    /// Append another buffer's entries, rebasing their path offsets.
+    fn merge(&mut self, other: WalkBuffer) {
+        let base = self.arena.len() as u32;
+        self.arena.extend_from_slice(&other.arena);
+        self.entries.extend(other.entries.into_iter().map(|mut e| {
+            e.path_off += base;
+            e
+        }));
+    }
 }
 
 /// A summary of a scan.
@@ -107,7 +177,7 @@ pub fn scan_into_index(index: &mut Index, config: &ScanConfig) -> ScanReport {
     }
 
     // Walk every root in parallel, collecting entries into one buffer.
-    let collected: Mutex<Vec<WalkEntry>> = Mutex::new(Vec::new());
+    let collected: Mutex<WalkBuffer> = Mutex::new(WalkBuffer::default());
     let errors = AtomicUsize::new(0);
     roots.par_iter().for_each(|(root, _)| {
         let root_dev = fs::metadata(root).map(|m| m.dev()).ok();
@@ -121,18 +191,19 @@ pub fn scan_into_index(index: &mut Index, config: &ScanConfig) -> ScanReport {
         );
     });
     report.errors = errors.load(Ordering::Relaxed);
-    let mut entries = collected.into_inner().unwrap_or_default();
+    let mut buffer = collected.into_inner().unwrap_or_default();
 
     // A parent path is always a strict prefix of its children, so sorting by
     // path guarantees parents are inserted before children.
-    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    buffer.sort();
 
-    for e in entries {
-        if index.find(&e.path).is_some() {
+    for e in &buffer.entries {
+        let path = buffer.path(e);
+        if index.find(path).is_some() {
             report.skipped += 1;
             continue;
         }
-        index.insert_with_flags(&e.path, e.is_dir, e.is_symlink, e.size, e.mtime);
+        index.insert_with_flags(path, e.is_dir, e.is_symlink, e.size, e.mtime);
         report.entries += 1;
     }
 
@@ -144,7 +215,7 @@ pub fn scan_into_index(index: &mut Index, config: &ScanConfig) -> ScanReport {
 pub fn scan_subtree(index: &mut Index, root: &Path, config: &ScanConfig) {
     let excludes = GlobSet::new(&config.excludes);
     let root_dev = fs::metadata(root).map(|m| m.dev()).ok();
-    let collected: Mutex<Vec<WalkEntry>> = Mutex::new(Vec::new());
+    let collected: Mutex<WalkBuffer> = Mutex::new(WalkBuffer::default());
     let errors = AtomicUsize::new(0);
     walk(
         root,
@@ -155,13 +226,14 @@ pub fn scan_subtree(index: &mut Index, root: &Path, config: &ScanConfig) {
         &errors,
     );
 
-    let mut entries = collected.into_inner().unwrap_or_default();
-    entries.sort_by(|a, b| a.path.cmp(&b.path));
-    for e in entries {
-        if index.find(&e.path).is_some() {
+    let mut buffer = collected.into_inner().unwrap_or_default();
+    buffer.sort();
+    for e in &buffer.entries {
+        let path = buffer.path(e);
+        if index.find(path).is_some() {
             continue;
         }
-        index.insert_with_flags(&e.path, e.is_dir, e.is_symlink, e.size, e.mtime);
+        index.insert_with_flags(path, e.is_dir, e.is_symlink, e.size, e.mtime);
     }
 }
 
@@ -174,7 +246,7 @@ pub fn scan_subtree(index: &mut Index, root: &Path, config: &ScanConfig) {
 /// in-memory reconciliation, so a rescan no longer needs to clone the whole
 /// index (which doubled peak memory).
 pub struct RescanPlan {
-    entries: Vec<WalkEntry>,
+    entries: WalkBuffer,
     roots: Vec<(PathBuf, FsKind)>,
     errors: usize,
 }
@@ -184,7 +256,7 @@ pub struct RescanPlan {
 pub fn plan_rescan(config: &ScanConfig) -> RescanPlan {
     let excludes = GlobSet::new(&config.excludes);
     let roots = resolve_roots(config);
-    let collected: Mutex<Vec<WalkEntry>> = Mutex::new(Vec::new());
+    let collected: Mutex<WalkBuffer> = Mutex::new(WalkBuffer::default());
     let errors = AtomicUsize::new(0);
     roots.par_iter().for_each(|(root, _)| {
         let root_dev = fs::metadata(root).map(|m| m.dev()).ok();
@@ -198,7 +270,7 @@ pub fn plan_rescan(config: &ScanConfig) -> RescanPlan {
         );
     });
     let mut entries = collected.into_inner().unwrap_or_default();
-    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    entries.sort();
     RescanPlan {
         entries,
         roots,
@@ -229,16 +301,17 @@ pub fn apply_rescan(index: &mut Index, plan: RescanPlan) -> ScanReport {
         }
     }
 
-    for e in &entries {
-        match index.find(&e.path) {
+    for e in &entries.entries {
+        let path = entries.path(e);
+        match index.find(path) {
             Some(idx) => {
                 seen[idx as usize] = true;
                 // Refresh metadata for entries that changed without an inotify
                 // event.
-                index.update_metadata(&e.path, e.size, e.mtime);
+                index.update_metadata(path, e.size, e.mtime);
             }
             None => {
-                let idx = index.insert_with_flags(&e.path, e.is_dir, e.is_symlink, e.size, e.mtime);
+                let idx = index.insert_with_flags(path, e.is_dir, e.is_symlink, e.size, e.mtime);
                 debug_assert_eq!(idx as usize, seen.len());
                 seen.push(true);
                 report.entries += 1;
@@ -322,11 +395,11 @@ fn walk(
     root_dev: Option<u64>,
     excludes: &GlobSet,
     collect_metadata: bool,
-    out: &Mutex<Vec<WalkEntry>>,
+    out: &Mutex<WalkBuffer>,
     errors: &AtomicUsize,
 ) {
     let mut subdirs: Vec<PathBuf> = Vec::new();
-    let mut batch: Vec<WalkEntry> = Vec::new();
+    let mut batch = WalkBuffer::default();
 
     if let Ok(rd) = fs::read_dir(dir) {
         for entry in rd.flatten() {
@@ -375,13 +448,7 @@ fn walk(
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
 
-            batch.push(WalkEntry {
-                path: path.clone(),
-                is_dir,
-                is_symlink,
-                size,
-                mtime,
-            });
+            batch.push(&path, is_dir, is_symlink, size, mtime);
             if is_dir {
                 subdirs.push(path);
             }
@@ -390,8 +457,8 @@ fn walk(
         errors.fetch_add(1, Ordering::Relaxed);
     }
 
-    if !batch.is_empty() {
-        out.lock().unwrap().extend(batch);
+    if !batch.entries.is_empty() {
+        out.lock().unwrap().merge(batch);
     }
 
     subdirs
@@ -553,5 +620,34 @@ mod tests {
         assert_eq!(hit.hits[0].mtime, 0);
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn walk_buffer_sorts_and_merges_by_path() {
+        let mut a = WalkBuffer::default();
+        a.push(Path::new("/b/two.txt"), false, false, 2, 20);
+        a.push(Path::new("/a/one.txt"), false, false, 1, 10);
+
+        let mut b = WalkBuffer::default();
+        b.push(Path::new("/c/three.txt"), true, false, 0, 30);
+
+        a.merge(b);
+        a.sort();
+
+        let paths: Vec<String> = a
+            .entries
+            .iter()
+            .map(|e| a.path(e).to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(paths, vec!["/a/one.txt", "/b/two.txt", "/c/three.txt"]);
+
+        // Metadata survives the merge and the offset rebasing.
+        let three = a
+            .entries
+            .iter()
+            .find(|e| a.path(e) == Path::new("/c/three.txt"))
+            .unwrap();
+        assert!(three.is_dir);
+        assert_eq!(three.mtime, 30);
     }
 }

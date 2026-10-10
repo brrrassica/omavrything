@@ -13,11 +13,13 @@ proposals are **already implemented**. Per live record, steady state:
 
 | Component | Size / record | Notes |
 |---|---|---|
-| [`FileRecord`](../crates/omavrything-core/src/index.rs:57) | 48 B | 5x u32 + u64 + i64 + u16 + u8, padded to 8-byte alignment |
-| `names` arena | ~15 B | basename bytes |
+| [`FileRecord`](../crates/omavrything-core/src/index.rs:57) | 32 B | u64 + i64 + 3x u32 + u16 + u8, packed (was 48 B) |
 | `paths` arena | ~70 B | **full path bytes** (the dominant term) |
 | [`PathIndex`](../crates/omavrything-core/src/index.rs:164) | ~13 B x load factor (~18 B) | `HashMap<u64, u32>` hash + index, no path copy |
-| **Total** | **~150 B/file** | ~450 MB for 3M files |
+| **Total** | **~120 B/file** | ~360 MB for 3M files |
+
+The basename is derived from the path (the bytes after the last `/`), so there
+is no separate `names` arena.
 
 The gap to the observed ~700 MB RSS is explained by:
 
@@ -82,26 +84,26 @@ decision and only stat non-directories (or only when size/mtime are needed).
 
 ## 3. Additional findings (not in the proposal list)
 
-- **Transient `Vec<WalkEntry>` (highest-impact RSS item).** Replacing the owned
-  `PathBuf` buffer with a compact representation (e.g. a single byte arena plus
-  offsets, or streaming insertion) would cut peak RSS by ~300 MB at 3M files.
-  **Complexity: Medium. Risk: Medium.**
+- **Transient `Vec<WalkEntry>` (highest-impact RSS item).** DONE: the walker now
+  collects into a compact [`WalkBuffer`](../crates/omavrything-core/src/scan.rs)
+  (a single byte arena plus `u32` offsets), eliminating the per-path `PathBuf`
+  heap allocation. This cuts peak RSS by ~200 MB at 3M files.
 - **`names` arena redundancy** (see 2a) — cheap, safe win.
 - **`PathIndex` load factor** — a custom open-addressed table could shave the
   HashMap overhead, but this is a micro-optimization.
 
 ## 4. Recommended ordering (lowest complexity / least radical first)
 
-| # | Change | Complexity | Risk | Primary benefit |
-|---|---|---|---|---|
-| 0 | Proposal 4 (32-bit indices) | none | none | already done |
-| 0 | Proposal 1 (flat records) | none | none | already done |
-| 1 | Proposal 2a: drop redundant `names` arena | Low | Low | ~15 B/file |
-| 2 | Proposal 5: `readdir` `d_type`, stat only when needed | Low | Low | fewer syscalls |
-| 3 | Proposal 1 remainder: shrink `FileRecord` to 24-32 B | Medium-low | Low-med | ~16-24 B/file |
-| 4 | Transient scan buffer -> compact arena / streaming | Medium | Medium | ~300 MB peak |
-| 5 | Proposal 3: bitmap filter cache for incremental search | Medium | Medium | latency |
-| 6 | Proposal 2b: drop full-path storage, reconstruct | High | High | ~70 B/file |
+| # | Change | Complexity | Risk | Primary benefit | Status |
+|---|---|---|---|---|---|
+| 0 | Proposal 4 (32-bit indices) | none | none | already done | done |
+| 0 | Proposal 1 (flat records) | none | none | already done | done |
+| 1 | Proposal 2a: drop redundant `names` arena | Low | Low | ~15 B/file | done |
+| 2 | Proposal 5: `readdir` `d_type`, stat only when needed | Low | Low | fewer syscalls | done |
+| 3 | Proposal 1 remainder: shrink `FileRecord` to 24-32 B | Medium-low | Low-med | ~16-24 B/file | done |
+| 4 | Transient scan buffer -> compact arena / streaming | Medium | Medium | ~200 MB peak | done |
+| 5 | Proposal 3: bitmap filter cache for incremental search | Medium | Medium | latency | pending |
+| 6 | Proposal 2b: drop full-path storage, reconstruct | High | High | ~70 B/file | pending |
 
 ## 5. Suggested execution plan
 
