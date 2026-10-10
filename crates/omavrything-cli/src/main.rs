@@ -46,6 +46,7 @@ fn search(query: &str) -> i32 {
     let request = Request {
         q: query.to_string(),
         limit: Some(50),
+        offset: None,
     };
     let line = serde_json::to_string(&request).unwrap();
     if writeln!(stream, "{line}").is_err() {
@@ -71,7 +72,12 @@ fn search(query: &str) -> i32 {
     for item in &response.results {
         println!("{}", item.path);
     }
-    eprintln!("{} result(s) in {} ms", response.total, response.took_ms);
+    eprintln!(
+        "{} of {} result(s) in {} ms",
+        response.results.len(),
+        response.total,
+        response.took_ms
+    );
     0
 }
 

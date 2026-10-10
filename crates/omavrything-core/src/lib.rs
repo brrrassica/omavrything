@@ -3,6 +3,7 @@
 
 pub mod index;
 pub mod protocol;
+pub mod query;
 pub mod scan;
 
 /// The crate version, sourced from `Cargo.toml`.

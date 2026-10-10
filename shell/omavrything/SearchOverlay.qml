@@ -33,6 +33,11 @@ Item {
   property var results: []
   property bool daemonAvailable: false
 
+  // Column sorting: "" keeps the daemon's ranking; otherwise the results are
+  // re-sorted client-side by the selected column.
+  property string sortKey: ""
+  property bool sortAscending: true
+
   // Scratchpad sizing (settable; defaults for the M2.5 spike).
   property real widthFraction: 0.7
   property real heightFraction: 0.7
@@ -129,9 +134,46 @@ Item {
       root.selectedIndex = Math.max(0, response.results.length - 1)
     if (response.results.length === 0) root.cursorActive = false
 
+    root.applySort()
+    root.rebuildModel()
+  }
+
+  // Re-sort the current page by the active column. The daemon returns a ranked
+  // page; sorting reorders that page client-side.
+  function applySort() {
+    if (!root.sortKey) return
+    var key = root.sortKey
+    var asc = root.sortAscending
+    root.results.sort(function(a, b) {
+      var va, vb
+      if (key === "name") { va = (a.name || "").toLowerCase(); vb = (b.name || "").toLowerCase() }
+      else if (key === "size") { va = Number(a.size) || 0; vb = Number(b.size) || 0 }
+      else if (key === "modified") { va = Number(a.mtime) || 0; vb = Number(b.mtime) || 0 }
+      else { va = (a.path || "").toLowerCase(); vb = (b.path || "").toLowerCase() }
+      if (va < vb) return asc ? -1 : 1
+      if (va > vb) return asc ? 1 : -1
+      return 0
+    })
+  }
+
+  // Click a header: same column toggles direction, a new column starts ascending.
+  function toggleSort(key) {
+    if (root.sortKey === key) root.sortAscending = !root.sortAscending
+    else { root.sortKey = key; root.sortAscending = true }
+    root.applySort()
+    root.rebuildModel()
+    root.selectedIndex = 0
+  }
+
+  function sortIndicator(key) {
+    if (root.sortKey !== key) return ""
+    return root.sortAscending ? "  ▲" : "  ▼"
+  }
+
+  function rebuildModel() {
     displayModel.clear()
-    for (var i = 0; i < response.results.length; i++) {
-      var r = response.results[i]
+    for (var i = 0; i < root.results.length; i++) {
+      var r = root.results[i]
       displayModel.append({
         name: r.name || "",
         path: r.path || "",
@@ -151,8 +193,11 @@ Item {
   }
 
   function activate() {
-    if (!root.cursorActive || root.selectedIndex < 0 || root.selectedIndex >= root.results.length) return
-    var item = root.results[root.selectedIndex]
+    if (root.results.length === 0) return
+    // With no explicit cursor, Enter opens the top result (Everything behavior).
+    var index = root.cursorActive ? root.selectedIndex : 0
+    if (index < 0 || index >= root.results.length) return
+    var item = root.results[index]
     root.dismiss()
     Quickshell.execDetached(["xdg-open", item.path])
   }
@@ -340,41 +385,88 @@ Item {
             anchors.fill: parent
             spacing: root.columnGap
 
-            Text {
+            // Each header is clickable: clicking sorts by that column, and
+            // clicking again toggles ascending/descending. The active column
+            // shows an arrow and is drawn brighter.
+            Item {
               width: root.nameWidth
-              text: "Name"
-              color: root.foreground
-              opacity: 0.5
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.bodySmall
-              elide: Text.ElideRight
+              height: parent.height
+              Text {
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Name" + root.sortIndicator("name")
+                color: root.foreground
+                opacity: root.sortKey === "name" ? 0.85 : 0.5
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                elide: Text.ElideRight
+              }
+              MouseArea {
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.toggleSort("name")
+              }
             }
-            Text {
+            Item {
               width: root.sizeWidth
-              text: "Size"
-              color: root.foreground
-              opacity: 0.5
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.bodySmall
-              horizontalAlignment: Text.AlignRight
+              height: parent.height
+              Text {
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Size" + root.sortIndicator("size")
+                color: root.foreground
+                opacity: root.sortKey === "size" ? 0.85 : 0.5
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                horizontalAlignment: Text.AlignRight
+              }
+              MouseArea {
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.toggleSort("size")
+              }
             }
-            Text {
+            Item {
               width: root.modifiedWidth
-              text: "Modified"
-              color: root.foreground
-              opacity: 0.5
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.bodySmall
-              horizontalAlignment: Text.AlignRight
+              height: parent.height
+              Text {
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Modified" + root.sortIndicator("modified")
+                color: root.foreground
+                opacity: root.sortKey === "modified" ? 0.85 : 0.5
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                horizontalAlignment: Text.AlignRight
+              }
+              MouseArea {
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.toggleSort("modified")
+              }
             }
-            Text {
+            Item {
               width: root.pathWidth
-              text: "Path"
-              color: root.foreground
-              opacity: 0.5
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.bodySmall
-              elide: Text.ElideRight
+              height: parent.height
+              Text {
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Path" + root.sortIndicator("path")
+                color: root.foreground
+                opacity: root.sortKey === "path" ? 0.85 : 0.5
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                elide: Text.ElideRight
+              }
+              MouseArea {
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.toggleSort("path")
+              }
             }
           }
         }

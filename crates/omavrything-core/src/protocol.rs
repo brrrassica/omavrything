@@ -13,6 +13,9 @@ pub struct Request {
     /// Maximum number of results to return. Defaults to 100, capped at 1000.
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Number of leading matches to skip, for paging. Defaults to 0.
+    #[serde(default)]
+    pub offset: Option<usize>,
 }
 
 /// One result row.
@@ -51,6 +54,11 @@ impl Request {
     pub fn effective_limit(&self) -> usize {
         self.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT)
     }
+
+    /// The effective offset for this request. Defaults to 0.
+    pub fn effective_offset(&self) -> usize {
+        self.offset.unwrap_or(0)
+    }
 }
 
 #[cfg(test)]
@@ -59,9 +67,16 @@ mod tests {
 
     #[test]
     fn request_round_trips() {
-        let req: Request = serde_json::from_str(r#"{"q":"report","limit":8}"#).unwrap();
+        let req: Request = serde_json::from_str(r#"{"q":"report","limit":8,"offset":16}"#).unwrap();
         assert_eq!(req.q, "report");
         assert_eq!(req.effective_limit(), 8);
+        assert_eq!(req.effective_offset(), 16);
+    }
+
+    #[test]
+    fn offset_defaults_to_zero() {
+        let req: Request = serde_json::from_str(r#"{"q":"x"}"#).unwrap();
+        assert_eq!(req.effective_offset(), 0);
     }
 
     #[test]

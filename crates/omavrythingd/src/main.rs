@@ -82,23 +82,24 @@ fn serve(stream: UnixStream, index: Arc<RwLock<Index>>) {
         let started = Instant::now();
         let response = {
             let guard = index.read().unwrap();
-            let hits = guard.search(&request.q, request.effective_limit());
-            let results: Vec<ResultItem> = hits
+            let outcome = guard.search(
+                &request.q,
+                request.effective_limit(),
+                request.effective_offset(),
+            );
+            let results: Vec<ResultItem> = outcome
+                .hits
                 .iter()
-                .map(|entry| ResultItem {
-                    name: entry
-                        .path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default(),
-                    path: entry.path.to_string_lossy().into_owned(),
-                    size: entry.size,
-                    mtime: entry.mtime,
-                    is_dir: entry.is_dir,
+                .map(|hit| ResultItem {
+                    name: hit.name.clone(),
+                    path: hit.path.clone(),
+                    size: hit.size,
+                    mtime: hit.mtime,
+                    is_dir: hit.is_dir,
                 })
                 .collect();
             Response {
-                total: results.len(),
+                total: outcome.total,
                 results,
                 took_ms: started.elapsed().as_millis() as u64,
             }

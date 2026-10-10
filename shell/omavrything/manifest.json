@@ -19,11 +19,19 @@
     "allowMultiple": false,
     "defaultSection": "center",
     "defaults": {
-      "width": 520,
-      "maxResults": 8
+      "backgroundOpacity": 0.75,
+      "widthFraction": 0.7,
+      "heightFraction": 0.7,
+      "maxWidth": 1200,
+      "maxHeight": 800,
+      "maxResults": 200
     },
     "schema": [
-      { "key": "width", "type": "number", "label": "Result window width" },
+      { "key": "backgroundOpacity", "type": "number", "label": "Tile transparency" },
+      { "key": "widthFraction", "type": "number", "label": "Width fraction" },
+      { "key": "heightFraction", "type": "number", "label": "Height fraction" },
+      { "key": "maxWidth", "type": "number", "label": "Max width" },
+      { "key": "maxHeight", "type": "number", "label": "Max height" },
       { "key": "maxResults", "type": "number", "label": "Max results" }
     ]
   }

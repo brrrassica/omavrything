@@ -33,6 +33,13 @@ BarWidget {
     onFileChanged: reload()
   }
 
+  // Seed the mirror file so `watchChanges` has something to watch. Without this,
+  // a bar widget that starts before the overlay has ever opened watches a
+  // non-existent path and may miss the file's creation.
+  Component.onCompleted: {
+    if (!queryFileView.exists) queryFileView.setText("")
+  }
+
   WidgetButton {
     id: button
     anchors.fill: parent

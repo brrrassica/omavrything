@@ -28,8 +28,8 @@ The design therefore splits the search bar in two:
   and summons the overlay on click. It does not host the input.
 - **`SearchOverlay.qml`** hosts the real `TextInput` and the results list. It is
   a `PanelWindow` with `WlrLayershell.keyboardFocus: WlrKeyboardFocus.Exclusive`
-  while open, anchored to the top and right-center aligned so it appears under
-  the bar's search widget.
+  while open, rendered as a **centered scratchpad tile** (~70% x 70%, high
+  transparency) rather than a dropdown under the bar.
 
 This is the fallback recorded in the project's ADR-008; the primary design (a
 bar widget hosting the input) was ruled out by the M1 spike.
@@ -72,6 +72,11 @@ anchor. The overlay and service are enabled by the same command.
 The overlay is a centered, high-transparency scratchpad tile (~70% x 70%) with
 the input at the top and a results table below. The table shows **name**,
 **size**, **modified**, and **path** so duplicates are distinguishable.
+
+The column headers are clickable: clicking a header sorts the current results by
+that column, and clicking it again toggles ascending/descending. The active
+column shows an arrow. Sorting is applied client-side to the ranked page the
+daemon returns; clearing the sort (a fresh query) restores the daemon's ranking.
 
 `SearchOverlay.qml` exposes `widthFraction`, `heightFraction`, `maxWidth`,
 `maxHeight`, `maxResults`, and `backgroundOpacity`. They are currently hardcoded

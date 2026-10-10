@@ -23,22 +23,27 @@ per line.
 Request:
 
 ```json
-{"q":"report 2024","limit":8}
+{"q":"report 2024","limit":8,"offset":0}
 ```
 
 - `q` — the query. Space-separated terms are ANDed (case-insensitive substring
   over the full path).
 - `limit` — optional; defaults to 100, capped at 1000.
+- `offset` — optional; number of leading matches to skip, for paging. Defaults
+  to 0.
 
 Response:
 
 ```json
-{"results":[{"name":"report-2024.pdf","path":"/home/sam/report-2024.pdf","size":245760,"mtime":1710000000,"is_dir":false}],"total":1,"took_ms":0}
+{"results":[{"name":"report-2024.pdf","path":"/home/sam/report-2024.pdf","size":245760,"mtime":1710000000,"is_dir":false}],"total":42,"took_ms":0}
 ```
 
 Each result carries the basename (`name`), the full `path`, the `size` in bytes,
 and the last-modified time (`mtime`, Unix seconds) so the UI can disambiguate
 duplicates.
+
+`total` is the number of **all** matching entries, not just the returned page, so
+a client can report "showing X of Y" and page with `offset`.
 
 ## CLI
 

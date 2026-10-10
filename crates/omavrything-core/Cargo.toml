@@ -11,3 +11,13 @@ description = "Core index, search, scanner, and IPC protocol for omavrything"
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+memchr = { workspace = true }
+rayon = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "search"
+harness = false
+test = false
