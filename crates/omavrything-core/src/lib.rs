@@ -9,6 +9,7 @@ pub mod mounts;
 pub mod protocol;
 pub mod query;
 pub mod scan;
+pub mod snapshot;
 pub mod watch;
 
 /// The crate version, sourced from `Cargo.toml`.

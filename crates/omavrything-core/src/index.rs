@@ -12,7 +12,7 @@
 //! known memory tradeoff (risk R2).
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::Path;
 
 use rayon::prelude::*;
@@ -130,6 +130,58 @@ impl Index {
 
     pub fn roots(&self) -> &[Root] {
         &self.roots
+    }
+
+    /// Keep only the roots whose path is in `keep`.
+    pub(crate) fn retain_roots(&mut self, keep: &HashSet<String>) {
+        self.roots.retain(|r| keep.contains(&r.path));
+    }
+
+    /// The raw records, for snapshot serialization.
+    pub(crate) fn records(&self) -> &[FileRecord] {
+        &self.records
+    }
+
+    /// The name arena, for snapshot serialization.
+    pub(crate) fn names(&self) -> &[u8] {
+        &self.names
+    }
+
+    /// The path arena, for snapshot serialization.
+    pub(crate) fn paths(&self) -> &[u8] {
+        &self.paths
+    }
+
+    /// Rebuild an index from raw parts, reconstructing the derived path map and
+    /// live count. Used by the snapshot loader.
+    pub(crate) fn from_parts(
+        records: Vec<FileRecord>,
+        names: Vec<u8>,
+        paths: Vec<u8>,
+        roots: Vec<Root>,
+    ) -> Self {
+        let mut by_path = HashMap::with_capacity(records.len());
+        let mut live = 0usize;
+        for (i, rec) in records.iter().enumerate() {
+            if rec.is_deleted() {
+                continue;
+            }
+            live += 1;
+            let start = rec.path_off as usize;
+            let end = start + rec.path_len as usize;
+            if let Some(bytes) = paths.get(start..end) {
+                let key = String::from_utf8_lossy(bytes).into_owned().into_boxed_str();
+                by_path.insert(key, i as u32);
+            }
+        }
+        Self {
+            records,
+            names,
+            paths,
+            roots,
+            by_path,
+            live,
+        }
     }
 
     /// Iterate over live (non-deleted) records as `(record index, record)`.

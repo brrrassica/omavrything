@@ -12,6 +12,8 @@ scripts/run-daemon.sh --auto                       # indexes all non-pseudo moun
 scripts/run-daemon.sh --root / --exclude '**/.git/**' --exclude '**/node_modules/**'
 scripts/run-daemon.sh --no-watch                   # disable inotify live updates
 scripts/run-daemon.sh --scan-interval 1800         # idle-gated rescan every 30 min
+scripts/run-daemon.sh --snapshot /tmp/idx.snap     # custom snapshot path
+scripts/run-daemon.sh --no-snapshot                # disable persistence
 ```
 
 Roots are either explicit (`--root`, repeatable) or discovered from the mount
@@ -90,9 +92,30 @@ entries, dropping stale ones) only when the system is idle — measured from
 `--scan-interval` seconds (default 900; 0 disables). `--no-watch` disables
 inotify entirely.
 
+## Persistence
+
+The index is snapshotted to disk so a restart warm-starts instead of rescanning
+everything. The snapshot is written on a timer (`--snapshot-interval`, default
+300 s; 0 disables) and on a clean `SIGTERM`/`SIGINT` shutdown.
+
+The default path is `/var/lib/omavrything/index.snapshot` when running as root
+(the M9 system service) and `$XDG_STATE_HOME/omavrything/index.snapshot`
+(falling back to `$HOME/.local/state/...`) otherwise; override with
+`--snapshot <path>` or disable with `--no-snapshot`.
+
+The format is versioned and length-prefixed with an FNV-1a checksum. Writes are
+atomic (temp file + `rename`) and the previous snapshot is kept as
+`<path>.prev`, so a corrupt or truncated snapshot falls back to the last good
+one and ultimately to a fresh scan.
+
+On load, each root is validated against the mount table and its filesystem
+identity (device plus btrfs subvolume generation). Roots whose identity or
+filesystem kind changed — or that are new — are rescanned; roots that are no
+longer configured are dropped. A snapshot that fails to load triggers a full
+cold scan.
+
 ## Current limitations
 
-- No persistence; the index is rebuilt on every start (M6).
 - The daemon runs as the user; the root system service arrives later (M9).
 - NTFS partitions are not yet read via the MFT (M8).
 - The login1 idle hint is not yet consulted (M7).

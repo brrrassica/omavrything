@@ -182,7 +182,7 @@ pub fn rescan_into_index(index: &mut Index, config: &ScanConfig) -> ScanReport {
 }
 
 /// Resolve the roots to scan: explicit roots, or non-pseudo mounts.
-fn resolve_roots(config: &ScanConfig) -> Vec<(PathBuf, FsKind)> {
+pub fn resolve_roots(config: &ScanConfig) -> Vec<(PathBuf, FsKind)> {
     let mounts = mounts::read_mounts().unwrap_or_default();
 
     if !config.roots.is_empty() {
