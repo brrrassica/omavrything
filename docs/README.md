@@ -2,14 +2,14 @@
 
 Public documentation for `omavrything`.
 
-> **Convention:** committed documentation must not reference the local `plans/`
-> directory. Design detail that needs to be public belongs here, under `docs/`.
-
 ## Index
 
-- [`omarchy-shell-integration.md`](omarchy-shell-integration.md) — the shell plugin, the focus constraint, IPC, and the hotkey.
+- [`install.md`](install.md) — installation and setup.
 - [`daemon.md`](daemon.md) — the index daemon and the socket protocol.
-- (coming soon) `architecture.md` — system design.
-- (coming soon) `install.md` — installation and setup.
+- [`omarchy-shell-integration.md`](omarchy-shell-integration.md) — the shell plugin, the focus constraint, IPC, and the hotkey.
+- [`architecture.md`](architecture.md) — system design.
+- [`decisions.md`](decisions.md) — decision log (ADRs).
+- [`development.md`](development.md) — build, test, and profiling.
+- [`memory-optimization.md`](memory-optimization.md) — memory model and optimization analysis.
 - (coming soon) `search-syntax.md` — query syntax.
 - (coming soon) `troubleshooting.md` — common issues.

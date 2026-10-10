@@ -7,54 +7,22 @@
 Are you a Wind*ws ~~user~~ survivor? Do you consider instant file searches with
 Voidtool's Everything indispensable and you miss it when daily driving Omarchy?
 
-Omavrything is a local file search for **Omarchy Quattro (4.x)**, with 
+Omavrything is a local file search for **Omarchy Quattro (4.x)**, with
 UX "inspired" by [Voidtools Everything](https://www.voidtools.com/).
 
 The UI lives in the `omarchy-shell` (Quickshell/Qt) as a persistent search bar;
-typing opens a centered, high-transparency scratchpad with a results table. A root system daemon
-(`omavrythingd`) keeps an in-memory index of all mounted filesystems — using
-directory traversal + inotify for Linux filesystems (btrfs/ext4/xfs/f2fs) and
-the MFT for NTFS partitions.
+typing opens a centered, high-transparency scratchpad with a results table. A root
+system daemon (`omavrythingd`) keeps an in-memory index of all mounted
+filesystems — using directory traversal + inotify for Linux filesystems
+(btrfs/ext4/xfs/f2fs) and the MFT for NTFS partitions.
 
 > **Status:** pre-alpha. See [`docs/`](docs/) for documentation.
 
-## Components
-
-| Component | Artifact | Role |
-| --- | --- | --- |
-| `omavrything-core` | library | Index, search, scanner, IPC protocol. |
-| `omavrything-ntfs` | library | Pure-Rust NTFS MFT reader and partition detection. |
-| `omavrythingd` | binary | Root system daemon. |
-| `omavrything-cli` | binary (`omavry`) | CLI client. |
-| `omavrything` shell plugin | QML | Search bar + results overlay. |
-
-## Build
+## Quick start
 
 ```sh
-cargo build
-cargo test
-cargo clippy --all-targets -- -D warnings
-cargo fmt --check
-```
-
-## Running the daemon
-
-```sh
-scripts/run-daemon.sh                              # indexes $HOME
-scripts/run-daemon.sh --root /home/sam/Documents   # indexes a subtree
-omavry search "report 2024"                        # query from the CLI
-```
-
-The daemon serves newline-delimited JSON over
-`$XDG_RUNTIME_DIR/omavrything.sock`. See
-[`docs/daemon.md`](docs/daemon.md) for the protocol.
-
-## Shell plugin (omarchy-shell)
-
-The search UI is an `omarchy-shell` plugin (Quickshell/QML). Install and enable
-it with:
-
-```sh
+cargo build --release
+scripts/run-daemon.sh
 scripts/install-plugin.sh
 omarchy plugin enable omavrything --section center
 ```
@@ -66,8 +34,18 @@ hl.unbind("SUPER + ALT + SPACE")
 o.bind("SUPER + ALT + SPACE", "Search files", "omarchy-shell omavrything focus")
 ```
 
-See [`docs/omarchy-shell-integration.md`](docs/omarchy-shell-integration.md) for
-the plugin structure and the focus constraint that shapes it.
+See [`docs/install.md`](docs/install.md) for the full setup, including the
+optional D-Bus control interface.
+
+## Documentation
+
+- [`docs/install.md`](docs/install.md) — installation and setup.
+- [`docs/daemon.md`](docs/daemon.md) — the daemon, its flags, and the socket protocol.
+- [`docs/omarchy-shell-integration.md`](docs/omarchy-shell-integration.md) — the shell plugin.
+- [`docs/architecture.md`](docs/architecture.md) — technical design.
+- [`docs/decisions.md`](docs/decisions.md) — decision log (ADRs).
+- [`docs/development.md`](docs/development.md) — build, test, and profiling.
+- [`docs/memory-optimization.md`](docs/memory-optimization.md) — memory model and optimization analysis.
 
 ## Target platform
 
@@ -77,7 +55,7 @@ No backwards compatibility with earlier Omarchy releases which used waybar.
 ## Attribution
 
 Thank you for the inspiration and years of blazing-fast searches to David Carpenter
-at www.voidtools.com, where I've saved maybe weeks of my life from needlessly 
+at www.voidtools.com, where I've saved maybe weeks of my life from needlessly
 organizing files and scrambling for files in tight moments in my life.
 
 ## License

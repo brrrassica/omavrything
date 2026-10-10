@@ -31,8 +31,9 @@ The design therefore splits the search bar in two:
   while open, rendered as a **centered scratchpad tile** (~70% x 70%, high
   transparency) rather than a dropdown under the bar.
 
-This is the fallback recorded in the project's ADR-008; the primary design (a
-bar widget hosting the input) was ruled out by the M1 spike.
+This is the fallback recorded in [ADR-008](decisions.md#adr-008); the primary
+design (a bar widget hosting the input) was ruled out by an early feasibility
+spike.
 
 ## IPC
 

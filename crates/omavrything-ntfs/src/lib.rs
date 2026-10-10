@@ -2,8 +2,9 @@
 //!
 //! This crate reads an NTFS volume's MFT directly from a raw device (or an
 //! image) without mounting it, and detects NTFS partitions. It is a pure-Rust
-//! implementation — ADR-006's documented alternative to libntfs-ng FFI — so it
-//! has no build-time C dependency and can be tested against a synthetic image.
+//! implementation — the alternative documented in ADR-006 (see
+//! `docs/decisions.md`) — so it has no build-time C dependency and can be tested
+//! against a synthetic image.
 //!
 //! The reader is intentionally minimal: it parses the boot sector, reads the
 //! `$MFT` record to obtain the MFT's run list, then walks every MFT record and

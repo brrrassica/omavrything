@@ -12,9 +12,10 @@ import qs.Ui
 // distinguishable — Everything users rarely organize their files, so the name
 // alone is ambiguous.
 //
-// This is the ADR-008 fallback: because the bar surface cannot take keyboard
-// focus, the input lives here rather than in the bar widget. The overlay is a
-// layer-shell PanelWindow with keyboardFocus Exclusive while open.
+// This is the ADR-008 fallback (see docs/decisions.md): because the bar surface
+// cannot take keyboard focus, the input lives here rather than in the bar
+// widget. The overlay is a layer-shell PanelWindow with keyboardFocus Exclusive
+// while open.
 //
 // Results come from the `omavrythingd` daemon over a Unix domain socket
 // (newline-delimited JSON). The query is mirrored to a runtime file so the bar

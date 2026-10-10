@@ -2,7 +2,8 @@
 //!
 //! The `$UsnJrnl:$J` stream is a sequence of `USN_RECORD_V2` entries. Parsing
 //! them is implemented here; wiring live USN updates into the index is deferred
-//! to v0.2 (ADR-006/ADR-010), so v0.1 uses MFT read-only plus periodic rescan.
+//! to v0.2 (ADR-006/ADR-010; see `docs/decisions.md`), so v0.1 uses MFT
+//! read-only plus periodic rescan.
 
 use crate::mft::ntfs_to_unix;
 

@@ -186,10 +186,10 @@ cold scan.
 NTFS partitions are detected with `blkid` (falling back to a boot-sector OEM
 check) and indexed by reading the **MFT directly from the raw device** — no
 mount is required for indexing. The reader is a pure-Rust implementation in
-`omavrything-ntfs` (ADR-006's documented alternative to libntfs-ng FFI): it
-parses the boot sector, reads the `$MFT` record to obtain the MFT's run list,
-then walks every MFT record and reconstructs paths from `$FILE_NAME` parent
-references.
+`omavrything-ntfs` (the alternative documented in
+[ADR-006](decisions.md#adr-006)): it parses the boot sector, reads the `$MFT`
+record to obtain the MFT's run list, then walks every MFT record and
+reconstructs paths from `$FILE_NAME` parent references.
 
 Mounting prefers **udisks2** (`udisksctl mount -o ro`) so the desktop sees the
 partition, and falls back to a private read-only **`ntfs3`** mount at
@@ -253,7 +253,7 @@ runs the release binary.
   well-known name, which the bus policy permits for root only; a user-run daemon
   therefore serves the socket search path but not D-Bus control until M9.
 - NTFS live updates use the periodic rescan; USN journal parsing is deferred to
-  v0.2 (ADR-006).
+  v0.2 ([ADR-006](decisions.md#adr-006)).
 - An NTFS root is validated by its mount point's device identity, so if the
   partition is not mounted at startup its MFT-indexed entries are dropped and
   re-indexed when it is mounted again.
