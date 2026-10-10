@@ -292,18 +292,29 @@ omavry mount <uuid>              # mount a detected NTFS partition
 ## 12. Configuration
 
 `/etc/omavrything/config.toml` (system-wide), with optional per-user overrides
-for the UI.
+for the UI. Every key is optional; a command-line flag overrides the file, which
+overrides the built-in default. Unknown keys are rejected.
 
 ```toml
-roots = ["/", "/home"]                 # or "auto" to follow the mount table
-exclude = ["/proc", "/sys", "/dev", "/run", "**/.git/**"]
-scan_interval_secs = 900
-idle_load_threshold = 1.0
-ntfs_auto_mount = true
-snapshot_path = "/var/lib/omavrything/index.snapshot"
-socket_path = "/run/omavrything/omavrything.sock"
-max_results = 100
+auto = true                            # discover roots from the mount table
+roots = ["/home", "/mnt/data"]         # explicit roots (when auto = false)
+excludes = ["**/.git/**", "**/node_modules/**"]
+scan_interval = 900                    # idle-gated rescan, seconds (0 disables)
+snapshot_interval = 300                # snapshot write, seconds (0 disables)
+watch = true                           # inotify live updates
+dbus = true                            # D-Bus control interface
+ntfs = true                            # detect and index NTFS partitions
+metadata = true                        # collect per-file size/mtime
+log_level = "info"                     # error | warn | info | debug | trace
+socket = "/run/omavrything/omavrything.sock"
+snapshot = "/var/lib/omavrything/index.snapshot"
 ```
+
+The daemon logs structured events to stderr (journald-friendly
+`field=value` lines); the level is set by `--log-level`, `log_level`, or
+`OMAVRYTHING_LOG`. The system service (`data/systemd/omavrythingd.service`) runs
+as a dedicated `omavrything` user with a minimal capability set and a hardened
+profile; see [`daemon.md`](daemon.md).
 
 ## 13. Packaging
 

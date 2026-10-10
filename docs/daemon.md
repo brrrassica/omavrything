@@ -36,15 +36,74 @@ mtime require one `stat` per file. `--no-metadata` skips that stat for files
 faster but leaves `size`/`mtime` at zero in results.
 
 The socket defaults to `/run/omavrything/omavrything.sock` when running as root
-(the M9 system service) and `$XDG_RUNTIME_DIR/omavrything.sock` (falling back to
+(the system service) and `$XDG_RUNTIME_DIR/omavrything.sock` (falling back to
 `/tmp/omavrything.sock`) otherwise. It is created mode `0660` and, as root,
 group `omavrything`. Every connection is checked with `SO_PEERCRED`: root, the
 daemon's own uid, and members of the `omavrything` group are allowed. A single
 daemon per socket is enforced with an exclusive `flock` on `<socket>.lock`, so a
 second instance refuses to start. Each request must complete within 30 seconds
 and be at most 64 KiB, so a slow or oversized client cannot hold a connection
-slot. The daemon prints the indexed entry count, the roots and their filesystem
+slot. The daemon logs the indexed entry count, the roots and their filesystem
 kinds, and the socket path on startup.
+
+## Configuration file
+
+The daemon reads `/etc/omavrything/config.toml` when it exists (override with
+`--config <path>`, skip with `--no-config`). Every key is optional: a missing key
+falls back to the built-in default, and a command-line flag overrides the file.
+Unknown keys are rejected so a typo is reported rather than silently ignored.
+
+```toml
+auto = true                                    # discover roots from the mount table
+# roots = ["/home", "/mnt/data"]               # explicit roots (when auto = false)
+excludes = ["**/.git/**", "**/node_modules/**"]
+scan_interval = 900                            # idle-gated rescan, seconds (0 disables)
+snapshot_interval = 300                        # snapshot write, seconds (0 disables)
+watch = true                                   # inotify live updates
+dbus = true                                    # D-Bus control interface
+ntfs = true                                    # detect and index NTFS partitions
+metadata = true                                # collect per-file size/mtime
+log_level = "info"                             # error | warn | info | debug | trace
+# socket = "/run/omavrything/omavrything.sock"
+# snapshot = "/var/lib/omavrything/index.snapshot"
+```
+
+Command-line `--exclude` globs extend the file's rather than replacing them. A
+shipped default is installed to `/etc/omavrything/config.toml` (see
+`data/config/config.toml`).
+
+## Logging
+
+The daemon logs structured events to stderr in a stable
+`TIMESTAMP LEVEL target: message field=value` format, which journald captures
+and `journalctl -o json` can parse. The level comes from `--log-level`, the
+`log_level` config key, or the `OMAVRYTHING_LOG` environment variable (which
+accepts `RUST_LOG` syntax, e.g. `omavrythingd=debug,zbus=warn`), in that order of
+precedence. The default is `info`.
+
+## systemd service
+
+`data/systemd/omavrythingd.service` runs the daemon as a hardened system service
+under a dedicated `omavrything` user (created by
+`data/sysusers/omavrything.conf`). It keeps only `CAP_DAC_READ_SEARCH` (read raw
+block devices for the NTFS MFT) and `CAP_SYS_ADMIN` (the read-only `ntfs3`
+fallback mount), and applies `ProtectSystem=strict`, `ProtectHome=read-only`,
+`NoNewPrivileges`, `MemoryDenyWriteExecute`, a `@system-service @mount` syscall
+filter, and memory, CPU, task, and file-descriptor limits. The socket and
+snapshot paths are fixed on the command line so the service does not depend on
+the invoking user's XDG directories.
+
+```sh
+sudo install -Dm644 data/systemd/omavrythingd.service /usr/lib/systemd/system/omavrythingd.service
+sudo install -Dm644 data/sysusers/omavrything.conf /usr/lib/sysusers.d/omavrything.conf
+sudo install -Dm644 data/config/config.toml /etc/omavrything/config.toml
+sudo systemd-sysusers
+sudo systemctl daemon-reload
+sudo systemctl enable --now omavrythingd
+sudo usermod -aG omavrything "$USER"   # so the shell plugin can reach the socket
+```
+
+`systemd-analyze security omavrythingd` reports the hardening profile.
 
 ## Protocol
 
@@ -248,10 +307,10 @@ runs the release binary.
 
 ## Current limitations
 
-- The daemon runs as the user; the root system service arrives later (M9).
 - The D-Bus control interface is only reachable when the daemon owns the
-  well-known name, which the bus policy permits for root only; a user-run daemon
-  therefore serves the socket search path but not D-Bus control until M9.
+  well-known name, which the bus policy permits for the `omavrything` user (or
+  root); a user-run daemon therefore serves the socket search path but not D-Bus
+  control.
 - NTFS live updates use the periodic rescan; USN journal parsing is deferred to
   v0.2 ([ADR-006](decisions.md#adr-006)).
 - An NTFS root is validated by its mount point's device identity, so if the

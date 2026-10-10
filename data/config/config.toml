@@ -1,0 +1,41 @@
+# omavrything daemon configuration.
+#
+# Installed to /etc/omavrything/config.toml. Every key is optional: a missing
+# key falls back to the built-in default, and a command-line flag overrides the
+# file. Unknown keys are rejected. See `omavrythingd --help` and docs/daemon.md.
+
+# Discover roots from the mount table (pseudo- and network filesystems are
+# skipped). Set to false and list explicit `roots` to index only specific trees.
+auto = true
+
+# Explicit roots, used when `auto` is false.
+# roots = ["/home", "/mnt/data"]
+
+# Exclude globs applied during traversal.
+excludes = ["**/.git/**", "**/node_modules/**", "**/.cache/**"]
+
+# Idle-gated rescan interval, in seconds (0 disables).
+scan_interval = 900
+
+# Snapshot write interval, in seconds (0 disables).
+snapshot_interval = 300
+
+# Watch roots with inotify for live updates.
+watch = true
+
+# Serve the D-Bus control interface.
+dbus = true
+
+# Detect and index NTFS partitions (requires raw-device access).
+ntfs = true
+
+# Collect per-file size and mtime (needed for the results table).
+metadata = true
+
+# Log level: error, warn, info, debug, or trace.
+log_level = "info"
+
+# The system service fixes these paths on the command line; they are shown here
+# for reference and for a user-run daemon.
+# socket = "/run/omavrything/omavrything.sock"
+# snapshot = "/var/lib/omavrything/index.snapshot"

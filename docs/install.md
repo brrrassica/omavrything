@@ -71,6 +71,28 @@ Without the policy the daemon logs `Request to own name refused by policy` and
 continues serving the socket search path. See [`daemon.md`](daemon.md) for the
 D-Bus methods and the polkit action.
 
+## 6. Run as a system service (optional)
+
+For a persistent, hardened daemon that starts at boot, install the systemd unit,
+the dedicated user, and the default configuration:
+
+```sh
+sudo install -Dm644 data/systemd/omavrythingd.service /usr/lib/systemd/system/omavrythingd.service
+sudo install -Dm644 data/sysusers/omavrything.conf /usr/lib/sysusers.d/omavrything.conf
+sudo install -Dm644 data/config/config.toml /etc/omavrything/config.toml
+sudo systemd-sysusers
+sudo systemctl daemon-reload
+sudo systemctl enable --now omavrythingd
+sudo usermod -aG omavrything "$USER"   # so the shell plugin can reach the socket
+```
+
+The service runs as the unprivileged `omavrything` user with only
+`CAP_DAC_READ_SEARCH` and `CAP_SYS_ADMIN`, and a hardened profile
+(`ProtectSystem=strict`, `NoNewPrivileges`, a syscall filter, and resource
+limits). Edit `/etc/omavrything/config.toml` to choose roots, excludes, and
+intervals, then `sudo systemctl restart omavrythingd`. See
+[`daemon.md`](daemon.md) for the configuration keys and the hardening details.
+
 ## Next steps
 
 - [`omarchy-shell-integration.md`](omarchy-shell-integration.md) — the plugin

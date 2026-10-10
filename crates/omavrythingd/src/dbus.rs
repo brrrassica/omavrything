@@ -12,6 +12,7 @@ use std::time::Instant;
 use omavrything_core::index::Index;
 use omavrything_core::scan::{ScanConfig, apply_rescan, plan_rescan};
 use tokio::sync::mpsc::UnboundedSender;
+use tracing::{error, info, warn};
 use zbus::interface;
 use zbus::object_server::SignalEmitter;
 
@@ -289,7 +290,7 @@ pub fn run(
     {
         Ok(runtime) => runtime,
         Err(e) => {
-            eprintln!("dbus: failed to build runtime: {e}");
+            error!(error = %e, "dbus: failed to build runtime");
             return;
         }
     };
@@ -298,21 +299,21 @@ pub fn run(
         let connection = match zbus::Connection::system().await {
             Ok(connection) => connection,
             Err(e) => {
-                eprintln!("dbus: cannot connect to the system bus: {e}");
+                warn!(error = %e, "dbus: cannot connect to the system bus");
                 return;
             }
         };
 
         let manager = Manager::new(index, config, started, event_tx, policy);
         if let Err(e) = connection.object_server().at(OBJECT_PATH, manager).await {
-            eprintln!("dbus: failed to register object: {e}");
+            error!(error = %e, "dbus: failed to register object");
             return;
         }
         if let Err(e) = connection.request_name(SERVICE_NAME).await {
-            eprintln!("dbus: failed to request name {SERVICE_NAME}: {e}");
+            error!(service = SERVICE_NAME, error = %e, "dbus: failed to request name");
             return;
         }
-        eprintln!("dbus: serving {SERVICE_NAME} at {OBJECT_PATH}");
+        info!(service = SERVICE_NAME, path = OBJECT_PATH, "dbus: serving");
 
         let iface = match connection
             .object_server()
@@ -321,7 +322,7 @@ pub fn run(
         {
             Ok(iface) => iface,
             Err(e) => {
-                eprintln!("dbus: interface lookup failed: {e}");
+                error!(error = %e, "dbus: interface lookup failed");
                 return;
             }
         };

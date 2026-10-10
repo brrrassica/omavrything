@@ -1,0 +1,66 @@
+[Unit]
+Description=omavrything file index daemon
+Documentation=man:omavrythingd(8)
+After=local-fs.target
+Wants=local-fs.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# The socket and snapshot paths are fixed here so the service is independent of
+# the invoking user's XDG directories. Roots, excludes, intervals, and the log
+# level come from /etc/omavrything/config.toml (auto-loaded when present).
+ExecStart=/usr/bin/omavrythingd --socket /run/omavrything/omavrything.sock --snapshot /var/lib/omavrything/index.snapshot
+Restart=on-failure
+RestartSec=5s
+# Allow the clean snapshot write on SIGTERM before the process is killed.
+TimeoutStopSec=30s
+
+# Run as a dedicated unprivileged user. The daemon reads raw block devices (the
+# NTFS MFT) and, as a fallback, mounts them read-only, so it keeps only those
+# two capabilities rather than full root.
+User=omavrything
+Group=omavrything
+RuntimeDirectory=omavrything
+RuntimeDirectoryMode=0750
+StateDirectory=omavrything
+StateDirectoryMode=0750
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_SYS_ADMIN
+AmbientCapabilities=CAP_DAC_READ_SEARCH CAP_SYS_ADMIN
+
+# Resource limits.
+MemoryHigh=3G
+MemoryMax=4G
+CPUQuota=50%
+TasksMax=64
+LimitNOFILE=65536
+IOWeight=50
+
+# Hardening.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+# @system-service covers the daemon and its helper processes (blkid, udisksctl);
+# @mount is needed for the read-only ntfs3 fallback mount.
+SystemCallFilter=@system-service @mount
+SystemCallErrorNumber=EPERM
+ReadWritePaths=/run/omavrything /var/lib/omavrything
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

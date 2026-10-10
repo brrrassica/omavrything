@@ -7,7 +7,9 @@
 //! D-Bus.
 
 mod config;
+mod config_file;
 mod dbus;
+mod logging;
 mod ntfs;
 mod peer;
 mod polkit;
@@ -33,9 +35,12 @@ use omavrything_core::scan::{ScanConfig, apply_rescan, plan_rescan, scan};
 use omavrything_core::snapshot::{self, RootIdentity, WarmStart};
 use omavrything_core::watch::Watcher;
 use tokio::sync::mpsc::UnboundedSender;
+use tracing::{debug, error, info, warn};
 
 use config::SharedConfig;
+use config_file::{DEFAULT_CONFIG_PATH, FileConfig};
 use dbus::IndexEvent;
+use logging::LogLevel;
 
 /// Maximum number of concurrent client connections.
 const MAX_CONNECTIONS: usize = 64;
@@ -55,9 +60,16 @@ const SOCKET_GROUP: &str = "omavrything";
 static SNAPSHOT_LOCK: Mutex<()> = Mutex::new(());
 
 fn main() {
-    let args = Args::parse();
+    let args = match Args::parse() {
+        Ok(args) => args,
+        Err(err) => {
+            eprintln!("omavrythingd: {err}");
+            std::process::exit(2);
+        }
+    };
+    logging::init(args.log_level);
 
-    eprintln!("omavrythingd {VERSION}");
+    info!(version = VERSION, "omavrythingd starting");
     let scan_config = args.scan_config();
     let started = Instant::now();
 
@@ -77,36 +89,38 @@ fn main() {
         }
     };
 
+    let elapsed_ms = started.elapsed().as_millis() as u64;
     match outcome {
-        Some(WarmStart::Snapshot) => eprintln!(
-            "warm-started from snapshot: {} entries in {:?}",
-            index.len(),
-            started.elapsed()
+        Some(WarmStart::Snapshot) => info!(
+            entries = %index.len(),
+            elapsed_ms,
+            "warm-started from snapshot"
         ),
-        Some(WarmStart::Partial { rescanned }) => eprintln!(
-            "warm-started from snapshot: {} entries; rescanned {rescanned} root(s) in {:?}",
-            index.len(),
-            started.elapsed()
+        Some(WarmStart::Partial { rescanned }) => info!(
+            entries = %index.len(),
+            rescanned,
+            elapsed_ms,
+            "warm-started from snapshot"
         ),
-        Some(WarmStart::ColdScan) => eprintln!(
-            "no usable snapshot; cold scan: {} entries across {} root(s) in {:?} ({} skipped, {} unreadable)",
-            report.entries,
-            report.roots,
-            started.elapsed(),
-            report.skipped,
-            report.errors
+        Some(WarmStart::ColdScan) => info!(
+            entries = %report.entries,
+            roots = %report.roots,
+            skipped = %report.skipped,
+            unreadable = %report.errors,
+            elapsed_ms,
+            "no usable snapshot; cold scan"
         ),
-        None => eprintln!(
-            "indexed {} entries across {} root(s) in {:?} ({} skipped, {} unreadable)",
-            report.entries,
-            report.roots,
-            started.elapsed(),
-            report.skipped,
-            report.errors
+        None => info!(
+            entries = %report.entries,
+            roots = %report.roots,
+            skipped = %report.skipped,
+            unreadable = %report.errors,
+            elapsed_ms,
+            "indexed"
         ),
     }
     for root in index.roots() {
-        eprintln!("  root {} ({:?})", root.path, root.fs_kind);
+        info!(path = %root.path, fs_kind = ?root.fs_kind, "root");
     }
 
     // The initial scan allocates large transient buffers (the walked entry list)
@@ -180,16 +194,17 @@ fn main() {
     // A stale socket from a previous run would make bind() fail.
     if let Some(parent) = args.socket.parent() {
         if let Err(err) = std::fs::create_dir_all(parent) {
-            eprintln!("failed to create {}: {err}", parent.display());
+            warn!(path = %parent.display(), error = %err, "failed to create socket directory");
         }
     }
     // Refuse to start a second daemon on the same socket.
     let _singleton = match acquire_singleton(&args.socket) {
         Ok(file) => file,
         Err(err) => {
-            eprintln!(
-                "another omavrythingd appears to be running on {}: {err}",
-                args.socket.display()
+            error!(
+                socket = %args.socket.display(),
+                error = %err,
+                "another omavrythingd appears to be running"
             );
             std::process::exit(1);
         }
@@ -198,18 +213,21 @@ fn main() {
     let listener = match UnixListener::bind(&args.socket) {
         Ok(listener) => listener,
         Err(err) => {
-            eprintln!("failed to bind {}: {err}", args.socket.display());
+            error!(socket = %args.socket.display(), error = %err, "failed to bind socket");
             std::process::exit(1);
         }
     };
     if let Err(err) = prepare_socket(&args.socket) {
-        eprintln!("warning: could not secure {}: {err}", args.socket.display());
+        warn!(socket = %args.socket.display(), error = %err, "could not secure socket");
     }
-    eprintln!("listening on {}", args.socket.display());
+    info!(socket = %args.socket.display(), "listening");
 
     let allowed_gid = peer::group_gid(SOCKET_GROUP);
     if allowed_gid.is_none() {
-        eprintln!("warning: group '{SOCKET_GROUP}' not found; relying on socket permissions");
+        warn!(
+            group = SOCKET_GROUP,
+            "group not found; relying on socket permissions"
+        );
     }
 
     // Opt-in per-query profiling: when `OMAVRYTHING_PROFILE` is set, every
@@ -217,7 +235,7 @@ fn main() {
     // the hot path pays nothing.
     let profile = std::env::var_os("OMAVRYTHING_PROFILE").is_some();
     if profile {
-        eprintln!("query profiling enabled (OMAVRYTHING_PROFILE set)");
+        info!("query profiling enabled (OMAVRYTHING_PROFILE set)");
     }
 
     let active = Arc::new(AtomicUsize::new(0));
@@ -227,21 +245,23 @@ fn main() {
                 match peer::peer_cred(&stream) {
                     Some(cred) if peer::peer_allowed(&cred, allowed_gid) => {}
                     Some(cred) => {
-                        eprintln!(
-                            "rejecting connection from uid {} gid {} pid {}",
-                            cred.uid, cred.gid, cred.pid
+                        warn!(
+                            uid = cred.uid,
+                            gid = cred.gid,
+                            pid = cred.pid,
+                            "rejecting connection"
                         );
                         drop(stream);
                         continue;
                     }
                     None => {
-                        eprintln!("rejecting connection: could not read peer credentials");
+                        warn!("rejecting connection: could not read peer credentials");
                         drop(stream);
                         continue;
                     }
                 }
                 if active.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
-                    eprintln!("connection limit reached; dropping client");
+                    warn!("connection limit reached; dropping client");
                     drop(stream);
                     continue;
                 }
@@ -253,7 +273,7 @@ fn main() {
                     active.fetch_sub(1, Ordering::Relaxed);
                 });
             }
-            Err(err) => eprintln!("accept error: {err}"),
+            Err(err) => warn!(error = %err, "accept error"),
         }
     }
 }
@@ -339,7 +359,7 @@ fn run_watcher(
     let mut watcher = match Watcher::new() {
         Ok(w) => w,
         Err(err) => {
-            eprintln!("inotify init failed: {err}");
+            error!(error = %err, "inotify init failed");
             return;
         }
     };
@@ -351,16 +371,17 @@ fn run_watcher(
         .collect();
     for root in &roots {
         if let Err(err) = watcher.watch_dir(root) {
-            eprintln!("watch {} failed: {err}", root.display());
+            warn!(path = %root.display(), error = %err, "watch failed");
         }
     }
     let mut reported_failed = watcher.failed().len();
     if reported_failed > 0 {
-        eprintln!(
-            "warning: {reported_failed} directories could not be watched (max_user_watches exhausted?)"
+        warn!(
+            failed = reported_failed,
+            "directories could not be watched (max_user_watches exhausted?)"
         );
     }
-    eprintln!("watching {} directories", watcher.watch_count());
+    info!(directories = watcher.watch_count(), "watching");
 
     let mut buffer = [0u8; 8192];
     loop {
@@ -386,9 +407,9 @@ fn run_watcher(
                 }
                 let failed = watcher.failed().len();
                 if failed > reported_failed {
-                    eprintln!(
-                        "warning: {} more directories could not be watched (max_user_watches exhausted?)",
-                        failed - reported_failed
+                    warn!(
+                        additional = failed - reported_failed,
+                        "more directories could not be watched (max_user_watches exhausted?)"
                     );
                     reported_failed = failed;
                 }
@@ -396,7 +417,7 @@ fn run_watcher(
                 let _ = events.send(IndexEvent::Changed { entries });
             }
             Err(err) => {
-                eprintln!("inotify read error: {err}");
+                error!(error = %err, "inotify read error");
                 break;
             }
         }
@@ -429,7 +450,7 @@ fn run_scheduler(
         let login1_idle = rt.as_ref().and_then(login1_idle_hint).unwrap_or(true);
         let idle = monitor.is_idle() && login1_idle;
         if scheduler.should_rescan(Instant::now(), idle) {
-            eprintln!("idle: rescanning roots");
+            info!("idle: rescanning roots");
             let _ = events.send(IndexEvent::ScanProgress {
                 phase: "start".into(),
                 entries: 0,
@@ -447,9 +468,11 @@ fn run_scheduler(
             };
             config.set_scanning(false);
             trim_heap();
-            eprintln!(
-                "rescan: +{} entries, -{} stale, {} unreadable",
-                report.entries, report.skipped, report.errors
+            info!(
+                added = %report.entries,
+                stale = %report.skipped,
+                unreadable = %report.errors,
+                "rescan complete"
             );
             let _ = events.send(IndexEvent::ScanProgress {
                 phase: "done".into(),
@@ -466,7 +489,7 @@ fn run_ntfs_startup(index: Arc<RwLock<Index>>, policy: Arc<Mutex<ntfs::NtfsPolic
     {
         let p = policy.lock().unwrap_or_else(|e| e.into_inner());
         if !p.is_empty() {
-            eprintln!("ntfs: {} previously indexed partition(s)", p.len());
+            info!(partitions = p.len(), "ntfs: previously indexed partitions");
         }
     }
     let partitions = omavrything_ntfs::list_ntfs_partitions();
@@ -480,20 +503,24 @@ fn run_ntfs_startup(index: Arc<RwLock<Index>>, policy: Arc<Mutex<ntfs::NtfsPolic
         // auto-mounted only if it was previously indexed, otherwise offered.
         let mounted = ntfs::existing_mount_point(&part.device).is_some();
         if !known && !mounted {
-            eprintln!(
-                "ntfs: new partition {} ({}) — use MountNtfs to index it",
-                part.device.display(),
-                part.label.as_deref().unwrap_or("no label")
+            info!(
+                device = %part.device.display(),
+                label = part.label.as_deref().unwrap_or("no label"),
+                "ntfs: new partition; use MountNtfs to index it"
             );
             continue;
         }
         match ntfs::mount_index_and_remember(&index, &policy, part) {
-            Ok(mount_point) => eprintln!(
-                "ntfs: indexed {} at {}",
-                part.device.display(),
-                mount_point.display()
+            Ok(mount_point) => info!(
+                device = %part.device.display(),
+                mount_point = %mount_point.display(),
+                "ntfs: indexed"
             ),
-            Err(err) => eprintln!("ntfs: failed to index {}: {err}", part.device.display()),
+            Err(err) => error!(
+                device = %part.device.display(),
+                error = %err,
+                "ntfs: failed to index"
+            ),
         }
     }
     // MFT parsing allocates large transient buffers and the re-index appends to
@@ -529,7 +556,7 @@ fn run_snapshot(
         };
         let _guard = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         if let Err(e) = snapshot::write_atomic(&bytes, &path) {
-            eprintln!("snapshot save failed: {e}");
+            error!(error = %e, "snapshot save failed");
         }
         drop(bytes);
         // The encoded snapshot is a large transient buffer; return its pages.
@@ -566,9 +593,9 @@ fn install_shutdown_handler(
     let mut fds = [0i32; 2];
     // SAFETY: `fds` is a valid 2-element array for `pipe`.
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        eprintln!(
-            "failed to create shutdown pipe: {}",
-            io::Error::last_os_error()
+        error!(
+            error = %io::Error::last_os_error(),
+            "failed to create shutdown pipe"
         );
         return;
     }
@@ -597,7 +624,7 @@ fn install_shutdown_handler(
                 return;
             }
         }
-        eprintln!("shutdown signal received");
+        info!("shutdown signal received");
         if let Some(path) = &snapshot {
             let bytes = {
                 let idx = read_index(&index);
@@ -606,8 +633,8 @@ fn install_shutdown_handler(
             };
             let _guard = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             match snapshot::write_atomic(&bytes, path) {
-                Ok(()) => eprintln!("snapshot written to {}", path.display()),
-                Err(e) => eprintln!("snapshot save failed: {e}"),
+                Ok(()) => info!(path = %path.display(), "snapshot written"),
+                Err(e) => error!(error = %e, "snapshot save failed"),
             }
         }
         std::process::exit(0);
@@ -653,7 +680,7 @@ fn serve(stream: UnixStream, index: Arc<RwLock<Index>>, profile: bool) {
                 let offset = request.effective_offset();
                 let outcome = if profile {
                     let (outcome, timing) = guard.search_profiled(&request.q, limit, offset);
-                    eprintln!("search {:?}: {}", request.q, timing.summary());
+                    debug!(query = %request.q, timing = %timing.summary(), "search");
                     outcome
                 } else {
                     guard.search(&request.q, limit, offset)
@@ -761,6 +788,8 @@ fn trim_heap() {
     }
 }
 
+/// The resolved daemon configuration: command-line flags override the config
+/// file, which overrides the built-in defaults.
 struct Args {
     roots: Vec<PathBuf>,
     auto: bool,
@@ -772,75 +801,85 @@ struct Args {
     snapshot_interval: u64,
     dbus: bool,
     ntfs: bool,
+    metadata: bool,
+    log_level: LogLevel,
+}
+
+/// Raw command-line options. `None` means "not specified on the command line",
+/// so the config file (or the built-in default) can supply the value.
+#[derive(Default)]
+struct RawArgs {
+    roots: Vec<PathBuf>,
+    auto: bool,
+    excludes: Vec<String>,
+    socket: Option<PathBuf>,
+    watch: Option<bool>,
+    scan_interval: Option<u64>,
+    snapshot: Option<PathBuf>,
+    no_snapshot: bool,
+    snapshot_interval: Option<u64>,
+    dbus: Option<bool>,
+    ntfs: Option<bool>,
     no_metadata: bool,
+    config: Option<PathBuf>,
+    no_config: bool,
+    log_level: Option<String>,
 }
 
 impl Args {
-    fn parse() -> Self {
-        let mut roots = Vec::new();
-        let mut auto = false;
-        let mut excludes = Vec::new();
-        let mut socket = default_socket_path();
-        let mut watch = true;
-        let mut scan_interval = 900u64;
-        let mut snapshot = Some(default_snapshot_path());
-        let mut snapshot_interval = DEFAULT_SNAPSHOT_INTERVAL;
-        let mut dbus = true;
-        let mut ntfs = true;
-        let mut no_metadata = false;
+    /// Parse the command line, load the configuration file, and merge them.
+    fn parse() -> Result<Self, String> {
+        let raw = RawArgs::parse()?;
+        let file = load_file_config(&raw)?;
+        Self::resolve(raw, file)
+    }
 
-        let mut args = std::env::args().skip(1);
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--root" => {
-                    if let Some(value) = args.next() {
-                        roots.push(PathBuf::from(value));
-                    }
-                }
-                "--auto" => auto = true,
-                "--exclude" => {
-                    if let Some(value) = args.next() {
-                        excludes.push(value);
-                    }
-                }
-                "--socket" => {
-                    if let Some(value) = args.next() {
-                        socket = PathBuf::from(value);
-                    }
-                }
-                "--no-watch" => watch = false,
-                "--scan-interval" => {
-                    if let Some(value) = args.next() {
-                        scan_interval = value.parse().unwrap_or(900);
-                    }
-                }
-                "--snapshot" => {
-                    if let Some(value) = args.next() {
-                        snapshot = Some(PathBuf::from(value));
-                    }
-                }
-                "--no-snapshot" => snapshot = None,
-                "--snapshot-interval" => {
-                    if let Some(value) = args.next() {
-                        snapshot_interval = value.parse().unwrap_or(DEFAULT_SNAPSHOT_INTERVAL);
-                    }
-                }
-                "--no-dbus" => dbus = false,
-                "--no-ntfs" => ntfs = false,
-                "--no-metadata" => no_metadata = true,
-                "-h" | "--help" => {
-                    print_help();
-                    std::process::exit(0);
-                }
-                other => {
-                    eprintln!("unknown argument: {other}");
-                    print_help();
-                    std::process::exit(2);
-                }
-            }
-        }
+    /// Merge the command line over the file configuration over the defaults.
+    fn resolve(raw: RawArgs, file: FileConfig) -> Result<Self, String> {
+        // Resolve the log level first: it borrows `file`, which is moved below.
+        let log_level = match &raw.log_level {
+            Some(level) => level.parse::<LogLevel>()?,
+            None => file.log_level().unwrap_or_default(),
+        };
 
-        Self {
+        let auto = raw.auto || file.auto.unwrap_or(false);
+        let roots = if !raw.roots.is_empty() {
+            raw.roots
+        } else {
+            file.roots.unwrap_or_default()
+        };
+
+        // Command-line excludes extend the file's rather than replacing them.
+        let mut excludes = file.excludes.unwrap_or_default();
+        excludes.extend(raw.excludes);
+
+        let socket = raw
+            .socket
+            .or(file.socket)
+            .unwrap_or_else(default_socket_path);
+
+        let snapshot = if raw.no_snapshot || file.no_snapshot.unwrap_or(false) {
+            None
+        } else {
+            raw.snapshot
+                .or(file.snapshot)
+                .or_else(|| Some(default_snapshot_path()))
+        };
+
+        let scan_interval = raw.scan_interval.or(file.scan_interval).unwrap_or(900);
+        let snapshot_interval = raw
+            .snapshot_interval
+            .or(file.snapshot_interval)
+            .unwrap_or(DEFAULT_SNAPSHOT_INTERVAL);
+        let watch = raw.watch.or(file.watch).unwrap_or(true);
+        let dbus = raw.dbus.or(file.dbus).unwrap_or(true);
+        let ntfs = raw.ntfs.or(file.ntfs).unwrap_or(true);
+        let metadata = if raw.no_metadata {
+            false
+        } else {
+            file.metadata.unwrap_or(true)
+        };
+        Ok(Self {
             roots,
             auto,
             excludes,
@@ -851,13 +890,14 @@ impl Args {
             snapshot_interval,
             dbus,
             ntfs,
-            no_metadata,
-        }
+            metadata,
+            log_level,
+        })
     }
 
     /// Build the scan configuration. `--auto` discovers roots from the mount
-    /// table; explicit `--root` flags take precedence; otherwise `$HOME` is
-    /// indexed (a development convenience).
+    /// table; explicit roots take precedence; otherwise `$HOME` is indexed (a
+    /// development convenience).
     fn scan_config(&self) -> ScanConfig {
         let roots = if self.auto {
             Vec::new()
@@ -874,7 +914,102 @@ impl Args {
             roots,
             excludes: self.excludes.clone(),
             skip_pseudo: true,
-            metadata: !self.no_metadata,
+            metadata: self.metadata,
+        }
+    }
+}
+
+impl RawArgs {
+    fn parse() -> Result<Self, String> {
+        let mut raw = RawArgs::default();
+        let mut args = std::env::args().skip(1);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--root" => {
+                    if let Some(value) = args.next() {
+                        raw.roots.push(PathBuf::from(value));
+                    }
+                }
+                "--auto" => raw.auto = true,
+                "--exclude" => {
+                    if let Some(value) = args.next() {
+                        raw.excludes.push(value);
+                    }
+                }
+                "--socket" => {
+                    if let Some(value) = args.next() {
+                        raw.socket = Some(PathBuf::from(value));
+                    }
+                }
+                "--no-watch" => raw.watch = Some(false),
+                "--scan-interval" => {
+                    if let Some(value) = args.next() {
+                        raw.scan_interval = Some(
+                            value
+                                .parse()
+                                .map_err(|_| format!("invalid --scan-interval: {value}"))?,
+                        );
+                    }
+                }
+                "--snapshot" => {
+                    if let Some(value) = args.next() {
+                        raw.snapshot = Some(PathBuf::from(value));
+                    }
+                }
+                "--no-snapshot" => raw.no_snapshot = true,
+                "--snapshot-interval" => {
+                    if let Some(value) = args.next() {
+                        raw.snapshot_interval = Some(
+                            value
+                                .parse()
+                                .map_err(|_| format!("invalid --snapshot-interval: {value}"))?,
+                        );
+                    }
+                }
+                "--no-dbus" => raw.dbus = Some(false),
+                "--no-ntfs" => raw.ntfs = Some(false),
+                "--no-metadata" => raw.no_metadata = true,
+                "--config" => {
+                    if let Some(value) = args.next() {
+                        raw.config = Some(PathBuf::from(value));
+                    }
+                }
+                "--no-config" => raw.no_config = true,
+                "--log-level" => {
+                    if let Some(value) = args.next() {
+                        raw.log_level = Some(value);
+                    }
+                }
+                "-h" | "--help" => {
+                    print_help();
+                    std::process::exit(0);
+                }
+                other => {
+                    eprintln!("unknown argument: {other}");
+                    print_help();
+                    std::process::exit(2);
+                }
+            }
+        }
+        Ok(raw)
+    }
+}
+
+/// Load the configuration file: the `--config` path when given, otherwise the
+/// default path when it exists. `--no-config` skips loading entirely.
+fn load_file_config(raw: &RawArgs) -> Result<FileConfig, String> {
+    if raw.no_config {
+        return Ok(FileConfig::default());
+    }
+    match &raw.config {
+        Some(path) => FileConfig::load(path),
+        None => {
+            let path = Path::new(DEFAULT_CONFIG_PATH);
+            if path.exists() {
+                FileConfig::load(path)
+            } else {
+                Ok(FileConfig::default())
+            }
         }
     }
 }
@@ -912,12 +1047,14 @@ fn print_help() {
     println!(
         "omavrythingd {VERSION}\n\
          \n\
-         Usage: omavrythingd [--root <dir>]... [--auto] [--exclude <glob>]...\n\
+         Usage: omavrythingd [--config <path>] [--root <dir>]... [--auto] [--exclude <glob>]...\n\
          \x20                  [--no-watch] [--scan-interval <secs>] [--socket <path>]\n\
          \x20                  [--snapshot <path>] [--no-snapshot] [--snapshot-interval <secs>]\n\
-         \x20                  [--no-dbus]\n\
+         \x20                  [--no-dbus] [--no-ntfs] [--no-metadata] [--log-level <level>]\n\
          \n\
          Options:\n\
+           --config <path>       Configuration file (default: {DEFAULT_CONFIG_PATH})\n\
+           --no-config           Ignore the configuration file\n\
            --root <dir>          Directory to index (repeatable; default: $HOME)\n\
            --auto                Discover roots from the mount table (skip pseudo-fs)\n\
            --exclude <glob>      Exclude glob, e.g. '**/.git/**' (repeatable)\n\
@@ -932,6 +1069,7 @@ fn print_help() {
            --no-dbus             Disable the D-Bus control interface\n\
            --no-ntfs             Disable NTFS partition detection and indexing\n\
            --no-metadata         Skip per-file size/mtime stats (names-only; faster scan)\n\
+           --log-level <level>   Log level: error, warn, info, debug, trace (default: info)\n\
            -h, --help            Show this help"
     );
 }
