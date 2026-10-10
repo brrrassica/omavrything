@@ -8,10 +8,17 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The target platform is Arch/Omarchy, so the build, test, and package jobs run
+  # inside an official Arch container rather than on the Ubuntu host. This keeps
+  # the toolchain, glibc, and package availability identical to what users run.
   build:
-    name: fmt, clippy, test, build
+    name: fmt, clippy, test, build (Arch)
     runs-on: ubuntu-latest
+    container: archlinux:base-devel
     steps:
+      - name: Install dependencies
+        run: pacman -Syu --noconfirm --needed --overwrite '*' git curl
+
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
@@ -31,5 +38,79 @@ jobs:
       - name: Test
         run: cargo test --all-features
 
+      - name: Test (release)
+        run: cargo test --release --all-features
+
       - name: Build
         run: cargo build --all-features
+
+  fuzz:
+    name: fuzz (smoke, Arch)
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install dependencies
+        run: pacman -Syu --noconfirm --needed --overwrite '*' git curl
+
+      - uses: actions/checkout@v4
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Fuzz the snapshot loader
+        working-directory: fuzz
+        run: cargo fuzz run snapshot_decode -- -max_total_time=60 -rss_limit_mb=2048
+
+      - name: Fuzz the protocol parser
+        working-directory: fuzz
+        run: cargo fuzz run protocol_parse -- -max_total_time=60 -rss_limit_mb=2048
+
+  # Dependency advisories are platform-independent (they only read Cargo.lock),
+  # so this job stays on the default runner where the rustsec action is designed
+  # to run.
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  package:
+    name: package release archive (Arch)
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    needs: build
+    steps:
+      - name: Install dependencies
+        run: pacman -Syu --noconfirm --needed --overwrite '*' git curl zip
+
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build the release archive
+        run: scripts/package-release.sh
+
+      - name: Upload the release archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: omavrything-release-archive
+          path: dist/*.zip
+          if-no-files-found: error

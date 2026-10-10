@@ -77,6 +77,23 @@ pub const DEFAULT_LIMIT: usize = 100;
 /// The hard result cap, regardless of what a request asks for.
 pub const MAX_LIMIT: usize = 1000;
 
+/// The maximum length of a single request line, in bytes. A longer line is
+/// rejected before it is parsed, so a client cannot force unbounded buffering.
+pub const MAX_LINE_BYTES: usize = 64 * 1024;
+
+/// Parse one request line (without the trailing newline).
+///
+/// This is the single entry point the daemon uses for untrusted socket input, so
+/// it is also the target of the protocol fuzzer. It enforces [`MAX_LINE_BYTES`]
+/// and rejects invalid UTF-8 and malformed JSON with a human-readable error.
+pub fn parse_request(line: &[u8]) -> Result<Request, String> {
+    if line.len() > MAX_LINE_BYTES {
+        return Err(format!("request line exceeds {MAX_LINE_BYTES} bytes"));
+    }
+    let text = std::str::from_utf8(line).map_err(|e| format!("invalid UTF-8: {e}"))?;
+    serde_json::from_str(text).map_err(|e| e.to_string())
+}
+
 impl Request {
     /// The effective limit for this request, clamped to [`MAX_LIMIT`].
     pub fn effective_limit(&self) -> usize {
@@ -143,6 +160,21 @@ mod tests {
 
         let req: Request = serde_json::from_str(r#"{"q":"x","limit":99999}"#).unwrap();
         assert_eq!(req.effective_limit(), MAX_LIMIT);
+    }
+
+    #[test]
+    fn parse_request_accepts_a_valid_line() {
+        let req = parse_request(br#"{"q":"report","limit":8}"#).unwrap();
+        assert_eq!(req.q, "report");
+        assert_eq!(req.effective_limit(), 8);
+    }
+
+    #[test]
+    fn parse_request_rejects_malformed_and_oversized_input() {
+        assert!(parse_request(b"not json").is_err());
+        assert!(parse_request(&[0xff, 0xfe]).is_err());
+        let oversized = vec![b'a'; MAX_LINE_BYTES + 1];
+        assert!(parse_request(&oversized).is_err());
     }
 
     #[test]

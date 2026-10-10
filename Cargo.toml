@@ -7,6 +7,9 @@ members = [
     "crates/omavrything-cli",
     "crates/omavrything-client",
 ]
+# The fuzz crate is its own workspace (it needs a nightly toolchain and the
+# libFuzzer runtime), so keep it out of the stable-toolchain workspace jobs.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,7 +17,7 @@ edition = "2024"
 rust-version = "1.85"
 license = "MIT"
 authors = ["omavrything contributors"]
-repository = "https://github.com/omavrything/omavrything"
+repository = "https://github.com/brrrassica/omavrything"
 description = "Instant, index-backed file search for Omarchy Quattro, inspired by Voidtools Everything"
 
 [workspace.dependencies]

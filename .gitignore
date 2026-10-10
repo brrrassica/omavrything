@@ -2,6 +2,15 @@
 /target
 **/*.rs.bk
 
+# Release archives
+/dist
+
+# Fuzzing artifacts
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/coverage
+
 # Planning documents (kept local, not published)
 /plans
 

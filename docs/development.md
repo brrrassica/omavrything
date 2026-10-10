@@ -2,6 +2,33 @@
 
 Build, test, and profiling workflow for contributors.
 
+## Continuous integration
+
+CI runs on GitHub Actions but **inside an official Arch container**
+(`archlinux:base-devel`), not on the Ubuntu host. The target platform is
+Omarchy Quattro / Arch Linux, so building and testing against Arch's toolchain,
+glibc, and package availability catches problems that an Ubuntu build would miss.
+The release archive is built the same way, so the shipped binaries match the
+target platform.
+
+The workflow ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) has four
+jobs:
+
+- **build** — `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`
+  (debug and release), and `cargo build`.
+- **fuzz** — a short `cargo-fuzz` smoke session of the snapshot and protocol
+  targets (nightly toolchain).
+- **audit** — `cargo audit` for dependency advisories. This job stays on the
+  default runner because advisories are platform-independent (they only read
+  `Cargo.lock`).
+- **package** — builds the release archive with `scripts/package-release.sh` and
+  uploads it as a build artifact, so a broken release is caught before a tag.
+
+Pushing a `v*` tag runs
+[`.github/workflows/release.yml`](../.github/workflows/release.yml), which builds
+the archive in the same Arch container and creates a GitHub release with the zip
+attached.
+
 ## Build and test
 
 ```sh
@@ -71,4 +98,22 @@ index size. Two tools measure it:
   is likely a debug build or the index is much larger than expected.
 
 See [`memory-optimization.md`](memory-optimization.md) for the memory model and
-optimization analysis.
+optimization analysis, and [`profiling.md`](profiling.md) for CPU wakeups, idle
+cost, and rescan-interval tuning.
+
+## Fuzzing
+
+The snapshot loader and the socket protocol parser are fuzzed with
+[`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) (requires a nightly
+toolchain):
+
+```sh
+cargo install cargo-fuzz
+cd fuzz
+cargo fuzz run snapshot_decode
+cargo fuzz run protocol_parse
+```
+
+CI runs a short smoke session of each target on every push. A crash is written to
+`fuzz/artifacts/<target>/`; reproduce it with
+`cargo fuzz run <target> fuzz/artifacts/<target>/<crash>`.

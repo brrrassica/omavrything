@@ -30,7 +30,7 @@ use omavrything_core::VERSION;
 use omavrything_core::idle::{IdleMonitor, IdleThresholds, RescanScheduler};
 use omavrything_core::index::Index;
 use omavrything_core::live::{self, FsEvent};
-use omavrything_core::protocol::{Method, Request, Response, ResultItem};
+use omavrything_core::protocol::{Method, Response, ResultItem, parse_request};
 use omavrything_core::scan::{ScanConfig, apply_rescan, plan_rescan, scan};
 use omavrything_core::snapshot::{self, RootIdentity, WarmStart};
 use omavrything_core::watch::Watcher;
@@ -44,8 +44,6 @@ use logging::LogLevel;
 
 /// Maximum number of concurrent client connections.
 const MAX_CONNECTIONS: usize = 64;
-/// Maximum length of a single request line, in bytes.
-const MAX_LINE_BYTES: usize = 64 * 1024;
 /// Per-connection read timeout.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the watcher blocks waiting for events before checking pending moves.
@@ -673,7 +671,11 @@ fn serve(stream: UnixStream, index: Arc<RwLock<Index>>, profile: bool) {
     let mut reader = BufReader::new(read_half);
 
     loop {
-        let line = match read_line_bounded(&mut reader, MAX_LINE_BYTES, READ_TIMEOUT) {
+        let line = match read_line_bounded(
+            &mut reader,
+            omavrything_core::protocol::MAX_LINE_BYTES,
+            READ_TIMEOUT,
+        ) {
             Ok(Some(line)) => line,
             Ok(None) => break,
             Err(_) => break,
@@ -682,10 +684,10 @@ fn serve(stream: UnixStream, index: Arc<RwLock<Index>>, profile: bool) {
             continue;
         }
 
-        let request: Request = match serde_json::from_str(&line) {
+        let request = match parse_request(line.as_bytes()) {
             Ok(request) => request,
             Err(err) => {
-                let _ = write_response(&mut writer, &Response::error(err.to_string()));
+                let _ = write_response(&mut writer, &Response::error(err));
                 continue;
             }
         };
