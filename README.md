@@ -36,6 +36,15 @@ The archive contains the `omavrythingd` daemon and the `omavry` CLI under `bin/`
 the system integration files under `data/`, the shell plugin under `shell/`, the
 install scripts under `scripts/`, and the documentation under `docs/`.
 
+On Arch/Omarchy you can also install from the AUR (see
+[`packaging/`](packaging/)):
+
+```sh
+yay -S omavrything
+omavrything-install-plugin
+omarchy plugin enable omavrything --section center
+```
+
 ## Quick start (from source)
 
 ```sh
