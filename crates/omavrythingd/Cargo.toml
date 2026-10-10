@@ -16,3 +16,5 @@ path = "src/main.rs"
 omavrything-core.workspace = true
 serde_json = { workspace = true }
 libc = { workspace = true }
+zbus = { workspace = true }
+tokio = { workspace = true }

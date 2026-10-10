@@ -5,6 +5,7 @@ members = [
     "crates/omavrything-ntfs",
     "crates/omavrythingd",
     "crates/omavrything-cli",
+    "crates/omavrything-client",
 ]
 
 [workspace.package]
@@ -19,6 +20,7 @@ description = "Instant, index-backed file search for Omarchy Quattro, inspired b
 [workspace.dependencies]
 omavrything-core = { path = "crates/omavrything-core" }
 omavrything-ntfs = { path = "crates/omavrything-ntfs" }
+omavrything-client = { path = "crates/omavrything-client" }
 
 # Shared third-party dependencies (wired up in later milestones).
 anyhow = "1"

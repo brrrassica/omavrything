@@ -26,9 +26,13 @@ NTFS) remains discoverable. `--exclude` globs prune matching paths during
 traversal. The scanner walks each root in parallel and does not cross into nested
 mounts.
 
-The socket defaults to `$XDG_RUNTIME_DIR/omavrything.sock` (falling back to
-`/tmp/omavrything.sock`). The daemon prints the indexed entry count, the roots
-and their filesystem kinds, and the socket path on startup.
+The socket defaults to `/run/omavrything/omavrything.sock` when running as root
+(the M9 system service) and `$XDG_RUNTIME_DIR/omavrything.sock` (falling back to
+`/tmp/omavrything.sock`) otherwise. It is created mode `0660` and, as root,
+group `omavrything`. Every connection is checked with `SO_PEERCRED`: root, the
+daemon's own uid, and members of the `omavrything` group are allowed. The daemon
+prints the indexed entry count, the roots and their filesystem kinds, and the
+socket path on startup.
 
 ## Protocol
 
@@ -69,10 +73,40 @@ results:
 {"results":[],"total":0,"took_ms":0,"error":"expected value at line 1 column 1"}
 ```
 
+## D-Bus control interface
+
+Control and status are exposed on the system bus as
+`org.omarchy.omavrything.Manager` at `/org/omarchy/omavrything`:
+
+| Method | Description |
+| --- | --- |
+| `GetStatus` | version, entries, roots, uptime |
+| `Rescan(root)` | rescan all roots (empty `root`) or one root; returns entries added |
+| `GetConfig` | the current configuration |
+| `SetConfig(key, value)` | set `excludes`, `scan_interval`, or `snapshot_interval` |
+| `ListRoots` | the indexed roots |
+| `MountNtfs(uuid)` | mount an NTFS partition (M8) |
+
+Signals: `IndexChanged(entries)` and `ScanProgress(phase, entries)`.
+
+The read-only methods are open to all; `Rescan`, `SetConfig`, and `MountNtfs`
+are gated by the `org.omarchy.omavrything.control` polkit action. The bus policy
+is in `data/dbus/org.omarchy.omavrything.conf` and the polkit action in
+`data/polkit/org.omarchy.omavrything.policy`. If the system bus is unavailable
+the daemon logs and continues, leaving the socket search path unaffected;
+`--no-dbus` disables the interface.
+
+## Client library
+
+`omavrything-client` is the shared client used by the CLI and the shell plugin:
+`SocketClient` speaks the search protocol over the Unix socket, and
+`DbusClient` calls the control interface.
+
 ## CLI
 
 ```sh
-omavry search "report 2024"
+omavry search "report 2024"   # Unix socket
+omavry status                 # D-Bus
 ```
 
 ## Live updates
@@ -117,5 +151,5 @@ cold scan.
 ## Current limitations
 
 - The daemon runs as the user; the root system service arrives later (M9).
-- NTFS partitions are not yet read via the MFT (M8).
-- The login1 idle hint is not yet consulted (M7).
+- NTFS partitions are not yet read via the MFT (M8); `MountNtfs` is a stub.
+- The login1 idle hint is not yet consulted.

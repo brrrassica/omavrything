@@ -1,14 +1,10 @@
 //! The `omavry` command-line client for `omavrything`.
 //!
-//! M2 walking skeleton: a `search` subcommand that queries the daemon over the
-//! Unix socket. The full CLI (status, rescan, config, mount) arrives in M10.
+//! Uses the shared `omavrything-client` library: `search` over the Unix socket
+//! and `status` over D-Bus. The full CLI (rescan, config, mount) arrives in M10.
 
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
-
+use omavrything_client::{DbusClient, SocketClient};
 use omavrything_core::VERSION;
-use omavrything_core::protocol::{Method, Request, Response};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -23,6 +19,7 @@ fn main() {
             }
             std::process::exit(search(&query));
         }
+        "status" => std::process::exit(status()),
         "help" | "-h" | "--help" => print_help(),
         other => {
             eprintln!("unknown command: {other}");
@@ -33,39 +30,19 @@ fn main() {
 }
 
 fn search(query: &str) -> i32 {
-    let socket = default_socket_path();
-    let mut stream = match UnixStream::connect(&socket) {
-        Ok(stream) => stream,
+    let mut client = match SocketClient::connect_default() {
+        Ok(client) => client,
         Err(err) => {
-            eprintln!("cannot connect to {}: {err}", socket.display());
+            eprintln!("cannot connect to the daemon: {err}");
             eprintln!("is omavrythingd running?");
             return 1;
         }
     };
 
-    let request = Request {
-        method: Method::Search,
-        q: query.to_string(),
-        limit: Some(50),
-        offset: None,
-    };
-    let line = serde_json::to_string(&request).unwrap();
-    if writeln!(stream, "{line}").is_err() {
-        eprintln!("failed to send request");
-        return 1;
-    }
-
-    let mut reader = BufReader::new(stream);
-    let mut response_line = String::new();
-    if reader.read_line(&mut response_line).is_err() {
-        eprintln!("failed to read response");
-        return 1;
-    }
-
-    let response: Response = match serde_json::from_str(&response_line) {
+    let response = match client.search(query, 50, 0) {
         Ok(response) => response,
         Err(err) => {
-            eprintln!("invalid response: {err}");
+            eprintln!("search failed: {err}");
             return 1;
         }
     };
@@ -87,11 +64,40 @@ fn search(query: &str) -> i32 {
     0
 }
 
-fn default_socket_path() -> PathBuf {
-    match std::env::var_os("XDG_RUNTIME_DIR") {
-        Some(dir) => PathBuf::from(dir).join("omavrything.sock"),
-        None => PathBuf::from("/tmp/omavrything.sock"),
-    }
+fn status() -> i32 {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("failed to start runtime: {err}");
+            return 1;
+        }
+    };
+    runtime.block_on(async {
+        let client = match DbusClient::connect().await {
+            Ok(client) => client,
+            Err(err) => {
+                eprintln!("cannot connect to the D-Bus interface: {err}");
+                return 1;
+            }
+        };
+        match client.status().await {
+            Ok(status) => {
+                let mut keys: Vec<&String> = status.keys().collect();
+                keys.sort();
+                for key in keys {
+                    println!("{key}: {}", status[key]);
+                }
+                0
+            }
+            Err(err) => {
+                eprintln!("status failed: {err}");
+                1
+            }
+        }
+    })
 }
 
 fn print_help() {
@@ -101,7 +107,8 @@ fn print_help() {
          Usage: omavry <command> [args]\n\
          \n\
          Commands:\n\
-           search <query>   Search the index\n\
+           search <query>   Search the index (Unix socket)\n\
+           status           Show daemon status (D-Bus)\n\
            help             Show this help"
     );
 }

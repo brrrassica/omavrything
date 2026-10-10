@@ -197,6 +197,11 @@ impl RescanScheduler {
         }
     }
 
+    /// Change the rescan interval (e.g. after a runtime config update).
+    pub fn set_interval(&mut self, interval: Duration) {
+        self.interval = interval;
+    }
+
     /// Whether a rescan should run at `now`. The interval timer resets whenever
     /// it elapses, so a busy system simply skips this cycle.
     pub fn should_rescan(&mut self, now: Instant, idle: bool) -> bool {

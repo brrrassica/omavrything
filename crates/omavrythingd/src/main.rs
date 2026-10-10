@@ -1,12 +1,22 @@
 //! The `omavrythingd` index daemon.
 //!
-//! M5: discovers mounted filesystems (or uses explicit roots), scans them in
-//! parallel, keeps the index current with inotify, and runs idle-gated periodic
-//! rescans. Queries are served as newline-delimited JSON over a Unix socket.
+//! Discovers mounted filesystems (or uses explicit roots), scans them in
+//! parallel, keeps the index current with inotify, runs idle-gated periodic
+//! rescans, and persists a snapshot for warm starts. Queries are served as
+//! newline-delimited JSON over a Unix socket; control and status are exposed on
+//! D-Bus.
 
+mod config;
+mod dbus;
+mod peer;
+mod polkit;
+
+use std::ffi::CString;
 use std::io::{self, BufRead, BufReader, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
@@ -19,6 +29,10 @@ use omavrything_core::protocol::{Method, Request, Response, ResultItem};
 use omavrything_core::scan::{ScanConfig, rescan_into_index, scan};
 use omavrything_core::snapshot::{self, RootIdentity, WarmStart};
 use omavrything_core::watch::Watcher;
+use tokio::sync::mpsc::UnboundedSender;
+
+use config::SharedConfig;
+use dbus::IndexEvent;
 
 /// Maximum number of concurrent client connections.
 const MAX_CONNECTIONS: usize = 64;
@@ -30,25 +44,27 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 const WATCH_POLL: Duration = Duration::from_millis(500);
 /// Default interval between periodic snapshot writes.
 const DEFAULT_SNAPSHOT_INTERVAL: u64 = 300;
+/// The group that may use the system socket.
+const SOCKET_GROUP: &str = "omavrything";
 
 fn main() {
     let args = Args::parse();
 
     eprintln!("omavrythingd {VERSION}");
-    let config = Arc::new(args.scan_config());
+    let scan_config = args.scan_config();
     let started = Instant::now();
 
     let (index, report, identities, outcome) = match &args.snapshot {
         Some(path) => {
-            let warm = snapshot::warm_start(&config, path);
+            let warm = snapshot::warm_start(&scan_config, path);
             (warm.index, warm.report, warm.identities, Some(warm.outcome))
         }
         None => {
-            let (index, report) = scan(&config);
+            let (index, report) = scan(&scan_config);
             let identities = index
                 .roots()
                 .iter()
-                .filter_map(|r| snapshot::root_identity(std::path::Path::new(&r.path)))
+                .filter_map(|r| snapshot::root_identity(Path::new(&r.path)))
                 .collect();
             (index, report, identities, None)
         }
@@ -87,7 +103,18 @@ fn main() {
     }
 
     let index = Arc::new(RwLock::new(index));
+    let config = Arc::new(SharedConfig::new(
+        scan_config,
+        args.scan_interval,
+        args.snapshot_interval,
+        args.snapshot.clone(),
+        args.watch,
+    ));
     let identities = Arc::new(RwLock::new(identities));
+
+    // Index events are forwarded to the D-Bus signal task. If D-Bus is
+    // disabled the receiver is dropped and sends are ignored.
+    let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<IndexEvent>();
 
     // Block SIGTERM/SIGINT before spawning threads so they inherit the mask and
     // a dedicated thread can perform a clean snapshot write on shutdown.
@@ -100,26 +127,40 @@ fn main() {
     if args.watch {
         let index = Arc::clone(&index);
         let config = Arc::clone(&config);
-        std::thread::spawn(move || run_watcher(index, config));
+        let events = event_tx.clone();
+        std::thread::spawn(move || run_watcher(index, config, events));
     }
 
     if args.scan_interval > 0 {
         let index = Arc::clone(&index);
         let config = Arc::clone(&config);
-        std::thread::spawn(move || run_scheduler(index, config, args.scan_interval));
+        let events = event_tx.clone();
+        std::thread::spawn(move || run_scheduler(index, config, events));
     }
 
     if let Some(path) = &args.snapshot {
         if args.snapshot_interval > 0 {
             let index = Arc::clone(&index);
             let identities = Arc::clone(&identities);
+            let config = Arc::clone(&config);
             let path = path.clone();
-            let interval = args.snapshot_interval;
-            std::thread::spawn(move || run_snapshot(index, identities, path, interval));
+            std::thread::spawn(move || run_snapshot(index, identities, config, path));
         }
     }
 
+    if args.dbus {
+        let index = Arc::clone(&index);
+        let config = Arc::clone(&config);
+        let events = event_tx.clone();
+        std::thread::spawn(move || dbus::run(index, config, started, event_rx, events));
+    }
+
     // A stale socket from a previous run would make bind() fail.
+    if let Some(parent) = args.socket.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            eprintln!("failed to create {}: {err}", parent.display());
+        }
+    }
     let _ = std::fs::remove_file(&args.socket);
     let listener = match UnixListener::bind(&args.socket) {
         Ok(listener) => listener,
@@ -128,12 +169,36 @@ fn main() {
             std::process::exit(1);
         }
     };
+    if let Err(err) = prepare_socket(&args.socket) {
+        eprintln!("warning: could not secure {}: {err}", args.socket.display());
+    }
     eprintln!("listening on {}", args.socket.display());
+
+    let allowed_gid = peer::group_gid(SOCKET_GROUP);
+    if allowed_gid.is_none() {
+        eprintln!("warning: group '{SOCKET_GROUP}' not found; relying on socket permissions");
+    }
 
     let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                match peer::peer_cred(&stream) {
+                    Some(cred) if peer::peer_allowed(&cred, allowed_gid) => {}
+                    Some(cred) => {
+                        eprintln!(
+                            "rejecting connection from uid {} gid {} pid {}",
+                            cred.uid, cred.gid, cred.pid
+                        );
+                        drop(stream);
+                        continue;
+                    }
+                    None => {
+                        eprintln!("rejecting connection: could not read peer credentials");
+                        drop(stream);
+                        continue;
+                    }
+                }
                 if active.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
                     eprintln!("connection limit reached; dropping client");
                     drop(stream);
@@ -152,8 +217,32 @@ fn main() {
     }
 }
 
+/// Set the socket to mode `0660` and, when running as root, group
+/// `omavrything`.
+fn prepare_socket(path: &Path) -> io::Result<()> {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
+    // SAFETY: `geteuid` has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        if let Some(gid) = peer::group_gid(SOCKET_GROUP) {
+            let c = CString::new(path.as_os_str().as_bytes())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "socket path has NUL"))?;
+            // SAFETY: `c` is a valid NUL-terminated path; uid -1 leaves the
+            // owner unchanged.
+            let rc = unsafe { libc::chown(c.as_ptr(), !0 as libc::uid_t, gid) };
+            if rc != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Watch the indexed roots with inotify and apply events to the index.
-fn run_watcher(index: Arc<RwLock<Index>>, config: Arc<ScanConfig>) {
+fn run_watcher(
+    index: Arc<RwLock<Index>>,
+    config: Arc<SharedConfig>,
+    events: UnboundedSender<IndexEvent>,
+) {
     let mut watcher = match Watcher::new() {
         Ok(w) => w,
         Err(err) => {
@@ -183,18 +272,19 @@ fn run_watcher(index: Arc<RwLock<Index>>, config: Arc<ScanConfig>) {
     let mut buffer = [0u8; 8192];
     loop {
         match watcher.read_events(&mut buffer, WATCH_POLL) {
-            Ok(events) => {
-                if events.is_empty() {
+            Ok(batch) => {
+                if batch.is_empty() {
                     continue;
                 }
+                let scan = config.scan();
                 {
                     let mut idx = write_index(&index);
-                    for event in &events {
-                        live::apply(&mut idx, event, &config);
+                    for event in &batch {
+                        live::apply(&mut idx, event, &scan);
                     }
                 }
                 // Watch newly created directories.
-                for event in &events {
+                for event in &batch {
                     if let FsEvent::Created(path) = event {
                         if path.is_dir() {
                             let _ = watcher.watch_dir(path);
@@ -209,6 +299,8 @@ fn run_watcher(index: Arc<RwLock<Index>>, config: Arc<ScanConfig>) {
                     );
                     reported_failed = failed;
                 }
+                let entries = read_index(&index).len() as u64;
+                let _ = events.send(IndexEvent::Changed { entries });
             }
             Err(err) => {
                 eprintln!("inotify read error: {err}");
@@ -219,20 +311,42 @@ fn run_watcher(index: Arc<RwLock<Index>>, config: Arc<ScanConfig>) {
 }
 
 /// Periodically rescan the roots when the system is idle.
-fn run_scheduler(index: Arc<RwLock<Index>>, config: Arc<ScanConfig>, interval_secs: u64) {
+fn run_scheduler(
+    index: Arc<RwLock<Index>>,
+    config: Arc<SharedConfig>,
+    events: UnboundedSender<IndexEvent>,
+) {
     let mut monitor = IdleMonitor::new(IdleThresholds::default());
-    let mut scheduler = RescanScheduler::new(Duration::from_secs(interval_secs));
+    let mut scheduler = RescanScheduler::new(Duration::from_secs(config.scan_interval().max(1)));
     loop {
         std::thread::sleep(Duration::from_secs(5));
+        let interval = config.scan_interval();
+        if interval == 0 {
+            continue;
+        }
+        scheduler.set_interval(Duration::from_secs(interval));
         let idle = monitor.is_idle();
         if scheduler.should_rescan(Instant::now(), idle) {
             eprintln!("idle: rescanning roots");
-            let mut idx = write_index(&index);
-            let report = rescan_into_index(&mut idx, &config);
+            let _ = events.send(IndexEvent::ScanProgress {
+                phase: "start".into(),
+                entries: 0,
+            });
+            let scan = config.scan();
+            let (report, entries) = {
+                let mut idx = write_index(&index);
+                let report = rescan_into_index(&mut idx, &scan);
+                (report, idx.len() as u64)
+            };
             eprintln!(
                 "rescan: +{} entries, -{} stale, {} unreadable",
                 report.entries, report.skipped, report.errors
             );
+            let _ = events.send(IndexEvent::ScanProgress {
+                phase: "done".into(),
+                entries,
+            });
+            let _ = events.send(IndexEvent::Changed { entries });
         }
     }
 }
@@ -241,11 +355,16 @@ fn run_scheduler(index: Arc<RwLock<Index>>, config: Arc<ScanConfig>, interval_se
 fn run_snapshot(
     index: Arc<RwLock<Index>>,
     identities: Arc<RwLock<Vec<RootIdentity>>>,
+    config: Arc<SharedConfig>,
     path: PathBuf,
-    interval_secs: u64,
 ) {
     loop {
-        std::thread::sleep(Duration::from_secs(interval_secs));
+        let interval = config.snapshot_interval();
+        if interval == 0 {
+            std::thread::sleep(Duration::from_secs(5));
+            continue;
+        }
+        std::thread::sleep(Duration::from_secs(interval));
         let idx = read_index(&index);
         let ids = read_identities(&identities);
         if let Err(e) = snapshot::save(&idx, &ids, &path) {
@@ -449,6 +568,7 @@ struct Args {
     scan_interval: u64,
     snapshot: Option<PathBuf>,
     snapshot_interval: u64,
+    dbus: bool,
 }
 
 impl Args {
@@ -461,6 +581,7 @@ impl Args {
         let mut scan_interval = 900u64;
         let mut snapshot = Some(default_snapshot_path());
         let mut snapshot_interval = DEFAULT_SNAPSHOT_INTERVAL;
+        let mut dbus = true;
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -498,6 +619,7 @@ impl Args {
                         snapshot_interval = value.parse().unwrap_or(DEFAULT_SNAPSHOT_INTERVAL);
                     }
                 }
+                "--no-dbus" => dbus = false,
                 "-h" | "--help" => {
                     print_help();
                     std::process::exit(0);
@@ -519,6 +641,7 @@ impl Args {
             scan_interval,
             snapshot,
             snapshot_interval,
+            dbus,
         }
     }
 
@@ -545,15 +668,22 @@ impl Args {
     }
 }
 
+/// The default socket path: `/run/omavrything` for the root system service,
+/// the per-user runtime directory otherwise.
 fn default_socket_path() -> PathBuf {
-    match std::env::var_os("XDG_RUNTIME_DIR") {
-        Some(dir) => PathBuf::from(dir).join("omavrything.sock"),
-        None => PathBuf::from("/tmp/omavrything.sock"),
+    // SAFETY: `geteuid` has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        PathBuf::from("/run/omavrything/omavrything.sock")
+    } else {
+        match std::env::var_os("XDG_RUNTIME_DIR") {
+            Some(dir) => PathBuf::from(dir).join("omavrything.sock"),
+            None => PathBuf::from("/tmp/omavrything.sock"),
+        }
     }
 }
 
-/// The default snapshot path: `/var/lib` for the root system service (M9), the
-/// XDG state directory for a user-run daemon.
+/// The default snapshot path: `/var/lib` for the root system service, the XDG
+/// state directory for a user-run daemon.
 fn default_snapshot_path() -> PathBuf {
     // SAFETY: `geteuid` has no preconditions.
     if unsafe { libc::geteuid() } == 0 {
@@ -574,6 +704,7 @@ fn print_help() {
          Usage: omavrythingd [--root <dir>]... [--auto] [--exclude <glob>]...\n\
          \x20                  [--no-watch] [--scan-interval <secs>] [--socket <path>]\n\
          \x20                  [--snapshot <path>] [--no-snapshot] [--snapshot-interval <secs>]\n\
+         \x20                  [--no-dbus]\n\
          \n\
          Options:\n\
            --root <dir>          Directory to index (repeatable; default: $HOME)\n\
@@ -581,11 +712,13 @@ fn print_help() {
            --exclude <glob>      Exclude glob, e.g. '**/.git/**' (repeatable)\n\
            --no-watch            Disable inotify live updates\n\
            --scan-interval <s>   Idle-gated rescan interval in seconds (0 disables; default 900)\n\
-           --socket <path>       Unix socket path (default: $XDG_RUNTIME_DIR/omavrything.sock)\n\
+           --socket <path>       Unix socket path (default: /run/omavrything/omavrything.sock as root,\n\
+         \x20                       else $XDG_RUNTIME_DIR/omavrything.sock)\n\
            --snapshot <path>     Snapshot path (default: /var/lib/omavrything/index.snapshot as root,\n\
          \x20                       else $XDG_STATE_HOME/omavrything/index.snapshot)\n\
            --no-snapshot         Disable snapshot persistence\n\
            --snapshot-interval <s>  Snapshot write interval in seconds (0 disables; default 300)\n\
+           --no-dbus             Disable the D-Bus control interface\n\
            -h, --help            Show this help"
     );
 }
