@@ -13,10 +13,10 @@ proposals are **already implemented**. Per live record, steady state:
 
 | Component | Size / record | Notes |
 |---|---|---|
-| [`FileRecord`](../crates/omavrything-core/src/index.rs:57) | 32 B | u64 + i64 + 3x u32 + u16 + u8, packed (was 48 B) |
+| [`FileRecord`](../crates/omavrything-core/src/index.rs:57) | 20 B | u32 size/mtime/parent/path_off + u16 path_len + u8 depth/flags |
 | `paths` arena | ~70 B | **full path bytes** (the dominant term) |
-| [`PathIndex`](../crates/omavrything-core/src/index.rs:164) | ~13 B x load factor (~18 B) | `HashMap<u64, u32>` hash + index, no path copy |
-| **Total** | **~120 B/file** | ~360 MB for 3M files |
+| [`PathIndex`](../crates/omavrything-core/src/index.rs:164) | ~9 B x load factor (~10 B) | `HashMap<u32, u32>` hash + index, no path copy |
+| **Total** | **~100 B/file** | ~300 MB for 3M files |
 
 The basename is derived from the path (the bytes after the last `/`), so there
 is no separate `names` arena.
@@ -105,7 +105,29 @@ decision and only stat non-directories (or only when size/mtime are needed).
 | 5 | Proposal 3: bitmap filter cache for incremental search | Medium | Medium | latency | pending |
 | 6 | Proposal 2b: drop full-path storage, reconstruct | High | High | ~70 B/file | pending |
 
-## 5. Suggested execution plan
+## 5. Resident memory follow-up
+
+After the arena/record work the daemon still sat at ~597 MB RSS. The remaining
+memory is the index itself, plus two allocation-slack bugs and allocator
+retention:
+
+- **Snapshot loader over-allocated `records`.** `Vec::with_capacity(count.min(1 << 20))`
+  let the vector double up to 8M capacity for 4.5M records (~112 MB slack). It
+  now pre-sizes exactly after validating the count against the remaining bytes.
+- **`PathIndex` was oversized.** A `HashMap<u64, u32>` pads each `(u64, u32)`
+  tuple to 16 B; switching the key to a 32-bit hash makes it `(u32, u32)` (8 B),
+  halving the map.
+- **`compact()` was a no-op without tombstones**, so a cold scan never shrank its
+  arenas. A new `Index::shrink()` reclaims the doubling slack after the scan or a
+  warm start, and `memory_bytes()` now reports capacity rather than length.
+- **Allocator retention.** `malloc_trim(0)` does not reliably release per-thread
+  glibc arenas, so the scan's transient buffers could stay resident. The daemon
+  now calls `mallopt(M_ARENA_MAX, 1)` at startup so a single arena is trimmed.
+
+`FileRecord` was also shrunk from 32 to 20 bytes (`size`/`mtime` to `u32`,
+`path_len` to `u16`, `depth` to `u8`), bumping the snapshot format to v3.
+
+## 6. Suggested execution plan
 
 1. Add a memory-accounting test/benchmark that reports bytes-per-record for a
    synthetic 3M index, so each change is measured (extend

@@ -11,9 +11,8 @@
 //!               generation: u64
 //!               path:       u32 len + bytes
 //! records:    u32 count, then per record:
-//!               size: u64, mtime: i64
-//!               parent, path_off, path_len: u32
-//!               depth: u16, flags: u8
+//!               size, mtime, parent, path_off: u32
+//!               path_len: u16, depth: u8, flags: u8
 //! paths:      u32 len + bytes
 //! checksum:   u64 LE (FNV-1a over everything before it)
 //! ```
@@ -32,7 +31,7 @@ use crate::index::{FileRecord, FsKind, Index, Root};
 use crate::scan::{ScanConfig, ScanReport, resolve_roots, scan, scan_into_index};
 
 const MAGIC: &[u8; 8] = b"OMAVSNAP";
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 
 /// A snapshot error.
 #[derive(Debug)]
@@ -182,12 +181,12 @@ pub fn encode(index: &Index, identities: &[RootIdentity]) -> Vec<u8> {
         } else {
             remap[rec.parent as usize]
         };
-        put_u64(&mut out, rec.size);
-        put_i64(&mut out, rec.mtime);
+        put_u32(&mut out, rec.size);
+        put_u32(&mut out, rec.mtime);
         put_u32(&mut out, parent);
         put_u32(&mut out, rec.path_off);
-        put_u32(&mut out, rec.path_len);
-        put_u16(&mut out, rec.depth);
+        put_u16(&mut out, rec.path_len);
+        put_u8(&mut out, rec.depth);
         put_u8(&mut out, rec.flags);
     }
 
@@ -234,15 +233,22 @@ pub fn decode(bytes: &[u8]) -> Result<(Index, Vec<RootIdentity>), SnapshotError>
     }
 
     let record_count = r.u32()? as usize;
-    let mut records = Vec::with_capacity(record_count.min(1 << 20));
+    // Each record is 4+4+4+4+2+1+1 = 20 bytes. Reject a count that cannot fit in
+    // the remaining bytes before allocating, so a corrupt snapshot cannot force a
+    // huge allocation; then pre-size exactly so the vector does not double.
+    const RECORD_BYTES: usize = 20;
+    if record_count.saturating_mul(RECORD_BYTES) > r.remaining() {
+        return Err(SnapshotError::Truncated);
+    }
+    let mut records = Vec::with_capacity(record_count);
     for _ in 0..record_count {
         records.push(FileRecord {
-            size: r.u64()?,
-            mtime: r.i64()?,
+            size: r.u32()?,
+            mtime: r.u32()?,
             parent: r.u32()?,
             path_off: r.u32()?,
-            path_len: r.u32()?,
-            depth: r.u16()?,
+            path_len: r.u16()?,
+            depth: r.u8()?,
             flags: r.u8()?,
         });
     }
@@ -465,10 +471,6 @@ fn put_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 
-fn put_i64(out: &mut Vec<u8>, v: i64) {
-    out.extend_from_slice(&v.to_le_bytes());
-}
-
 fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     put_u32(out, bytes.len() as u32);
     out.extend_from_slice(bytes);
@@ -493,6 +495,11 @@ struct Reader<'a> {
 impl<'a> Reader<'a> {
     fn new(buf: &'a [u8]) -> Self {
         Self { buf, pos: 0 }
+    }
+
+    /// The number of bytes left to read.
+    fn remaining(&self) -> usize {
+        self.buf.len() - self.pos
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8], SnapshotError> {
@@ -523,10 +530,6 @@ impl<'a> Reader<'a> {
 
     fn u64(&mut self) -> Result<u64, SnapshotError> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
-    }
-
-    fn i64(&mut self) -> Result<i64, SnapshotError> {
-        Ok(i64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
 
     fn bytes(&mut self) -> Result<&'a [u8], SnapshotError> {

@@ -60,6 +60,9 @@ const SOCKET_GROUP: &str = "omavrything";
 static SNAPSHOT_LOCK: Mutex<()> = Mutex::new(());
 
 fn main() {
+    // Constrain the allocator before any thread spawns so the scan's transient
+    // buffers are returned to the OS rather than retained in per-thread arenas.
+    tune_allocator();
     let args = match Args::parse() {
         Ok(args) => args,
         Err(err) => {
@@ -73,7 +76,7 @@ fn main() {
     let scan_config = args.scan_config();
     let started = Instant::now();
 
-    let (index, report, identities, outcome) = match &args.snapshot {
+    let (mut index, report, identities, outcome) = match &args.snapshot {
         Some(path) => {
             let warm = snapshot::warm_start(&scan_config, path);
             (warm.index, warm.report, warm.identities, Some(warm.outcome))
@@ -123,9 +126,9 @@ fn main() {
         info!(path = %root.path, fs_kind = ?root.fs_kind, "root");
     }
 
-    // The initial scan allocates large transient buffers (the walked entry list)
-    // on the rayon worker threads; return those freed pages to the OS before the
-    // daemon settles into its idle footprint.
+    // Reclaim the doubling slack left by the scan or snapshot load, then return
+    // the scan's freed transient pages to the OS before the daemon idles.
+    index.shrink();
     trim_heap();
 
     let index = Arc::new(RwLock::new(index));
@@ -790,6 +793,20 @@ fn trim_heap() {
     // SAFETY: `malloc_trim` has no preconditions.
     unsafe {
         libc::malloc_trim(0);
+    }
+}
+
+/// Constrain the glibc allocator so freed scan buffers are returned to the OS.
+///
+/// By default glibc creates one arena per thread, and `malloc_trim` only
+/// reliably releases the main arena, so the scan's transient allocations (made
+/// on rayon worker threads) can stay resident. Forcing a single arena makes
+/// [`trim_heap`] effective. A no-op on non-glibc targets.
+fn tune_allocator() {
+    #[cfg(target_env = "gnu")]
+    // SAFETY: `mallopt` has no preconditions; `M_ARENA_MAX` is a valid option.
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 1);
     }
 }
 

@@ -58,21 +58,23 @@ pub struct Root {
 ///
 /// The basename is not stored: it is derived from the full path (the bytes after
 /// the last `/`), so the record carries only the path arena offset. Fields are
-/// ordered largest-first so the struct packs into 32 bytes with no padding.
+/// sized to pack the struct into 20 bytes: `size` saturates at 4 GiB, `mtime` is
+/// Unix seconds (valid to 2106), `path_len` covers paths under 64 KiB, and
+/// `depth` saturates at 255.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileRecord {
-    /// Size in bytes. Zero for directories.
-    pub size: u64,
+    /// Size in bytes, saturating at `u32::MAX` (4 GiB). Zero for directories.
+    pub size: u32,
     /// Last-modified time, Unix seconds. Zero when unavailable.
-    pub mtime: i64,
+    pub mtime: u32,
     /// Index of the parent directory record, or `u32::MAX` for a root.
     pub parent: u32,
     /// Offset of the full path into the path arena.
     pub path_off: u32,
-    /// Byte length of the full path.
-    pub path_len: u32,
-    /// Path depth (number of `/` separators).
-    pub depth: u16,
+    /// Byte length of the full path (paths are under 64 KiB).
+    pub path_len: u16,
+    /// Path depth (number of `/` separators), saturating at 255.
+    pub depth: u8,
     /// `FLAG_*` bits.
     pub flags: u8,
 }
@@ -157,14 +159,16 @@ impl SearchTiming {
 
 /// Maps full paths to record indices without duplicating the path bytes.
 ///
-/// The primary map is keyed by a 64-bit hash of the path; the path arena is
-/// consulted to confirm a match. A hash collision (astronomically rare) is kept
-/// in `collisions`, keyed by the full path, so lookups stay correct. This
-/// replaces the previous `HashMap<Box<str>, u32>`, which stored a second copy of
-/// every path and dominated the index's memory use.
+/// The primary map is keyed by a 32-bit hash of the path; the path arena is
+/// consulted to confirm a match. A 32-bit key halves the map's per-entry cost
+/// (a `(u32, u32)` tuple is 8 bytes, versus 16 for `(u64, u32)`). A hash
+/// collision (two distinct paths with the same hash) is kept in `collisions`,
+/// keyed by the full path, so lookups stay correct. This replaces the previous
+/// `HashMap<Box<str>, u32>`, which stored a second copy of every path and
+/// dominated the index's memory use.
 #[derive(Debug, Default, Clone)]
 struct PathIndex {
-    main: HashMap<u64, u32>,
+    main: HashMap<u32, u32>,
     collisions: HashMap<Box<str>, u32>,
 }
 
@@ -174,10 +178,6 @@ impl PathIndex {
             main: HashMap::with_capacity(n),
             collisions: HashMap::new(),
         }
-    }
-
-    fn len(&self) -> usize {
-        self.main.len() + self.collisions.len()
     }
 
     fn clear(&mut self) {
@@ -190,10 +190,19 @@ impl PathIndex {
         self.collisions.shrink_to_fit();
     }
 
+    /// An estimate of the heap bytes held by the map, based on its capacity.
+    fn capacity_bytes(&self) -> usize {
+        // hashbrown stores `(K, V)` tuples plus one control byte per bucket, and
+        // keeps the bucket count at a power of two with a 7/8 load factor.
+        let per_bucket = std::mem::size_of::<u32>() + std::mem::size_of::<u32>() + 1;
+        let buckets = self.main.capacity() * 8 / 7;
+        buckets * per_bucket
+    }
+
     /// The record index for `key`, or `None`. `records`/`paths` are the index's
     /// arenas, used to confirm the hash match.
     fn get(&self, key: &str, records: &[FileRecord], paths: &[u8]) -> Option<u32> {
-        let h = fnv1a64(key.as_bytes());
+        let h = fnv1a32(key.as_bytes());
         if let Some(&idx) = self.main.get(&h) {
             let rec = &records[idx as usize];
             let start = rec.path_off as usize;
@@ -206,7 +215,7 @@ impl PathIndex {
 
     /// Record `key` -> `idx`, keeping a colliding path in the fallback map.
     fn insert(&mut self, key: &str, idx: u32, records: &[FileRecord], paths: &[u8]) {
-        let h = fnv1a64(key.as_bytes());
+        let h = fnv1a32(key.as_bytes());
         let collides = self.main.get(&h).copied().is_some_and(|existing| {
             let rec = &records[existing as usize];
             let start = rec.path_off as usize;
@@ -226,7 +235,7 @@ impl PathIndex {
     /// currently in `collisions`, which holds when the map is built from
     /// scratch.
     fn insert_bytes(&mut self, key: &[u8], idx: u32, records: &[FileRecord], paths: &[u8]) {
-        let h = fnv1a64(key);
+        let h = fnv1a32(key);
         let collides = self.main.get(&h).copied().is_some_and(|existing| {
             let rec = &records[existing as usize];
             let start = rec.path_off as usize;
@@ -244,7 +253,7 @@ impl PathIndex {
 
     /// Remove `key` from the index.
     fn remove(&mut self, key: &str, records: &[FileRecord], paths: &[u8]) {
-        let h = fnv1a64(key.as_bytes());
+        let h = fnv1a32(key.as_bytes());
         if let Some(&idx) = self.main.get(&h) {
             let rec = &records[idx as usize];
             let start = rec.path_off as usize;
@@ -257,14 +266,28 @@ impl PathIndex {
     }
 }
 
-/// FNV-1a 64-bit hash, used to key the path index without storing the path.
-fn fnv1a64(data: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+/// FNV-1a 32-bit hash, used to key the path index without storing the path.
+///
+/// A 32-bit hash halves the map's per-entry cost. Collisions (two distinct paths
+/// with the same hash) are resolved by confirming against the path arena and
+/// falling back to `collisions`, so correctness is unaffected.
+fn fnv1a32(data: &[u8]) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
     for &byte in data {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
     }
     hash
+}
+
+/// Saturating conversion of a byte size to the record's `u32` field.
+fn size_to_u32(size: u64) -> u32 {
+    size.min(u32::MAX as u64) as u32
+}
+
+/// Clamp a Unix-seconds timestamp to the record's `u32` field.
+fn mtime_to_u32(mtime: i64) -> u32 {
+    mtime.clamp(0, u32::MAX as i64) as u32
 }
 
 /// The in-memory index.
@@ -307,16 +330,12 @@ impl Index {
 
     /// An estimate of the heap memory held by the index, in bytes.
     ///
-    /// Counts the record vector, both arenas, and a rough per-entry cost for the
-    /// path map (a hash and a record index, not the path bytes). Used for
-    /// `GetStatus`.
+    /// Counts the **capacity** of the record vector, the path arena, and the path
+    /// map, so allocation slack is included. Used for `GetStatus`.
     pub fn memory_bytes(&self) -> u64 {
-        let records = self.records.len() * std::mem::size_of::<FileRecord>();
-        let arenas = self.paths.len();
-        // The path index stores a 64-bit hash and a 32-bit record index per
-        // entry (plus a control byte), not a copy of the path bytes.
-        let map =
-            self.by_path.len() * (std::mem::size_of::<u64>() + std::mem::size_of::<u32>() + 1);
+        let records = self.records.capacity() * std::mem::size_of::<FileRecord>();
+        let arenas = self.paths.capacity();
+        let map = self.by_path.capacity_bytes();
         (records + arenas + map) as u64
     }
 
@@ -372,6 +391,17 @@ impl Index {
         }
         // The arena was pre-sized to its pre-compaction length, which still
         // includes the tombstones just dropped; release the excess capacity.
+        self.records.shrink_to_fit();
+        self.paths.shrink_to_fit();
+        self.by_path.shrink_to_fit();
+    }
+
+    /// Release excess capacity in the record vector, path arena, and path map.
+    ///
+    /// Unlike [`Index::compact`], this does not require tombstones: it reclaims
+    /// the doubling slack left by a fresh scan or a snapshot load. Call it once
+    /// the index has settled (after the initial scan or a warm start).
+    pub fn shrink(&mut self) {
         self.records.shrink_to_fit();
         self.paths.shrink_to_fit();
         self.by_path.shrink_to_fit();
@@ -460,11 +490,11 @@ impl Index {
             .bytes()
             .filter(|&b| b == b'/')
             .count()
-            .min(u16::MAX as usize) as u16;
+            .min(u8::MAX as usize) as u8;
 
         let path_off = self.paths.len() as u32;
         self.paths.extend_from_slice(path_str.as_bytes());
-        let path_len = path_str.len() as u32;
+        let path_len = path_str.len().min(u16::MAX as usize) as u16;
 
         let mut flags = 0u8;
         if is_dir {
@@ -476,8 +506,8 @@ impl Index {
 
         let idx = self.records.len() as u32;
         self.records.push(FileRecord {
-            size,
-            mtime,
+            size: size_to_u32(size),
+            mtime: mtime_to_u32(mtime),
             parent,
             path_off,
             path_len,
@@ -516,8 +546,8 @@ impl Index {
             return false;
         };
         let rec = &mut self.records[idx as usize];
-        rec.size = size;
-        rec.mtime = mtime;
+        rec.size = size_to_u32(size);
+        rec.mtime = mtime_to_u32(mtime);
         true
     }
 
@@ -636,12 +666,12 @@ impl Index {
 
             let path_off = self.paths.len() as u32;
             self.paths.extend_from_slice(new_path.as_bytes());
-            let path_len = new_path.len() as u32;
+            let path_len = new_path.len().min(u16::MAX as usize) as u16;
             let depth = new_path
                 .bytes()
                 .filter(|&b| b == b'/')
                 .count()
-                .min(u16::MAX as usize) as u16;
+                .min(u8::MAX as usize) as u8;
 
             let is_exact = exact == Some(i);
 
@@ -759,9 +789,9 @@ impl Index {
         Some(Rank {
             name_match,
             first_pos,
-            path_len: rec.path_len,
-            depth: rec.depth,
-            mtime: rec.mtime,
+            path_len: rec.path_len as u32,
+            depth: rec.depth as u16,
+            mtime: rec.mtime as i64,
         })
     }
 
@@ -806,8 +836,8 @@ impl Index {
         Hit {
             path: self.path(idx).to_string(),
             name: self.name(idx).to_string(),
-            size: rec.size,
-            mtime: rec.mtime,
+            size: rec.size as u64,
+            mtime: rec.mtime as i64,
             is_dir: rec.is_dir(),
         }
     }
@@ -876,10 +906,35 @@ mod tests {
 
     #[test]
     fn file_record_is_compact() {
-        // The record packs into 32 bytes: size/mtime (16) + parent/path_off/
-        // path_len (12) + depth (2) + flags (1) + 1 byte padding. The basename
-        // is derived from the path, so no name offset/length is stored.
-        assert_eq!(std::mem::size_of::<FileRecord>(), 32);
+        // The record packs into 20 bytes: size/mtime (8) + parent/path_off (8) +
+        // path_len (2) + depth (1) + flags (1). The basename is derived from the
+        // path, so no name offset/length is stored.
+        assert_eq!(std::mem::size_of::<FileRecord>(), 20);
+    }
+
+    #[test]
+    fn size_and_mtime_saturate() {
+        let mut index = Index::new();
+        let big = index.insert(Path::new("/big.bin"), false, u64::MAX, i64::MAX);
+        assert_eq!(index.record(big).size, u32::MAX);
+        assert_eq!(index.record(big).mtime, u32::MAX);
+        // A negative timestamp clamps to zero rather than wrapping.
+        let neg = index.insert(Path::new("/neg.bin"), false, 0, -5);
+        assert_eq!(index.record(neg).mtime, 0);
+    }
+
+    #[test]
+    fn shrink_keeps_the_index_intact() {
+        let mut index = Index::new();
+        for i in 0..1000 {
+            index.insert(Path::new(&format!("/home/file-{i}.txt")), false, 1, 0);
+        }
+        let before = index.memory_bytes();
+        index.shrink();
+        let after = index.memory_bytes();
+        assert!(after <= before, "shrink must not grow the index");
+        assert_eq!(index.len(), 1000);
+        assert_eq!(index.search("file-500", 10, 0).hits.len(), 1);
     }
 
     #[test]
