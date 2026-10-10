@@ -6,6 +6,10 @@ in-memory index and serves queries over a Unix domain socket.
 ## Running
 
 ```sh
+scripts/restart-all.sh                             # restart the daemon + reload the shell plugin
+scripts/restart-all.sh --rebuild                   # rebuild the release daemon first (-r)
+scripts/restart-all.sh --sudo                      # run the daemon as root (to index NTFS)
+scripts/restart-all.sh -- --auto                   # pass daemon args through
 scripts/run-daemon.sh                              # indexes $HOME
 scripts/run-daemon.sh --root /home/sam/Documents   # indexes a subtree
 scripts/run-daemon.sh --auto                       # indexes all non-pseudo mounts
@@ -192,6 +196,51 @@ state file (`/var/lib/omavrything/ntfs.state` as root, else
 `$XDG_STATE_HOME/omavrything/ntfs.state`). At startup, a remembered partition is
 auto-mounted and indexed; a newly seen one is only logged as an offer and is
 indexed on demand via `MountNtfs`. `--no-ntfs` disables detection entirely.
+
+## NTFS indexing and the index lock
+
+NTFS volumes are indexed by reading the MFT directly from the raw device, which
+requires root. The MFT read and parse is the expensive half of NTFS indexing
+(seconds on a multi-million-record volume), so it runs **outside** the index
+lock: [`enumerate_device`](../crates/omavrythingd/src/ntfs.rs) reads the MFT,
+then [`apply_entries`](../crates/omavrythingd/src/ntfs.rs) inserts the result
+under a brief write lock. This mirrors the `plan_rescan`/`apply_rescan` split, so
+searches keep serving at full speed while a volume is being indexed. Run the
+daemon as root with `scripts/restart-all.sh --sudo` to index NTFS.
+
+## Profiling query performance
+
+Search is a linear scan over every record, so its cost is proportional to the
+index size. Two tools measure it:
+
+- **Standalone profiler** — builds a synthetic index and times a query (or a
+  simulated burst of typing) with a stage-by-stage breakdown:
+
+  ```sh
+  cargo run --release -p omavrything-core --example profile            # 1M records, typing simulation
+  cargo run --release -p omavrything-core --example profile -- 3000000 report
+  ```
+
+  Always pass `--release`: a debug build is 10-50x slower and the example warns
+  when it detects one. On a 1M-record index a query is ~6-18 ms; the cost scales
+  linearly (1M ≈ 6 ms, 2M ≈ 12 ms, 3M ≈ 18 ms).
+
+- **Daemon query profiler** — set `OMAVRYTHING_PROFILE=1` when starting the
+  daemon and every search logs a breakdown to stderr:
+
+  ```sh
+  OMAVRYTHING_PROFILE=1 scripts/run-daemon.sh
+  # search "report": total=0.87ms parse=0.00ms scan=0.85ms sort=0.01ms materialize=0.01ms scanned=50401 matched=50000 parallel
+  ```
+
+  The `scan` stage dominates; `parse`, `sort`, and `materialize` are negligible
+  for a bounded page. If `total` is far above the standalone numbers, the daemon
+  is likely a debug build or the index is much larger than expected.
+
+The daemon must be built in **release** mode for interactive use. A debug build
+is roughly 10x slower, which turns a sub-millisecond query into hundreds of
+milliseconds and makes typing feel unusable. `scripts/run-daemon.sh` builds and
+runs the release binary.
 
 ## Current limitations
 

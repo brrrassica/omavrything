@@ -212,6 +212,14 @@ fn main() {
         eprintln!("warning: group '{SOCKET_GROUP}' not found; relying on socket permissions");
     }
 
+    // Opt-in per-query profiling: when `OMAVRYTHING_PROFILE` is set, every
+    // search logs a stage-by-stage timing breakdown to stderr. Off by default so
+    // the hot path pays nothing.
+    let profile = std::env::var_os("OMAVRYTHING_PROFILE").is_some();
+    if profile {
+        eprintln!("query profiling enabled (OMAVRYTHING_PROFILE set)");
+    }
+
     let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         match stream {
@@ -241,7 +249,7 @@ fn main() {
                 let index = Arc::clone(&index);
                 let active = Arc::clone(&active);
                 std::thread::spawn(move || {
-                    serve(stream, index);
+                    serve(stream, index, profile);
                     active.fetch_sub(1, Ordering::Relaxed);
                 });
             }
@@ -607,7 +615,10 @@ fn install_shutdown_handler(
 }
 
 /// Serve one client connection: one request per line, one response per line.
-fn serve(stream: UnixStream, index: Arc<RwLock<Index>>) {
+///
+/// When `profile` is set, each search logs a stage-by-stage timing breakdown to
+/// stderr (see `OMAVRYTHING_PROFILE`).
+fn serve(stream: UnixStream, index: Arc<RwLock<Index>>, profile: bool) {
     let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
     let read_half = match stream.try_clone() {
         Ok(clone) => clone,
@@ -638,11 +649,15 @@ fn serve(stream: UnixStream, index: Arc<RwLock<Index>>) {
             Method::Search => {
                 let started = Instant::now();
                 let guard = read_index(&index);
-                let outcome = guard.search(
-                    &request.q,
-                    request.effective_limit(),
-                    request.effective_offset(),
-                );
+                let limit = request.effective_limit();
+                let offset = request.effective_offset();
+                let outcome = if profile {
+                    let (outcome, timing) = guard.search_profiled(&request.q, limit, offset);
+                    eprintln!("search {:?}: {}", request.q, timing.summary());
+                    outcome
+                } else {
+                    guard.search(&request.q, limit, offset)
+                };
                 let results: Vec<ResultItem> = outcome
                     .hits
                     .iter()

@@ -12,7 +12,7 @@ use std::process::Command;
 use std::sync::{Mutex, RwLock};
 
 use omavrything_core::index::{FsKind, Index};
-use omavrything_ntfs::{NtfsPartition, NtfsVolume};
+use omavrything_ntfs::{NtfsEntry, NtfsPartition, NtfsVolume};
 
 /// The private mount root used when udisks2 is unavailable.
 const PRIVATE_MOUNT_ROOT: &str = "/run/omavrything/ntfs";
@@ -117,23 +117,33 @@ fn mount_via_ntfs3(device: &Path, uuid: Option<&str>) -> Result<PathBuf, String>
     Ok(mount_point)
 }
 
-/// Read an NTFS device's MFT and insert its entries into `index` under
-/// `mount_point`. Returns the number of entries added.
-pub fn index_device(index: &mut Index, device: &Path, mount_point: &Path) -> Result<usize, String> {
+/// Enumerate an NTFS device's MFT into a list of entries, without touching the
+/// index.
+///
+/// This is the expensive half of NTFS indexing: it reads the whole MFT from the
+/// raw device and parses every record, which takes seconds on a multi-million
+/// record volume. Run it **outside** the index lock so searches keep serving,
+/// then apply the result with [`apply_entries`] under a brief write lock.
+pub fn enumerate_device(device: &Path) -> Result<Vec<NtfsEntry>, String> {
     let file = std::fs::File::open(device).map_err(|e| e.to_string())?;
     let mut volume = NtfsVolume::open(file).map_err(|e| e.to_string())?;
-    let entries = volume.enumerate().map_err(|e| e.to_string())?;
+    volume.enumerate().map_err(|e| e.to_string())
+}
 
+/// Insert pre-enumerated NTFS entries into `index` under `mount_point`. Performs
+/// no device I/O, so the caller can hold the index write lock for the duration.
+/// Returns the number of entries added.
+pub fn apply_entries(index: &mut Index, mount_point: &Path, entries: &[NtfsEntry]) -> usize {
     index.add_root(mount_point, FsKind::Ntfs);
     let mut added = 0usize;
-    for entry in &entries {
+    for entry in entries {
         let path = mount_point.join(&entry.path);
         if index.find(&path).is_none() {
             index.insert(&path, entry.is_dir, entry.size, entry.mtime);
             added += 1;
         }
     }
-    Ok(added)
+    added
 }
 
 /// Mount a partition, index it via the MFT, and remember it in the policy.
@@ -146,9 +156,13 @@ pub fn mount_index_and_remember(
     partition: &NtfsPartition,
 ) -> Result<PathBuf, String> {
     let mount_point = mount_readonly(&partition.device, partition.uuid.as_deref())?;
+    // Read and parse the MFT outside the index lock: on a multi-million-record
+    // volume this takes seconds, and holding the write lock for it would stall
+    // every search for the duration.
+    let entries = enumerate_device(&partition.device)?;
     {
         let mut idx = index.write().unwrap_or_else(|e| e.into_inner());
-        index_device(&mut idx, &partition.device, &mount_point)?;
+        apply_entries(&mut idx, &mount_point, &entries);
     }
     if let Some(uuid) = &partition.uuid {
         let mut p = policy.lock().unwrap_or_else(|e| e.into_inner());
@@ -265,7 +279,8 @@ mod tests {
 
         let mut index = Index::new();
         let mount_point = Path::new("/mnt/ntfs");
-        let added = index_device(&mut index, &image_path, mount_point).unwrap();
+        let entries = enumerate_device(&image_path).unwrap();
+        let added = apply_entries(&mut index, mount_point, &entries);
         assert_eq!(added, 3);
 
         assert!(index.find(Path::new("/mnt/ntfs/hello.txt")).is_some());
@@ -279,6 +294,35 @@ mod tests {
         let hit = index.search("hello.txt", 10, 0);
         assert_eq!(hit.hits.len(), 1);
         assert_eq!(hit.hits[0].size, 5);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enumerate_and_apply_index_a_synthetic_image() {
+        let dir =
+            std::env::temp_dir().join(format!("omavrything-ntfs-split-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let image_path = dir.join("volume.img");
+        std::fs::write(&image_path, omavrything_ntfs::image::build_test_image()).unwrap();
+
+        // The split path: enumerate outside the lock, then apply under it.
+        let entries = enumerate_device(&image_path).unwrap();
+        assert_eq!(entries.len(), 3);
+
+        let mut index = Index::new();
+        let mount_point = Path::new("/mnt/ntfs");
+        let added = apply_entries(&mut index, mount_point, &entries);
+        assert_eq!(added, 3);
+        assert!(
+            index
+                .find(Path::new("/mnt/ntfs/subdir/world.txt"))
+                .is_some()
+        );
+
+        // Applying the same entries again is idempotent.
+        assert_eq!(apply_entries(&mut index, mount_point, &entries), 0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

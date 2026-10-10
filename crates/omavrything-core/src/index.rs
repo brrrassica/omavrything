@@ -16,6 +16,7 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 
@@ -105,6 +106,53 @@ pub struct SearchOutcome {
     pub total: usize,
 }
 
+/// A per-query timing breakdown, for profiling.
+///
+/// Produced by [`Index::search_profiled`]. The stages are disjoint and sum to
+/// roughly [`SearchTiming::total`] (the small remainder is bookkeeping):
+///
+/// - `parse`: splitting the query into terms and precompiling them.
+/// - `scan`: the linear scan over every record, including the top-N heap
+///   pushes. This dominates for large indexes.
+/// - `sort`: ordering the collected top-N candidates.
+/// - `materialize`: allocating the `String`s for the returned page of hits.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SearchTiming {
+    pub parse: Duration,
+    pub scan: Duration,
+    pub sort: Duration,
+    pub materialize: Duration,
+    pub total: Duration,
+    /// Number of records examined (live and tombstoned).
+    pub scanned: usize,
+    /// Number of records that matched the query.
+    pub matched: usize,
+    /// Whether the parallel (rayon) scan path was taken.
+    pub parallel: bool,
+}
+
+impl SearchTiming {
+    /// A one-line human-readable summary, e.g. for daemon logs.
+    pub fn summary(&self) -> String {
+        format!(
+            "total={:.2}ms parse={:.2}ms scan={:.2}ms sort={:.2}ms materialize={:.2}ms \
+             scanned={} matched={} {}",
+            self.total.as_secs_f64() * 1e3,
+            self.parse.as_secs_f64() * 1e3,
+            self.scan.as_secs_f64() * 1e3,
+            self.sort.as_secs_f64() * 1e3,
+            self.materialize.as_secs_f64() * 1e3,
+            self.scanned,
+            self.matched,
+            if self.parallel {
+                "parallel"
+            } else {
+                "sequential"
+            },
+        )
+    }
+}
+
 /// Maps full paths to record indices without duplicating the path bytes.
 ///
 /// The primary map is keyed by a 64-bit hash of the path; the path arena is
@@ -167,6 +215,28 @@ impl PathIndex {
         } else {
             self.main.insert(h, idx);
             self.collisions.remove(key);
+        }
+    }
+
+    /// Like [`PathIndex::insert`], but takes the key as raw bytes so callers
+    /// that already have the path in the arena (`compact`, `from_parts`) avoid
+    /// allocating a `String` per record. The caller must ensure `key` is not
+    /// currently in `collisions`, which holds when the map is built from
+    /// scratch.
+    fn insert_bytes(&mut self, key: &[u8], idx: u32, records: &[FileRecord], paths: &[u8]) {
+        let h = fnv1a64(key);
+        let collides = self.main.get(&h).copied().is_some_and(|existing| {
+            let rec = &records[existing as usize];
+            let start = rec.path_off as usize;
+            &paths[start..start + rec.path_len as usize] != key
+        });
+        if collides {
+            self.collisions.insert(
+                String::from_utf8_lossy(key).into_owned().into_boxed_str(),
+                idx,
+            );
+        } else {
+            self.main.insert(h, idx);
         }
     }
 
@@ -298,8 +368,12 @@ impl Index {
         for (i, rec) in self.records.iter().enumerate() {
             let start = rec.path_off as usize;
             let end = start + rec.path_len as usize;
-            let key = String::from_utf8_lossy(&self.paths[start..end]).into_owned();
-            self.by_path.insert(&key, i as u32, &self.records, &self.paths);
+            self.by_path.insert_bytes(
+                &self.paths[start..end],
+                i as u32,
+                &self.records,
+                &self.paths,
+            );
         }
         // The arenas were pre-sized to their pre-compaction length, which still
         // includes the tombstones just dropped; release the excess capacity.
@@ -337,8 +411,7 @@ impl Index {
             let start = rec.path_off as usize;
             let end = start + rec.path_len as usize;
             if let Some(bytes) = paths.get(start..end) {
-                let key = String::from_utf8_lossy(bytes).into_owned();
-                by_path.insert(&key, i as u32, &records, &paths);
+                by_path.insert_bytes(bytes, i as u32, &records, &paths);
             }
         }
         Self {
@@ -640,27 +713,73 @@ impl Index {
     ///
     /// An empty query matches nothing.
     pub fn search(&self, query: &str, limit: usize, offset: usize) -> SearchOutcome {
+        self.search_profiled(query, limit, offset).0
+    }
+
+    /// Like [`Index::search`], but also returns a [`SearchTiming`] breakdown of
+    /// where the time went. Used by the profiling example and the daemon's
+    /// opt-in query profiler.
+    pub fn search_profiled(
+        &self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> (SearchOutcome, SearchTiming) {
+        let started = Instant::now();
+
+        let parse_started = Instant::now();
         let q = Query::parse(query);
+        let parse = parse_started.elapsed();
+
         if q.is_empty() || limit == 0 {
-            return SearchOutcome::default();
+            return (
+                SearchOutcome::default(),
+                SearchTiming {
+                    parse,
+                    total: started.elapsed(),
+                    scanned: self.records.len(),
+                    ..SearchTiming::default()
+                },
+            );
         }
 
         let want = offset.saturating_add(limit);
-        let (total, top) = if self.records.len() >= PARALLEL_THRESHOLD {
+        let parallel = self.records.len() >= PARALLEL_THRESHOLD;
+
+        let scan_started = Instant::now();
+        let (total, top) = if parallel {
             self.scan_parallel(&q, want)
         } else {
             self.scan_sequential(&q, want)
         };
+        let scan = scan_started.elapsed();
 
-        let hits = top
-            .into_sorted()
+        let sort_started = Instant::now();
+        let sorted = top.into_sorted();
+        let sort = sort_started.elapsed();
+
+        let materialize_started = Instant::now();
+        let hits = sorted
             .into_iter()
             .skip(offset)
             .take(limit)
             .map(|(i, _)| self.hit(i))
             .collect();
+        let materialize = materialize_started.elapsed();
 
-        SearchOutcome { hits, total }
+        (
+            SearchOutcome { hits, total },
+            SearchTiming {
+                parse,
+                scan,
+                sort,
+                materialize,
+                total: started.elapsed(),
+                scanned: self.records.len(),
+                matched: total,
+                parallel,
+            },
+        )
     }
 
     /// Score one record against the query, or `None` if it does not match.
@@ -1062,5 +1181,41 @@ mod tests {
             elapsed < std::time::Duration::from_secs(5),
             "search took {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn search_profiled_matches_search_and_reports_timing() {
+        let mut index = Index::new();
+        for i in 0..100 {
+            index.insert(Path::new(&format!("/home/report-{i}.txt")), false, 1, 0);
+        }
+
+        let plain = index.search("report", 10, 0);
+        let (profiled, timing) = index.search_profiled("report", 10, 0);
+
+        // The profiled path must return exactly the same results.
+        assert_eq!(profiled.total, plain.total);
+        assert_eq!(profiled.hits, plain.hits);
+
+        // The breakdown is populated and internally consistent.
+        assert_eq!(timing.scanned, index.records().len());
+        assert_eq!(timing.matched, plain.total);
+        assert!(
+            !timing.parallel,
+            "100 records is below the parallel threshold"
+        );
+        assert!(timing.total >= timing.scan);
+        assert!(timing.total >= timing.parse);
+        assert!(timing.summary().contains("scanned=100"));
+    }
+
+    #[test]
+    fn search_profiled_empty_query_is_zero_cost() {
+        let mut index = Index::new();
+        index.insert(Path::new("/a.txt"), false, 1, 0);
+        let (outcome, timing) = index.search_profiled("", 10, 0);
+        assert!(outcome.hits.is_empty());
+        assert_eq!(outcome.total, 0);
+        assert_eq!(timing.matched, 0);
     }
 }

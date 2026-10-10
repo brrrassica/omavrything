@@ -199,8 +199,7 @@ pub fn apply_rescan(index: &mut Index, plan: RescanPlan) -> ScanReport {
                 index.update_metadata(&e.path, e.size, e.mtime);
             }
             None => {
-                let idx =
-                    index.insert_with_flags(&e.path, e.is_dir, e.is_symlink, e.size, e.mtime);
+                let idx = index.insert_with_flags(&e.path, e.is_dir, e.is_symlink, e.size, e.mtime);
                 debug_assert_eq!(idx as usize, seen.len());
                 seen.push(true);
                 report.entries += 1;

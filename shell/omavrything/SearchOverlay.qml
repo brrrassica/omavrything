@@ -112,9 +112,16 @@ Item {
     queryFileView.setText(text)
   }
 
+  // Schedule a search. Rapid keystrokes restart the debounce timer so a burst of
+  // typing issues one request instead of one per character; without this, a slow
+  // daemon falls behind and the UI lags by seconds.
+  function rebuild() {
+    searchDebounce.restart()
+  }
+
   // Send the current query to the daemon. The response arrives asynchronously
   // in handleResponse().
-  function rebuild() {
+  function sendQuery() {
     if (!sock.connected) {
       root.results = []
       displayModel.clear()
@@ -241,6 +248,15 @@ Item {
     id: queryFileView
     path: root.queryFile
     printErrors: false
+  }
+
+  // Coalesces a burst of keystrokes into a single search request. 40 ms is below
+  // the threshold of perception but long enough to absorb fast typing.
+  Timer {
+    id: searchDebounce
+    interval: 40
+    repeat: false
+    onTriggered: root.sendQuery()
   }
 
   Socket {
