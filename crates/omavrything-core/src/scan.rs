@@ -109,6 +109,67 @@ pub fn scan_into_index(index: &mut Index, config: &ScanConfig) -> ScanReport {
     report
 }
 
+/// Walk `root` and insert any entries not already indexed. Used for live
+/// updates when a new directory appears.
+pub fn scan_subtree(index: &mut Index, root: &Path, config: &ScanConfig) {
+    let excludes = GlobSet::new(&config.excludes);
+    let root_dev = fs::metadata(root).map(|m| m.dev()).ok();
+    let collected: Mutex<Vec<WalkEntry>> = Mutex::new(Vec::new());
+    walk(root, root_dev, &excludes, &collected);
+
+    let mut entries = collected.into_inner().unwrap_or_default();
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    for e in entries {
+        if index.find(&e.path).is_some() {
+            continue;
+        }
+        index.insert_with_flags(&e.path, e.is_dir, e.is_symlink, e.size, e.mtime);
+    }
+}
+
+/// Re-walk the configured roots and reconcile the index: add new entries and
+/// drop entries that no longer exist. This is the idle-gated safety net for
+/// events missed by inotify.
+pub fn rescan_into_index(index: &mut Index, config: &ScanConfig) -> ScanReport {
+    let excludes = GlobSet::new(&config.excludes);
+    let roots = resolve_roots(config);
+    let mut report = ScanReport::default();
+
+    let collected: Mutex<Vec<WalkEntry>> = Mutex::new(Vec::new());
+    roots.par_iter().for_each(|(root, _)| {
+        let root_dev = fs::metadata(root).map(|m| m.dev()).ok();
+        walk(root, root_dev, &excludes, &collected);
+    });
+    let mut entries = collected.into_inner().unwrap_or_default();
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+
+    let mut current: std::collections::HashSet<PathBuf> =
+        entries.iter().map(|e| e.path.clone()).collect();
+    for (root, _) in &roots {
+        current.insert(root.clone());
+    }
+
+    for e in &entries {
+        if index.find(&e.path).is_none() {
+            index.insert_with_flags(&e.path, e.is_dir, e.is_symlink, e.size, e.mtime);
+            report.entries += 1;
+        }
+    }
+
+    let stale: Vec<PathBuf> = index
+        .iter()
+        .map(|(i, _)| PathBuf::from(index.path(i)))
+        .filter(|p| roots.iter().any(|(r, _)| p.starts_with(r)) && !current.contains(p))
+        .collect();
+    for p in stale {
+        if index.remove(&p) {
+            report.skipped += 1;
+        }
+    }
+
+    report
+}
+
 /// Resolve the roots to scan: explicit roots, or non-pseudo mounts.
 fn resolve_roots(config: &ScanConfig) -> Vec<(PathBuf, FsKind)> {
     let mounts = mounts::read_mounts().unwrap_or_default();

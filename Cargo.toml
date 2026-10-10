@@ -33,4 +33,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 memchr = "2"
 rayon = "1"
+inotify = "0.11"
+libc = "0.2"
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }

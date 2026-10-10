@@ -219,6 +219,18 @@ impl Index {
         self.by_path.get(path.to_string_lossy().as_ref()).copied()
     }
 
+    /// Update the size and mtime of an existing record. Returns whether the
+    /// record existed.
+    pub fn update_metadata(&mut self, path: &Path, size: u64, mtime: i64) -> bool {
+        let Some(&idx) = self.by_path.get(path.to_string_lossy().as_ref()) else {
+            return false;
+        };
+        let rec = &mut self.records[idx as usize];
+        rec.size = size;
+        rec.mtime = mtime;
+        true
+    }
+
     pub fn record(&self, idx: u32) -> &FileRecord {
         &self.records[idx as usize]
     }

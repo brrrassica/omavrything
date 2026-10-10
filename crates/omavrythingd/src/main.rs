@@ -1,26 +1,28 @@
 //! The `omavrythingd` index daemon.
 //!
-//! M4: discovers mounted filesystems (or uses explicit roots), scans them in
-//! parallel into the in-memory index, and serves newline-delimited JSON queries
-//! over a Unix domain socket. Live updates, persistence, D-Bus, and NTFS arrive
-//! in later milestones.
+//! M5: discovers mounted filesystems (or uses explicit roots), scans them in
+//! parallel, keeps the index current with inotify, and runs idle-gated periodic
+//! rescans. Queries are served as newline-delimited JSON over a Unix socket.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use omavrything_core::VERSION;
+use omavrything_core::idle::{IdleMonitor, IdleThresholds, RescanScheduler};
 use omavrything_core::index::Index;
+use omavrything_core::live::{self, FsEvent};
 use omavrything_core::protocol::{Request, Response, ResultItem};
-use omavrything_core::scan::{ScanConfig, scan};
+use omavrything_core::scan::{ScanConfig, rescan_into_index, scan};
+use omavrything_core::watch::Watcher;
 
 fn main() {
     let args = Args::parse();
 
     eprintln!("omavrythingd {VERSION}");
-    let config = args.scan_config();
+    let config = Arc::new(args.scan_config());
     let started = Instant::now();
     let (index, report) = scan(&config);
     eprintln!(
@@ -35,6 +37,18 @@ fn main() {
     }
 
     let index = Arc::new(RwLock::new(index));
+
+    if args.watch {
+        let index = Arc::clone(&index);
+        let config = Arc::clone(&config);
+        std::thread::spawn(move || run_watcher(index, config));
+    }
+
+    if args.scan_interval > 0 {
+        let index = Arc::clone(&index);
+        let config = Arc::clone(&config);
+        std::thread::spawn(move || run_scheduler(index, config, args.scan_interval));
+    }
 
     // A stale socket from a previous run would make bind() fail.
     let _ = std::fs::remove_file(&args.socket);
@@ -54,6 +68,85 @@ fn main() {
                 std::thread::spawn(move || serve(stream, index));
             }
             Err(err) => eprintln!("accept error: {err}"),
+        }
+    }
+}
+
+/// Watch the indexed roots with inotify and apply events to the index.
+fn run_watcher(index: Arc<RwLock<Index>>, config: Arc<ScanConfig>) {
+    let mut watcher = match Watcher::new() {
+        Ok(w) => w,
+        Err(err) => {
+            eprintln!("inotify init failed: {err}");
+            return;
+        }
+    };
+
+    let roots: Vec<PathBuf> = index
+        .read()
+        .unwrap()
+        .roots()
+        .iter()
+        .map(|r| PathBuf::from(&r.path))
+        .collect();
+    for root in &roots {
+        if let Err(err) = watcher.watch_dir(root) {
+            eprintln!("watch {} failed: {err}", root.display());
+        }
+    }
+    if !watcher.failed().is_empty() {
+        eprintln!(
+            "warning: {} directories could not be watched (max_user_watches exhausted?)",
+            watcher.failed().len()
+        );
+    }
+    eprintln!("watching {} directories", watcher.watch_count());
+
+    let mut buffer = [0u8; 8192];
+    loop {
+        match watcher.read_events(&mut buffer) {
+            Ok(events) => {
+                if events.is_empty() {
+                    continue;
+                }
+                {
+                    let mut idx = index.write().unwrap();
+                    for event in &events {
+                        live::apply(&mut idx, event, &config);
+                    }
+                }
+                // Watch newly created directories.
+                for event in &events {
+                    if let FsEvent::Created(path) = event {
+                        if path.is_dir() {
+                            let _ = watcher.watch_dir(path);
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!("inotify read error: {err}");
+                break;
+            }
+        }
+    }
+}
+
+/// Periodically rescan the roots when the system is idle.
+fn run_scheduler(index: Arc<RwLock<Index>>, config: Arc<ScanConfig>, interval_secs: u64) {
+    let mut monitor = IdleMonitor::new(IdleThresholds::default());
+    let mut scheduler = RescanScheduler::new(Duration::from_secs(interval_secs));
+    loop {
+        std::thread::sleep(Duration::from_secs(5));
+        let idle = monitor.is_idle();
+        if scheduler.should_rescan(Instant::now(), idle) {
+            eprintln!("idle: rescanning roots");
+            let mut idx = index.write().unwrap();
+            let report = rescan_into_index(&mut idx, &config);
+            eprintln!(
+                "rescan: +{} entries, -{} stale",
+                report.entries, report.skipped
+            );
         }
     }
 }
@@ -130,6 +223,8 @@ struct Args {
     auto: bool,
     excludes: Vec<String>,
     socket: PathBuf,
+    watch: bool,
+    scan_interval: u64,
 }
 
 impl Args {
@@ -138,6 +233,8 @@ impl Args {
         let mut auto = false;
         let mut excludes = Vec::new();
         let mut socket = default_socket_path();
+        let mut watch = true;
+        let mut scan_interval = 900u64;
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -158,6 +255,12 @@ impl Args {
                         socket = PathBuf::from(value);
                     }
                 }
+                "--no-watch" => watch = false,
+                "--scan-interval" => {
+                    if let Some(value) = args.next() {
+                        scan_interval = value.parse().unwrap_or(900);
+                    }
+                }
                 "-h" | "--help" => {
                     print_help();
                     std::process::exit(0);
@@ -175,6 +278,8 @@ impl Args {
             auto,
             excludes,
             socket,
+            watch,
+            scan_interval,
         }
     }
 
@@ -212,13 +317,16 @@ fn print_help() {
     println!(
         "omavrythingd {VERSION}\n\
          \n\
-         Usage: omavrythingd [--root <dir>]... [--auto] [--exclude <glob>]... [--socket <path>]\n\
+         Usage: omavrythingd [--root <dir>]... [--auto] [--exclude <glob>]...\n\
+         \x20                  [--no-watch] [--scan-interval <secs>] [--socket <path>]\n\
          \n\
          Options:\n\
-           --root <dir>      Directory to index (repeatable; default: $HOME)\n\
-           --auto            Discover roots from the mount table (skip pseudo-fs)\n\
-           --exclude <glob>  Exclude glob, e.g. '**/.git/**' (repeatable)\n\
-           --socket <path>   Unix socket path (default: $XDG_RUNTIME_DIR/omavrything.sock)\n\
-           -h, --help        Show this help"
+           --root <dir>          Directory to index (repeatable; default: $HOME)\n\
+           --auto                Discover roots from the mount table (skip pseudo-fs)\n\
+           --exclude <glob>      Exclude glob, e.g. '**/.git/**' (repeatable)\n\
+           --no-watch            Disable inotify live updates\n\
+           --scan-interval <s>   Idle-gated rescan interval in seconds (0 disables; default 900)\n\
+           --socket <path>       Unix socket path (default: $XDG_RUNTIME_DIR/omavrything.sock)\n\
+           -h, --help            Show this help"
     );
 }

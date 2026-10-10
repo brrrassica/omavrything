@@ -2,11 +2,14 @@
 //! filesystem scanner, and IPC protocol.
 
 pub mod glob;
+pub mod idle;
 pub mod index;
+pub mod live;
 pub mod mounts;
 pub mod protocol;
 pub mod query;
 pub mod scan;
+pub mod watch;
 
 /// The crate version, sourced from `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
