@@ -13,6 +13,10 @@ import qs.Ui
 // focus, the input lives here rather than in the bar widget. The overlay is a
 // layer-shell PanelWindow with keyboardFocus Exclusive while open, modelled on
 // the first-party menu plugin.
+//
+// Results come from the `omavrythingd` daemon over a Unix domain socket
+// (newline-delimited JSON). When the daemon is not running the overlay shows an
+// unavailable state instead of results.
 Item {
   id: root
 
@@ -25,11 +29,14 @@ Item {
   property int selectedIndex: 0
   property bool cursorActive: false
   property var results: []
+  property bool daemonAvailable: false
 
-  // Result-window sizing (settable; defaults for the M1 spike).
+  // Result-window sizing (settable; defaults for the M2 walking skeleton).
   property int cardWidth: 520
   property int maxResults: 8
   property real anchorFraction: 0.6
+
+  readonly property string socketPath: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/omavrything.sock"
 
   // Theme: shares the [menu] surface tokens so themes that style the menu also
   // style the search overlay.
@@ -47,28 +54,14 @@ Item {
   property int rowSpacing: Style.spacing.xs
   property int contentSpacing: Style.spacing.md
 
-  // Fake data for the M1 feasibility spike. Replaced by daemon results in M2.
-  readonly property var fakeFiles: [
-    { path: "/home/sam/Documents/report-2024.pdf", isDir: false },
-    { path: "/home/sam/Documents/notes/meeting-notes.md", isDir: false },
-    { path: "/home/sam/Downloads/omarchy-quattro.iso", isDir: false },
-    { path: "/home/sam/Pictures/screenshots/2026-10-10.png", isDir: false },
-    { path: "/home/sam/Projects/omavrything/Cargo.toml", isDir: false },
-    { path: "/home/sam/Projects/omavrything/crates/omavrything-core/src/lib.rs", isDir: false },
-    { path: "/home/sam/Music/playlist.m3u", isDir: false },
-    { path: "/home/sam/Videos/demo.mp4", isDir: false },
-    { path: "/etc/omavrything/config.toml", isDir: false },
-    { path: "/var/log/omavrythingd.log", isDir: false },
-    { path: "/home/sam/.config/omarchy/shell.json", isDir: false },
-    { path: "/home/sam/Documents", isDir: true }
-  ]
-
   // Plugin lifecycle hooks, called by the shell host.
   function open(payloadJson) {
     root.opened = true
     root.filterText = ""
     root.selectedIndex = 0
     root.cursorActive = false
+    root.results = []
+    displayModel.clear()
     root.rebuild()
     Qt.callLater(function() { input.forceActiveFocus() })
   }
@@ -83,25 +76,35 @@ Item {
       root.shell.hide((root.manifest && root.manifest.id) || "omavrything")
   }
 
+  // Send the current query to the daemon. The response arrives asynchronously
+  // in handleResponse().
   function rebuild() {
-    var q = root.filterText.trim().toLowerCase()
-    var terms = q.length > 0 ? q.split(/\s+/) : []
-    var out = []
-    for (var i = 0; i < root.fakeFiles.length; i++) {
-      var f = root.fakeFiles[i]
-      var hay = f.path.toLowerCase()
-      var ok = true
-      for (var t = 0; t < terms.length; t++) {
-        if (hay.indexOf(terms[t]) < 0) { ok = false; break }
-      }
-      if (ok) out.push(f)
-      if (out.length >= root.maxResults) break
+    if (!sock.connected) {
+      root.results = []
+      displayModel.clear()
+      return
     }
-    root.results = out
-    if (root.selectedIndex >= out.length) root.selectedIndex = Math.max(0, out.length - 1)
-    if (out.length === 0) root.cursorActive = false
+    var request = JSON.stringify({ q: root.filterText, limit: root.maxResults })
+    sock.write(request + "\n")
+  }
+
+  function handleResponse(line) {
+    var response
+    try { response = JSON.parse(line) } catch (e) { return }
+    if (!response || !Array.isArray(response.results)) return
+
+    root.results = response.results
+    if (root.selectedIndex >= response.results.length)
+      root.selectedIndex = Math.max(0, response.results.length - 1)
+    if (response.results.length === 0) root.cursorActive = false
+
     displayModel.clear()
-    for (var j = 0; j < out.length; j++) displayModel.append(out[j])
+    for (var i = 0; i < response.results.length; i++) {
+      displayModel.append({
+        path: response.results[i].path,
+        isDir: response.results[i].is_dir === true
+      })
+    }
   }
 
   function select(delta) {
@@ -113,9 +116,9 @@ Item {
 
   function activate() {
     if (!root.cursorActive || root.selectedIndex < 0 || root.selectedIndex >= root.results.length) return
-    var f = root.results[root.selectedIndex]
+    var item = root.results[root.selectedIndex]
     root.dismiss()
-    Quickshell.execDetached(["xdg-open", f.path])
+    Quickshell.execDetached(["xdg-open", item.path])
   }
 
   readonly property int listAreaHeight: {
@@ -126,6 +129,19 @@ Item {
   readonly property int cardHeight: root.contentMargin * 2 + root.inputHeight + root.contentSpacing + root.listAreaHeight
 
   ListModel { id: displayModel }
+
+  Socket {
+    id: sock
+    path: root.socketPath
+    connected: root.opened
+    parser: SplitParser {
+      onRead: function(line) { root.handleResponse(line) }
+    }
+    onConnectionStateChanged: {
+      root.daemonAvailable = sock.connected
+      if (sock.connected && root.opened) root.rebuild()
+    }
+  }
 
   PanelWindow {
     id: panel
@@ -254,7 +270,9 @@ Item {
           Text {
             anchors.centerIn: parent
             visible: root.results.length === 0
-            text: root.filterText ? "No matches for “" + root.filterText + "”" : "Type to search files"
+            text: !root.daemonAvailable
+              ? "Search daemon unavailable"
+              : (root.filterText ? "No matches for “" + root.filterText + "”" : "Type to search files")
             color: root.foreground
             opacity: 0.6
             font.family: root.fontFamily

@@ -7,6 +7,8 @@ Public documentation for `omavrything`.
 
 ## Index
 
+- [`omarchy-shell-integration.md`](omarchy-shell-integration.md) — the shell plugin, the focus constraint, IPC, and the hotkey.
+- [`daemon.md`](daemon.md) — the index daemon and the socket protocol.
 - (coming soon) `architecture.md` — system design.
 - (coming soon) `install.md` — installation and setup.
 - (coming soon) `search-syntax.md` — query syntax.

@@ -1,6 +1,10 @@
 //! Core library for `omavrything`: the in-memory index, search engine,
 //! filesystem scanner, and IPC protocol.
 
+pub mod index;
+pub mod protocol;
+pub mod scan;
+
 /// The crate version, sourced from `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

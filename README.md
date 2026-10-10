@@ -33,6 +33,18 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
+## Running the daemon
+
+```sh
+scripts/run-daemon.sh                              # indexes $HOME
+scripts/run-daemon.sh --root /home/sam/Documents   # indexes a subtree
+omavry search "report 2024"                        # query from the CLI
+```
+
+The daemon serves newline-delimited JSON over
+`$XDG_RUNTIME_DIR/omavrything.sock`. See
+[`docs/daemon.md`](docs/daemon.md) for the protocol.
+
 ## Shell plugin (omarchy-shell)
 
 The search UI is an `omarchy-shell` plugin (Quickshell/QML). Install and enable

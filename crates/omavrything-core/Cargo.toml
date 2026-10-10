@@ -9,3 +9,5 @@ repository.workspace = true
 description = "Core index, search, scanner, and IPC protocol for omavrything"
 
 [dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
