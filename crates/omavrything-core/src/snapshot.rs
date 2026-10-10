@@ -11,9 +11,9 @@
 //!               generation: u64
 //!               path:       u32 len + bytes
 //! records:    u32 count, then per record:
-//!               parent, name_off, name_len, path_off, path_len: u32
-//!               size: u64, mtime: i64, depth: u16, flags: u8
-//! names:      u32 len + bytes
+//!               size: u64, mtime: i64
+//!               parent, path_off, path_len: u32
+//!               depth: u16, flags: u8
 //! paths:      u32 len + bytes
 //! checksum:   u64 LE (FNV-1a over everything before it)
 //! ```
@@ -32,7 +32,7 @@ use crate::index::{FileRecord, FsKind, Index, Root};
 use crate::scan::{ScanConfig, ScanReport, resolve_roots, scan, scan_into_index};
 
 const MAGIC: &[u8; 8] = b"OMAVSNAP";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 /// A snapshot error.
 #[derive(Debug)]
@@ -182,18 +182,15 @@ pub fn encode(index: &Index, identities: &[RootIdentity]) -> Vec<u8> {
         } else {
             remap[rec.parent as usize]
         };
-        put_u32(&mut out, parent);
-        put_u32(&mut out, rec.name_off);
-        put_u32(&mut out, rec.name_len);
-        put_u32(&mut out, rec.path_off);
-        put_u32(&mut out, rec.path_len);
         put_u64(&mut out, rec.size);
         put_i64(&mut out, rec.mtime);
+        put_u32(&mut out, parent);
+        put_u32(&mut out, rec.path_off);
+        put_u32(&mut out, rec.path_len);
         put_u16(&mut out, rec.depth);
         put_u8(&mut out, rec.flags);
     }
 
-    put_bytes(&mut out, index.names());
     put_bytes(&mut out, index.paths());
 
     let checksum = fnv1a64(&out);
@@ -240,32 +237,28 @@ pub fn decode(bytes: &[u8]) -> Result<(Index, Vec<RootIdentity>), SnapshotError>
     let mut records = Vec::with_capacity(record_count.min(1 << 20));
     for _ in 0..record_count {
         records.push(FileRecord {
-            parent: r.u32()?,
-            name_off: r.u32()?,
-            name_len: r.u32()?,
-            path_off: r.u32()?,
-            path_len: r.u32()?,
             size: r.u64()?,
             mtime: r.i64()?,
+            parent: r.u32()?,
+            path_off: r.u32()?,
+            path_len: r.u32()?,
             depth: r.u16()?,
             flags: r.u8()?,
         });
     }
 
-    let names = r.bytes()?.to_vec();
     let paths = r.bytes()?.to_vec();
 
     // Validate arena offsets so a corrupt snapshot cannot cause out-of-bounds
     // reads later.
     for rec in &records {
-        let name_end = rec.name_off as usize + rec.name_len as usize;
         let path_end = rec.path_off as usize + rec.path_len as usize;
-        if name_end > names.len() || path_end > paths.len() {
+        if path_end > paths.len() {
             return Err(SnapshotError::Truncated);
         }
     }
 
-    Ok((Index::from_parts(records, names, paths, roots), identities))
+    Ok((Index::from_parts(records, paths, roots), identities))
 }
 
 /// Write a snapshot atomically, keeping the previous one as `<path>.prev`.
@@ -373,6 +366,7 @@ pub fn warm_start(config: &ScanConfig, snapshot_path: &Path) -> WarmStartResult 
                 roots: vec![path.clone()],
                 excludes: config.excludes.clone(),
                 skip_pseudo: config.skip_pseudo,
+                metadata: config.metadata,
             };
             let sub_report = scan_into_index(&mut index, &sub);
             report.entries += sub_report.entries;

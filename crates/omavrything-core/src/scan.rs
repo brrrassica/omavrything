@@ -20,7 +20,7 @@ use crate::index::{FsKind, Index};
 use crate::mounts::{self, Mount};
 
 /// Scanner configuration.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ScanConfig {
     /// Explicit roots. Empty means "discover from the mount table".
     pub roots: Vec<PathBuf>,
@@ -28,6 +28,22 @@ pub struct ScanConfig {
     pub excludes: Vec<String>,
     /// Skip pseudo-filesystems when discovering roots.
     pub skip_pseudo: bool,
+    /// Collect each entry's size and mtime. When `false`, the walk uses only
+    /// `readdir`'s `d_type` and skips the per-file `stat`, which is markedly
+    /// faster but leaves `size`/`mtime` at zero. Directories are still stat'd so
+    /// nested mounts are not crossed.
+    pub metadata: bool,
+}
+
+impl Default for ScanConfig {
+    fn default() -> Self {
+        Self {
+            roots: Vec::new(),
+            excludes: Vec::new(),
+            skip_pseudo: false,
+            metadata: true,
+        }
+    }
 }
 
 impl ScanConfig {
@@ -37,6 +53,7 @@ impl ScanConfig {
             roots,
             excludes: Vec::new(),
             skip_pseudo: true,
+            metadata: true,
         }
     }
 
@@ -46,6 +63,7 @@ impl ScanConfig {
             roots: Vec::new(),
             excludes: Vec::new(),
             skip_pseudo: true,
+            metadata: true,
         }
     }
 }
@@ -93,7 +111,14 @@ pub fn scan_into_index(index: &mut Index, config: &ScanConfig) -> ScanReport {
     let errors = AtomicUsize::new(0);
     roots.par_iter().for_each(|(root, _)| {
         let root_dev = fs::metadata(root).map(|m| m.dev()).ok();
-        walk(root, root_dev, &excludes, &collected, &errors);
+        walk(
+            root,
+            root_dev,
+            &excludes,
+            config.metadata,
+            &collected,
+            &errors,
+        );
     });
     report.errors = errors.load(Ordering::Relaxed);
     let mut entries = collected.into_inner().unwrap_or_default();
@@ -121,7 +146,14 @@ pub fn scan_subtree(index: &mut Index, root: &Path, config: &ScanConfig) {
     let root_dev = fs::metadata(root).map(|m| m.dev()).ok();
     let collected: Mutex<Vec<WalkEntry>> = Mutex::new(Vec::new());
     let errors = AtomicUsize::new(0);
-    walk(root, root_dev, &excludes, &collected, &errors);
+    walk(
+        root,
+        root_dev,
+        &excludes,
+        config.metadata,
+        &collected,
+        &errors,
+    );
 
     let mut entries = collected.into_inner().unwrap_or_default();
     entries.sort_by(|a, b| a.path.cmp(&b.path));
@@ -156,7 +188,14 @@ pub fn plan_rescan(config: &ScanConfig) -> RescanPlan {
     let errors = AtomicUsize::new(0);
     roots.par_iter().for_each(|(root, _)| {
         let root_dev = fs::metadata(root).map(|m| m.dev()).ok();
-        walk(root, root_dev, &excludes, &collected, &errors);
+        walk(
+            root,
+            root_dev,
+            &excludes,
+            config.metadata,
+            &collected,
+            &errors,
+        );
     });
     let mut entries = collected.into_inner().unwrap_or_default();
     entries.sort_by(|a, b| a.path.cmp(&b.path));
@@ -282,6 +321,7 @@ fn walk(
     dir: &Path,
     root_dev: Option<u64>,
     excludes: &GlobSet,
+    collect_metadata: bool,
     out: &Mutex<Vec<WalkEntry>>,
     errors: &AtomicUsize,
 ) {
@@ -294,12 +334,24 @@ fn walk(
             if !excludes.is_empty() && excludes.matches(&path) {
                 continue;
             }
-            let metadata = entry.metadata().ok();
-            let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-            let is_symlink = metadata
-                .as_ref()
-                .map(|m| m.file_type().is_symlink())
-                .unwrap_or(false);
+            // `file_type()` reads the `d_type` field that `readdir` already
+            // returned, so on ext4/xfs/btrfs it costs no extra syscall. Only
+            // fall back to `metadata()` when size/mtime are actually needed.
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let is_dir = file_type.is_dir();
+            let is_symlink = file_type.is_symlink();
+
+            // Directories need `dev` to avoid crossing a nested mount; files
+            // need `size`/`mtime`. In names-only mode (`collect_metadata` false)
+            // directories are still stat'd (a small fraction of entries) so
+            // mount boundaries are respected, but files skip the stat entirely.
+            let metadata = if collect_metadata || is_dir {
+                entry.metadata().ok()
+            } else {
+                None
+            };
 
             // Do not cross into another filesystem (a nested mount).
             if is_dir {
@@ -344,7 +396,7 @@ fn walk(
 
     subdirs
         .into_par_iter()
-        .for_each(|d| walk(&d, root_dev, excludes, out, errors));
+        .for_each(|d| walk(&d, root_dev, excludes, collect_metadata, out, errors));
 }
 
 #[cfg(test)]
@@ -421,6 +473,7 @@ mod tests {
             roots: vec![base.clone()],
             excludes: vec!["**/.git/**".into()],
             skip_pseudo: true,
+            metadata: true,
         };
         let (index, _) = scan(&config);
 
@@ -468,6 +521,36 @@ mod tests {
         assert!(index.find(&base).is_some());
         assert_eq!(report.entries, 1); // new.txt
         assert_eq!(report.skipped, 1); // sub/b.txt
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn names_only_scan_finds_paths_but_skips_metadata() {
+        let base = temp_dir("names-only");
+        fs::create_dir_all(base.join("sub")).unwrap();
+        fs::write(base.join("a.txt"), b"hello").unwrap();
+        fs::write(base.join("sub/b.txt"), b"world!").unwrap();
+
+        let config = ScanConfig {
+            roots: vec![base.clone()],
+            excludes: Vec::new(),
+            skip_pseudo: true,
+            metadata: false,
+        };
+        let (index, report) = scan(&config);
+
+        // The tree is still fully discovered, with correct types.
+        assert!(index.find(&base.join("a.txt")).is_some());
+        assert!(index.find(&base.join("sub")).is_some());
+        assert!(index.find(&base.join("sub/b.txt")).is_some());
+        assert_eq!(report.entries, 3);
+
+        // Size and mtime are not collected in names-only mode.
+        let hit = index.search("a.txt", 10, 0);
+        assert_eq!(hit.hits.len(), 1);
+        assert_eq!(hit.hits[0].size, 0);
+        assert_eq!(hit.hits[0].mtime, 0);
 
         let _ = fs::remove_dir_all(&base);
     }

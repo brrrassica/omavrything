@@ -772,6 +772,7 @@ struct Args {
     snapshot_interval: u64,
     dbus: bool,
     ntfs: bool,
+    no_metadata: bool,
 }
 
 impl Args {
@@ -786,6 +787,7 @@ impl Args {
         let mut snapshot_interval = DEFAULT_SNAPSHOT_INTERVAL;
         let mut dbus = true;
         let mut ntfs = true;
+        let mut no_metadata = false;
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -825,6 +827,7 @@ impl Args {
                 }
                 "--no-dbus" => dbus = false,
                 "--no-ntfs" => ntfs = false,
+                "--no-metadata" => no_metadata = true,
                 "-h" | "--help" => {
                     print_help();
                     std::process::exit(0);
@@ -848,6 +851,7 @@ impl Args {
             snapshot_interval,
             dbus,
             ntfs,
+            no_metadata,
         }
     }
 
@@ -870,6 +874,7 @@ impl Args {
             roots,
             excludes: self.excludes.clone(),
             skip_pseudo: true,
+            metadata: !self.no_metadata,
         }
     }
 }
@@ -926,6 +931,7 @@ fn print_help() {
            --snapshot-interval <s>  Snapshot write interval in seconds (0 disables; default 300)\n\
            --no-dbus             Disable the D-Bus control interface\n\
            --no-ntfs             Disable NTFS partition detection and indexing\n\
+           --no-metadata         Skip per-file size/mtime stats (names-only; faster scan)\n\
            -h, --help            Show this help"
     );
 }

@@ -1,11 +1,13 @@
 //! Production in-memory index: arena-backed records with ranked substring
 //! search.
 //!
-//! Records live in a flat `Vec<FileRecord>`; basenames and full paths live in
-//! two byte arenas so a query scans contiguous memory. Directories are records
-//! too, so the tree can be reconstructed and subtree updates can splice.
+//! Records live in a flat `Vec<FileRecord>`; full paths live in a single byte
+//! arena so a query scans contiguous memory. The basename is derived from the
+//! path (the bytes after the last `/`) rather than stored in a second arena, so
+//! there is no duplicate string storage. Directories are records too, so the
+//! tree can be reconstructed and subtree updates can splice.
 //!
-//! Deletions are tombstones (`FLAG_DELETED`): the arenas are append-only, so a
+//! Deletions are tombstones (`FLAG_DELETED`): the arena is append-only, so a
 //! removed record's bytes are not reclaimed until a future compaction pass. A
 //! [`PathIndex`] maps full paths to record indices for O(1)
 //! insert/remove/rename lookups; it keys on a 64-bit hash of the path and
@@ -53,22 +55,22 @@ pub struct Root {
 }
 
 /// One indexed filesystem entry.
+///
+/// The basename is not stored: it is derived from the full path (the bytes after
+/// the last `/`), so the record carries only the path arena offset. Fields are
+/// ordered largest-first so the struct packs into 32 bytes with no padding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileRecord {
-    /// Index of the parent directory record, or `u32::MAX` for a root.
-    pub parent: u32,
-    /// Offset of the basename into the name arena.
-    pub name_off: u32,
-    /// Byte length of the basename.
-    pub name_len: u32,
-    /// Offset of the full path into the path arena.
-    pub path_off: u32,
-    /// Byte length of the full path.
-    pub path_len: u32,
     /// Size in bytes. Zero for directories.
     pub size: u64,
     /// Last-modified time, Unix seconds. Zero when unavailable.
     pub mtime: i64,
+    /// Index of the parent directory record, or `u32::MAX` for a root.
+    pub parent: u32,
+    /// Offset of the full path into the path arena.
+    pub path_off: u32,
+    /// Byte length of the full path.
+    pub path_len: u32,
     /// Path depth (number of `/` separators).
     pub depth: u16,
     /// `FLAG_*` bits.
@@ -269,7 +271,6 @@ fn fnv1a64(data: &[u8]) -> u64 {
 #[derive(Debug, Default, Clone)]
 pub struct Index {
     records: Vec<FileRecord>,
-    names: Vec<u8>,
     paths: Vec<u8>,
     roots: Vec<Root>,
     by_path: PathIndex,
@@ -311,7 +312,7 @@ impl Index {
     /// `GetStatus`.
     pub fn memory_bytes(&self) -> u64 {
         let records = self.records.len() * std::mem::size_of::<FileRecord>();
-        let arenas = self.names.len() + self.paths.len();
+        let arenas = self.paths.len();
         // The path index stores a 64-bit hash and a 32-bit record index per
         // entry (plus a control byte), not a copy of the path bytes.
         let map =
@@ -329,7 +330,6 @@ impl Index {
 
         let mut remap = vec![u32::MAX; self.records.len()];
         let mut records = Vec::with_capacity(self.live);
-        let mut names = Vec::with_capacity(self.names.len());
         let mut paths = Vec::with_capacity(self.paths.len());
 
         for (i, rec) in self.records.iter().enumerate() {
@@ -338,8 +338,6 @@ impl Index {
             }
             remap[i] = records.len() as u32;
 
-            let name_off = names.len() as u32;
-            names.extend_from_slice(self.name_bytes(rec));
             let path_off = paths.len() as u32;
             paths.extend_from_slice(self.path_bytes(rec));
 
@@ -349,20 +347,17 @@ impl Index {
                 remap[rec.parent as usize]
             };
             records.push(FileRecord {
-                parent,
-                name_off,
-                name_len: rec.name_len,
-                path_off,
-                path_len: rec.path_len,
                 size: rec.size,
                 mtime: rec.mtime,
+                parent,
+                path_off,
+                path_len: rec.path_len,
                 depth: rec.depth,
                 flags: rec.flags,
             });
         }
 
         self.records = records;
-        self.names = names;
         self.paths = paths;
         self.by_path.clear();
         for (i, rec) in self.records.iter().enumerate() {
@@ -375,17 +370,11 @@ impl Index {
                 &self.paths,
             );
         }
-        // The arenas were pre-sized to their pre-compaction length, which still
+        // The arena was pre-sized to its pre-compaction length, which still
         // includes the tombstones just dropped; release the excess capacity.
         self.records.shrink_to_fit();
-        self.names.shrink_to_fit();
         self.paths.shrink_to_fit();
         self.by_path.shrink_to_fit();
-    }
-
-    /// The name arena, for snapshot serialization.
-    pub(crate) fn names(&self) -> &[u8] {
-        &self.names
     }
 
     /// The path arena, for snapshot serialization.
@@ -395,12 +384,7 @@ impl Index {
 
     /// Rebuild an index from raw parts, reconstructing the derived path map and
     /// live count. Used by the snapshot loader.
-    pub(crate) fn from_parts(
-        records: Vec<FileRecord>,
-        names: Vec<u8>,
-        paths: Vec<u8>,
-        roots: Vec<Root>,
-    ) -> Self {
+    pub(crate) fn from_parts(records: Vec<FileRecord>, paths: Vec<u8>, roots: Vec<Root>) -> Self {
         let mut by_path = PathIndex::with_capacity(records.len());
         let mut live = 0usize;
         for (i, rec) in records.iter().enumerate() {
@@ -416,7 +400,6 @@ impl Index {
         }
         Self {
             records,
-            names,
             paths,
             roots,
             by_path,
@@ -469,10 +452,6 @@ impl Index {
         mtime: i64,
     ) -> u32 {
         let path_str = path.to_string_lossy();
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
         let parent = path
             .parent()
             .and_then(|p| self.find_str(p.to_string_lossy().as_ref()))
@@ -482,10 +461,6 @@ impl Index {
             .filter(|&b| b == b'/')
             .count()
             .min(u16::MAX as usize) as u16;
-
-        let name_off = self.names.len() as u32;
-        self.names.extend_from_slice(name.as_bytes());
-        let name_len = name.len() as u32;
 
         let path_off = self.paths.len() as u32;
         self.paths.extend_from_slice(path_str.as_bytes());
@@ -501,13 +476,11 @@ impl Index {
 
         let idx = self.records.len() as u32;
         self.records.push(FileRecord {
-            parent,
-            name_off,
-            name_len,
-            path_off,
-            path_len,
             size,
             mtime,
+            parent,
+            path_off,
+            path_len,
             depth,
             flags,
         });
@@ -552,11 +525,10 @@ impl Index {
         &self.records[idx as usize]
     }
 
-    /// The basename of a record.
+    /// The basename of a record, derived from its full path.
     pub fn name(&self, idx: u32) -> &str {
         let rec = &self.records[idx as usize];
-        let start = rec.name_off as usize;
-        std::str::from_utf8(&self.names[start..start + rec.name_len as usize]).unwrap_or("")
+        std::str::from_utf8(self.name_bytes(rec)).unwrap_or("")
     }
 
     /// The full path of a record.
@@ -571,9 +543,11 @@ impl Index {
         &self.paths[start..start + rec.path_len as usize]
     }
 
+    /// The basename bytes of a record: the path bytes after the last `/`.
     fn name_bytes(&self, rec: &FileRecord) -> &[u8] {
-        let start = rec.name_off as usize;
-        &self.names[start..start + rec.name_len as usize]
+        let path = self.path_bytes(rec);
+        let start = path.iter().rposition(|&b| b == b'/').map_or(0, |p| p + 1);
+        &path[start..]
     }
 
     /// Remove `path` and its subtree. Returns whether anything was removed.
@@ -670,17 +644,6 @@ impl Index {
                 .min(u16::MAX as usize) as u16;
 
             let is_exact = exact == Some(i);
-            let (name_off, name_len) = if is_exact {
-                let name = new
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                let off = self.names.len() as u32;
-                self.names.extend_from_slice(name.as_bytes());
-                (off, name.len() as u32)
-            } else {
-                (rec.name_off, rec.name_len)
-            };
 
             self.map_remove(String::from_utf8_lossy(&old_path).as_ref());
             // If the destination already exists (rename over an existing file or
@@ -699,8 +662,6 @@ impl Index {
             rec.path_off = path_off;
             rec.path_len = path_len;
             rec.depth = depth;
-            rec.name_off = name_off;
-            rec.name_len = name_len;
             if is_exact {
                 rec.parent = new_parent;
             }
@@ -911,6 +872,14 @@ mod tests {
 
     fn idx_of(index: &Index, path: &str) -> u32 {
         index.find(Path::new(path)).expect("path not indexed")
+    }
+
+    #[test]
+    fn file_record_is_compact() {
+        // The record packs into 32 bytes: size/mtime (16) + parent/path_off/
+        // path_len (12) + depth (2) + flags (1) + 1 byte padding. The basename
+        // is derived from the path, so no name offset/length is stored.
+        assert_eq!(std::mem::size_of::<FileRecord>(), 32);
     }
 
     #[test]

@@ -19,6 +19,7 @@ scripts/run-daemon.sh --scan-interval 1800         # idle-gated rescan every 30 
 scripts/run-daemon.sh --snapshot /tmp/idx.snap     # custom snapshot path
 scripts/run-daemon.sh --no-snapshot                # disable persistence
 scripts/run-daemon.sh --no-ntfs                    # disable NTFS detection/indexing
+scripts/run-daemon.sh --no-metadata                # names-only scan (skip per-file size/mtime stats)
 ```
 
 Roots are either explicit (`--root`, repeatable) or discovered from the mount
@@ -29,7 +30,10 @@ are the pseudo mount points `/proc`, `/sys`, and `/dev`. `/run` is **not**
 excluded, so removable media mounted under `/run/media/<user>/<volume>` (including
 NTFS) remains discoverable. `--exclude` globs prune matching paths during
 traversal. The scanner walks each root in parallel and does not cross into nested
-mounts.
+mounts. Entry type comes from `readdir`'s `d_type` (no extra syscall); size and
+mtime require one `stat` per file. `--no-metadata` skips that stat for files
+(directories are still stat'd so nested mounts are not crossed), which is much
+faster but leaves `size`/`mtime` at zero in results.
 
 The socket defaults to `/run/omavrything/omavrything.sock` when running as root
 (the M9 system service) and `$XDG_RUNTIME_DIR/omavrything.sock` (falling back to

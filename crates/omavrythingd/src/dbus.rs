@@ -229,6 +229,7 @@ async fn run_rescan(
                 roots: vec![PathBuf::from(&root)],
                 excludes: scan.excludes.clone(),
                 skip_pseudo: scan.skip_pseudo,
+                metadata: scan.metadata,
             };
             plan_rescan(&sub)
         };
