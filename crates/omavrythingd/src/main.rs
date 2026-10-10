@@ -29,7 +29,7 @@ use omavrything_core::idle::{IdleMonitor, IdleThresholds, RescanScheduler};
 use omavrything_core::index::Index;
 use omavrything_core::live::{self, FsEvent};
 use omavrything_core::protocol::{Method, Request, Response, ResultItem};
-use omavrything_core::scan::{ScanConfig, rescan_into_index, scan};
+use omavrything_core::scan::{ScanConfig, apply_rescan, plan_rescan, scan};
 use omavrything_core::snapshot::{self, RootIdentity, WarmStart};
 use omavrything_core::watch::Watcher;
 use tokio::sync::mpsc::UnboundedSender;
@@ -108,6 +108,11 @@ fn main() {
     for root in index.roots() {
         eprintln!("  root {} ({:?})", root.path, root.fs_kind);
     }
+
+    // The initial scan allocates large transient buffers (the walked entry list)
+    // on the rayon worker threads; return those freed pages to the OS before the
+    // daemon settles into its idle footprint.
+    trim_heap();
 
     let index = Arc::new(RwLock::new(index));
     let config = Arc::new(SharedConfig::new(
@@ -251,18 +256,33 @@ fn prepare_socket(path: &Path) -> io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
     // SAFETY: `geteuid` has no preconditions.
     if unsafe { libc::geteuid() } == 0 {
-        if let Some(gid) = peer::group_gid(SOCKET_GROUP) {
-            let c = CString::new(path.as_os_str().as_bytes())
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "socket path has NUL"))?;
-            // SAFETY: `c` is a valid NUL-terminated path; uid -1 leaves the
-            // owner unchanged.
-            let rc = unsafe { libc::chown(c.as_ptr(), !0 as libc::uid_t, gid) };
-            if rc != 0 {
-                return Err(io::Error::last_os_error());
-            }
+        // Prefer the `omavrything` group. When it does not exist (a dev setup),
+        // hand the socket to the user who invoked `sudo` so their session can
+        // connect; otherwise the socket would be root-only and the shell plugin
+        // could not search.
+        let (uid, gid) = match peer::group_gid(SOCKET_GROUP) {
+            Some(gid) => (!0 as libc::uid_t, gid),
+            None => match sudo_invoker() {
+                Some(owner) => owner,
+                None => return Ok(()),
+            },
+        };
+        let c = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "socket path has NUL"))?;
+        // SAFETY: `c` is a valid NUL-terminated path.
+        let rc = unsafe { libc::chown(c.as_ptr(), uid, gid) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
         }
     }
     Ok(())
+}
+
+/// The uid/gid of the user who invoked `sudo`, from `SUDO_UID`/`SUDO_GID`.
+fn sudo_invoker() -> Option<(libc::uid_t, libc::gid_t)> {
+    let uid = std::env::var("SUDO_UID").ok()?.parse().ok()?;
+    let gid = std::env::var("SUDO_GID").ok()?.parse().ok()?;
+    Some((uid, gid))
 }
 
 /// Acquire an exclusive lock on `<socket>.lock` so only one daemon runs per
@@ -408,16 +428,17 @@ fn run_scheduler(
             });
             config.set_scanning(true);
             let scan = config.scan();
-            // Rescan a clone and swap it in so searches are not blocked on a
-            // long write lock.
+            // Walk the filesystem outside the lock, then reconcile under it.
+            // This keeps searches unblocked during the traversal without cloning
+            // the whole index (which doubled peak memory).
+            let plan = plan_rescan(&scan);
             let (report, entries) = {
-                let mut working = Index::clone(&read_index(&index));
-                let report = rescan_into_index(&mut working, &scan);
-                let entries = working.len() as u64;
-                *write_index(&index) = working;
-                (report, entries)
+                let mut idx = write_index(&index);
+                let report = apply_rescan(&mut idx, plan);
+                (report, idx.len() as u64)
             };
             config.set_scanning(false);
+            trim_heap();
             eprintln!(
                 "rescan: +{} entries, -{} stale, {} unreadable",
                 report.entries, report.skipped, report.errors
@@ -467,6 +488,13 @@ fn run_ntfs_startup(index: Arc<RwLock<Index>>, policy: Arc<Mutex<ntfs::NtfsPolic
             Err(err) => eprintln!("ntfs: failed to index {}: {err}", part.device.display()),
         }
     }
+    // MFT parsing allocates large transient buffers and the re-index appends to
+    // the arenas; compact and return the freed pages before the daemon idles.
+    {
+        let mut idx = write_index(&index);
+        idx.compact();
+    }
+    trim_heap();
 }
 
 /// Periodically write a snapshot of the index.
@@ -495,6 +523,9 @@ fn run_snapshot(
         if let Err(e) = snapshot::write_atomic(&bytes, &path) {
             eprintln!("snapshot save failed: {e}");
         }
+        drop(bytes);
+        // The encoded snapshot is a large transient buffer; return its pages.
+        trim_heap();
     }
 }
 
@@ -699,6 +730,20 @@ fn write_index(index: &RwLock<Index>) -> RwLockWriteGuard<'_, Index> {
 /// Clone the current root identities.
 fn read_identities(identities: &RwLock<Vec<RootIdentity>>) -> Vec<RootIdentity> {
     identities.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Ask the allocator to return freed heap pages to the OS.
+///
+/// A rescan allocates large transient buffers (the walked entry list) and, on
+/// glibc, the freed pages are otherwise retained in the process's arenas, so RSS
+/// stays at the peak long after the buffers are dropped. This is a best-effort
+/// hint and a no-op on non-glibc targets.
+fn trim_heap() {
+    #[cfg(target_env = "gnu")]
+    // SAFETY: `malloc_trim` has no preconditions.
+    unsafe {
+        libc::malloc_trim(0);
+    }
 }
 
 struct Args {

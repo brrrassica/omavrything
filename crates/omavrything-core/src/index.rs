@@ -7,9 +7,11 @@
 //!
 //! Deletions are tombstones (`FLAG_DELETED`): the arenas are append-only, so a
 //! removed record's bytes are not reclaimed until a future compaction pass. A
-//! `HashMap<Box<str>, u32>` maps full paths to record indices for O(1)
-//! insert/remove/rename lookups; it duplicates the path bytes, which is the
-//! known memory tradeoff (risk R2).
+//! [`PathIndex`] maps full paths to record indices for O(1)
+//! insert/remove/rename lookups; it keys on a 64-bit hash of the path and
+//! confirms matches against the path arena, so it does **not** duplicate the
+//! path bytes (the previous `HashMap<Box<str>, u32>` did, and dominated the
+//! index's memory use).
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -103,6 +105,96 @@ pub struct SearchOutcome {
     pub total: usize,
 }
 
+/// Maps full paths to record indices without duplicating the path bytes.
+///
+/// The primary map is keyed by a 64-bit hash of the path; the path arena is
+/// consulted to confirm a match. A hash collision (astronomically rare) is kept
+/// in `collisions`, keyed by the full path, so lookups stay correct. This
+/// replaces the previous `HashMap<Box<str>, u32>`, which stored a second copy of
+/// every path and dominated the index's memory use.
+#[derive(Debug, Default, Clone)]
+struct PathIndex {
+    main: HashMap<u64, u32>,
+    collisions: HashMap<Box<str>, u32>,
+}
+
+impl PathIndex {
+    fn with_capacity(n: usize) -> Self {
+        Self {
+            main: HashMap::with_capacity(n),
+            collisions: HashMap::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.main.len() + self.collisions.len()
+    }
+
+    fn clear(&mut self) {
+        self.main.clear();
+        self.collisions.clear();
+    }
+
+    fn shrink_to_fit(&mut self) {
+        self.main.shrink_to_fit();
+        self.collisions.shrink_to_fit();
+    }
+
+    /// The record index for `key`, or `None`. `records`/`paths` are the index's
+    /// arenas, used to confirm the hash match.
+    fn get(&self, key: &str, records: &[FileRecord], paths: &[u8]) -> Option<u32> {
+        let h = fnv1a64(key.as_bytes());
+        if let Some(&idx) = self.main.get(&h) {
+            let rec = &records[idx as usize];
+            let start = rec.path_off as usize;
+            if &paths[start..start + rec.path_len as usize] == key.as_bytes() {
+                return Some(idx);
+            }
+        }
+        self.collisions.get(key).copied()
+    }
+
+    /// Record `key` -> `idx`, keeping a colliding path in the fallback map.
+    fn insert(&mut self, key: &str, idx: u32, records: &[FileRecord], paths: &[u8]) {
+        let h = fnv1a64(key.as_bytes());
+        let collides = self.main.get(&h).copied().is_some_and(|existing| {
+            let rec = &records[existing as usize];
+            let start = rec.path_off as usize;
+            &paths[start..start + rec.path_len as usize] != key.as_bytes()
+        });
+        if collides {
+            self.collisions.insert(key.into(), idx);
+        } else {
+            self.main.insert(h, idx);
+            self.collisions.remove(key);
+        }
+    }
+
+    /// Remove `key` from the index.
+    fn remove(&mut self, key: &str, records: &[FileRecord], paths: &[u8]) {
+        let h = fnv1a64(key.as_bytes());
+        if let Some(&idx) = self.main.get(&h) {
+            let rec = &records[idx as usize];
+            let start = rec.path_off as usize;
+            if &paths[start..start + rec.path_len as usize] == key.as_bytes() {
+                self.main.remove(&h);
+                return;
+            }
+        }
+        self.collisions.remove(key);
+    }
+}
+
+/// FNV-1a 64-bit hash, used to key the path index without storing the path.
+fn fnv1a64(data: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in data {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 /// The in-memory index.
 #[derive(Debug, Default, Clone)]
 pub struct Index {
@@ -110,7 +202,7 @@ pub struct Index {
     names: Vec<u8>,
     paths: Vec<u8>,
     roots: Vec<Root>,
-    by_path: HashMap<Box<str>, u32>,
+    by_path: PathIndex,
     live: usize,
 }
 
@@ -145,13 +237,15 @@ impl Index {
     /// An estimate of the heap memory held by the index, in bytes.
     ///
     /// Counts the record vector, both arenas, and a rough per-entry cost for the
-    /// path map (the key bytes plus `HashMap` overhead). Used for `GetStatus`.
+    /// path map (a hash and a record index, not the path bytes). Used for
+    /// `GetStatus`.
     pub fn memory_bytes(&self) -> u64 {
         let records = self.records.len() * std::mem::size_of::<FileRecord>();
         let arenas = self.names.len() + self.paths.len();
-        // Each map entry owns a boxed path (already counted in `paths`) plus the
-        // hash-table slot and the `Box`/`u32` bookkeeping.
-        let map = self.by_path.len() * (std::mem::size_of::<u32>() + 16);
+        // The path index stores a 64-bit hash and a 32-bit record index per
+        // entry (plus a control byte), not a copy of the path bytes.
+        let map =
+            self.by_path.len() * (std::mem::size_of::<u64>() + std::mem::size_of::<u32>() + 1);
         (records + arenas + map) as u64
     }
 
@@ -204,11 +298,15 @@ impl Index {
         for (i, rec) in self.records.iter().enumerate() {
             let start = rec.path_off as usize;
             let end = start + rec.path_len as usize;
-            let key = String::from_utf8_lossy(&self.paths[start..end])
-                .into_owned()
-                .into_boxed_str();
-            self.by_path.insert(key, i as u32);
+            let key = String::from_utf8_lossy(&self.paths[start..end]).into_owned();
+            self.by_path.insert(&key, i as u32, &self.records, &self.paths);
         }
+        // The arenas were pre-sized to their pre-compaction length, which still
+        // includes the tombstones just dropped; release the excess capacity.
+        self.records.shrink_to_fit();
+        self.names.shrink_to_fit();
+        self.paths.shrink_to_fit();
+        self.by_path.shrink_to_fit();
     }
 
     /// The name arena, for snapshot serialization.
@@ -229,7 +327,7 @@ impl Index {
         paths: Vec<u8>,
         roots: Vec<Root>,
     ) -> Self {
-        let mut by_path = HashMap::with_capacity(records.len());
+        let mut by_path = PathIndex::with_capacity(records.len());
         let mut live = 0usize;
         for (i, rec) in records.iter().enumerate() {
             if rec.is_deleted() {
@@ -239,8 +337,8 @@ impl Index {
             let start = rec.path_off as usize;
             let end = start + rec.path_len as usize;
             if let Some(bytes) = paths.get(start..end) {
-                let key = String::from_utf8_lossy(bytes).into_owned().into_boxed_str();
-                by_path.insert(key, i as u32);
+                let key = String::from_utf8_lossy(bytes).into_owned();
+                by_path.insert(&key, i as u32, &records, &paths);
             }
         }
         Self {
@@ -304,7 +402,7 @@ impl Index {
             .unwrap_or_default();
         let parent = path
             .parent()
-            .and_then(|p| self.by_path.get(p.to_string_lossy().as_ref()).copied())
+            .and_then(|p| self.find_str(p.to_string_lossy().as_ref()))
             .unwrap_or(u32::MAX);
         let depth = path_str
             .bytes()
@@ -340,21 +438,35 @@ impl Index {
             depth,
             flags,
         });
-        self.by_path
-            .insert(path_str.into_owned().into_boxed_str(), idx);
+        self.map_insert(path_str.as_ref(), idx);
         self.live += 1;
         idx
     }
 
     /// The record index for `path`, if present.
     pub fn find(&self, path: &Path) -> Option<u32> {
-        self.by_path.get(path.to_string_lossy().as_ref()).copied()
+        self.find_str(path.to_string_lossy().as_ref())
+    }
+
+    /// The record index for a path string, if present.
+    fn find_str(&self, key: &str) -> Option<u32> {
+        self.by_path.get(key, &self.records, &self.paths)
+    }
+
+    /// Record `key` -> `idx` in the path index.
+    fn map_insert(&mut self, key: &str, idx: u32) {
+        self.by_path.insert(key, idx, &self.records, &self.paths);
+    }
+
+    /// Remove `key` from the path index.
+    fn map_remove(&mut self, key: &str) {
+        self.by_path.remove(key, &self.records, &self.paths);
     }
 
     /// Update the size and mtime of an existing record. Returns whether the
     /// record existed.
     pub fn update_metadata(&mut self, path: &Path, size: u64, mtime: i64) -> bool {
-        let Some(&idx) = self.by_path.get(path.to_string_lossy().as_ref()) else {
+        let Some(idx) = self.find_str(path.to_string_lossy().as_ref()) else {
             return false;
         };
         let rec = &mut self.records[idx as usize];
@@ -424,7 +536,7 @@ impl Index {
         for &i in &to_delete {
             self.records[i as usize].flags |= FLAG_DELETED;
             let p = self.path_bytes(&self.records[i as usize]).to_vec();
-            self.by_path.remove(String::from_utf8_lossy(&p).as_ref());
+            self.map_remove(String::from_utf8_lossy(&p).as_ref());
         }
         self.live -= to_delete.len();
         true
@@ -459,10 +571,10 @@ impl Index {
 
         // The renamed record itself, if it is indexed (a directory may be
         // renamed before its own record exists).
-        let exact = self.by_path.get(old_key.as_ref()).copied();
+        let exact = self.find_str(old_key.as_ref());
         let new_parent = new
             .parent()
-            .and_then(|p| self.by_path.get(p.to_string_lossy().as_ref()).copied())
+            .and_then(|p| self.find_str(p.to_string_lossy().as_ref()))
             .unwrap_or(u32::MAX);
 
         for i in affected {
@@ -497,19 +609,18 @@ impl Index {
                 (rec.name_off, rec.name_len)
             };
 
-            self.by_path
-                .remove(String::from_utf8_lossy(&old_path).as_ref());
+            self.map_remove(String::from_utf8_lossy(&old_path).as_ref());
             // If the destination already exists (rename over an existing file or
             // empty directory), tombstone the displaced record so it does not
             // linger as a duplicate.
-            let existing = self.by_path.get(new_path.as_str()).copied();
+            let existing = self.find_str(new_path.as_str());
             if let Some(existing) = existing {
                 if existing != i && !self.records[existing as usize].is_deleted() {
                     self.records[existing as usize].flags |= FLAG_DELETED;
                     self.live -= 1;
                 }
             }
-            self.by_path.insert(new_path.into_boxed_str(), i);
+            self.map_insert(new_path.as_str(), i);
 
             let rec = &mut self.records[i as usize];
             rec.path_off = path_off;

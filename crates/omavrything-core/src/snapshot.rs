@@ -394,6 +394,10 @@ pub fn warm_start(config: &ScanConfig, snapshot_path: &Path) -> WarmStartResult 
         index.remove(path);
     }
     index.retain_roots(&keep);
+    // Dropping stale roots tombstones their records but leaves their bytes in the
+    // append-only arenas. Compact now so a subsequent re-index (e.g. NTFS roots
+    // re-added at startup) appends to a small arena instead of doubling it.
+    index.compact();
 
     // Emit identities aligned with `index.roots()` so a later `encode` zips them
     // correctly even if the config order changed between runs.

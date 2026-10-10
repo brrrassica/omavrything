@@ -133,45 +133,92 @@ pub fn scan_subtree(index: &mut Index, root: &Path, config: &ScanConfig) {
     }
 }
 
-/// Re-walk the configured roots and reconcile the index: add new entries and
-/// drop entries that no longer exist. This is the idle-gated safety net for
-/// events missed by inotify.
-pub fn rescan_into_index(index: &mut Index, config: &ScanConfig) -> ScanReport {
+/// A prepared rescan: the entries discovered by walking the roots, the roots
+/// themselves, and the traversal error count.
+///
+/// Produced by [`plan_rescan`], which performs the (I/O-bound) filesystem
+/// traversal, and consumed by [`apply_rescan`], which reconciles the index. The
+/// split lets callers walk outside the index lock and hold the lock only for the
+/// in-memory reconciliation, so a rescan no longer needs to clone the whole
+/// index (which doubled peak memory).
+pub struct RescanPlan {
+    entries: Vec<WalkEntry>,
+    roots: Vec<(PathBuf, FsKind)>,
+    errors: usize,
+}
+
+/// Walk the configured roots and collect the entries, without touching any
+/// index. This is the expensive half of a rescan; run it outside the index lock.
+pub fn plan_rescan(config: &ScanConfig) -> RescanPlan {
     let excludes = GlobSet::new(&config.excludes);
     let roots = resolve_roots(config);
-    let mut report = ScanReport::default();
-
     let collected: Mutex<Vec<WalkEntry>> = Mutex::new(Vec::new());
     let errors = AtomicUsize::new(0);
     roots.par_iter().for_each(|(root, _)| {
         let root_dev = fs::metadata(root).map(|m| m.dev()).ok();
         walk(root, root_dev, &excludes, &collected, &errors);
     });
-    report.errors = errors.load(Ordering::Relaxed);
     let mut entries = collected.into_inner().unwrap_or_default();
     entries.sort_by(|a, b| a.path.cmp(&b.path));
-
-    let mut current: std::collections::HashSet<PathBuf> =
-        entries.iter().map(|e| e.path.clone()).collect();
-    for (root, _) in &roots {
-        current.insert(root.clone());
+    RescanPlan {
+        entries,
+        roots,
+        errors: errors.load(Ordering::Relaxed),
     }
+}
 
-    for e in &entries {
-        if index.find(&e.path).is_none() {
-            index.insert_with_flags(&e.path, e.is_dir, e.is_symlink, e.size, e.mtime);
-            report.entries += 1;
-        } else {
-            // Refresh metadata for entries that changed without an inotify event.
-            index.update_metadata(&e.path, e.size, e.mtime);
+/// Reconcile a prepared [`RescanPlan`] into `index`: add new entries, refresh
+/// metadata, and drop entries that no longer exist. Performs no filesystem I/O,
+/// so the caller can hold the index write lock for the duration.
+pub fn apply_rescan(index: &mut Index, plan: RescanPlan) -> ScanReport {
+    let RescanPlan {
+        entries,
+        roots,
+        errors,
+    } = plan;
+    let mut report = ScanReport {
+        errors,
+        ..ScanReport::default()
+    };
+
+    // Track which records the walk confirmed, by record index. A `Vec<bool>` is
+    // far smaller than a `HashSet<PathBuf>` holding a copy of every path.
+    let mut seen = vec![false; index.records().len()];
+    for (root, _) in &roots {
+        if let Some(idx) = index.find(root) {
+            seen[idx as usize] = true;
         }
     }
 
-    let mut stale: Vec<PathBuf> = index
-        .iter()
-        .map(|(i, _)| PathBuf::from(index.path(i)))
-        .filter(|p| roots.iter().any(|(r, _)| p.starts_with(r)) && !current.contains(p))
-        .collect();
+    for e in &entries {
+        match index.find(&e.path) {
+            Some(idx) => {
+                seen[idx as usize] = true;
+                // Refresh metadata for entries that changed without an inotify
+                // event.
+                index.update_metadata(&e.path, e.size, e.mtime);
+            }
+            None => {
+                let idx =
+                    index.insert_with_flags(&e.path, e.is_dir, e.is_symlink, e.size, e.mtime);
+                debug_assert_eq!(idx as usize, seen.len());
+                seen.push(true);
+                report.entries += 1;
+            }
+        }
+    }
+
+    // Records under a root that the walk did not confirm are stale.
+    let mut stale: Vec<PathBuf> = Vec::new();
+    for (i, rec) in index.records().iter().enumerate() {
+        if rec.is_deleted() || seen[i] {
+            continue;
+        }
+        let p = index.path(i as u32);
+        if roots.iter().any(|(r, _)| Path::new(p).starts_with(r)) {
+            stale.push(PathBuf::from(p));
+        }
+    }
     // Removing a directory tombstones its whole subtree, so drop descendants of
     // an already-removed path to avoid redundant O(n) scans.
     stale.sort();
@@ -187,6 +234,13 @@ pub fn rescan_into_index(index: &mut Index, config: &ScanConfig) -> ScanReport {
     }
 
     report
+}
+
+/// Re-walk the configured roots and reconcile the index: add new entries and
+/// drop entries that no longer exist. This is the idle-gated safety net for
+/// events missed by inotify.
+pub fn rescan_into_index(index: &mut Index, config: &ScanConfig) -> ScanReport {
+    apply_rescan(index, plan_rescan(config))
 }
 
 /// Resolve the roots to scan: explicit roots, or non-pseudo mounts.
@@ -387,5 +441,35 @@ mod tests {
             roots.iter().all(|(p, _)| !mounts::is_pseudo_mount_point(p)),
             "auto roots must not include pseudo mount points: {roots:?}"
         );
+    }
+
+    #[test]
+    fn rescan_adds_updates_and_removes() {
+        let base = temp_dir("rescan");
+        fs::create_dir_all(base.join("sub")).unwrap();
+        fs::write(base.join("a.txt"), b"x").unwrap();
+        fs::write(base.join("sub/b.txt"), b"y").unwrap();
+
+        let config = ScanConfig::with_roots(vec![base.clone()]);
+        let (mut index, _) = scan(&config);
+        assert!(index.find(&base.join("a.txt")).is_some());
+        assert!(index.find(&base.join("sub/b.txt")).is_some());
+
+        // Add a file, delete another, and grow a third.
+        fs::write(base.join("new.txt"), b"z").unwrap();
+        fs::remove_file(base.join("sub/b.txt")).unwrap();
+        fs::write(base.join("a.txt"), b"much longer").unwrap();
+
+        let report = rescan_into_index(&mut index, &config);
+
+        assert!(index.find(&base.join("new.txt")).is_some());
+        assert!(index.find(&base.join("sub/b.txt")).is_none());
+        assert_eq!(index.search("a.txt", 10, 0).hits[0].size, 11);
+        // The root record must survive the reconcile.
+        assert!(index.find(&base).is_some());
+        assert_eq!(report.entries, 1); // new.txt
+        assert_eq!(report.skipped, 1); // sub/b.txt
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

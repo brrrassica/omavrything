@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use omavrything_core::index::Index;
-use omavrything_core::scan::{ScanConfig, rescan_into_index};
+use omavrything_core::scan::{ScanConfig, apply_rescan, plan_rescan};
 use tokio::sync::mpsc::UnboundedSender;
 use zbus::interface;
 use zbus::object_server::SignalEmitter;
@@ -219,18 +219,23 @@ async fn run_rescan(
     let task_config = Arc::clone(&config);
     let added = tokio::task::spawn_blocking(move || {
         let scan = task_config.scan();
-        let mut working = task_index.read().unwrap_or_else(|e| e.into_inner()).clone();
-        let report = if root.is_empty() {
-            rescan_into_index(&mut working, &scan)
+        // Walk outside the lock, then reconcile under it. This avoids cloning the
+        // whole index (which doubled peak memory) while keeping searches
+        // unblocked during the filesystem traversal.
+        let plan = if root.is_empty() {
+            plan_rescan(&scan)
         } else {
             let sub = ScanConfig {
                 roots: vec![PathBuf::from(&root)],
                 excludes: scan.excludes.clone(),
                 skip_pseudo: scan.skip_pseudo,
             };
-            rescan_into_index(&mut working, &sub)
+            plan_rescan(&sub)
         };
-        *task_index.write().unwrap_or_else(|e| e.into_inner()) = working;
+        let report = {
+            let mut idx = task_index.write().unwrap_or_else(|e| e.into_inner());
+            apply_rescan(&mut idx, plan)
+        };
         report.entries as u64
     })
     .await

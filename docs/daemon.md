@@ -91,9 +91,10 @@ Control and status are exposed on the system bus as
 | `ListRoots` | the indexed roots |
 | `MountNtfs(uuid)` | mount an NTFS partition and index it via the MFT; returns the mount point |
 
-A rescan runs against a clone of the index that is swapped in on completion, so
-socket searches keep serving the previous index instead of blocking on a long
-write lock. A non-empty `root` must be one of the configured roots.
+A rescan walks the filesystem outside the index lock and then reconciles the
+index under a brief write lock, so socket searches keep serving during the
+traversal without cloning the whole index (which doubled peak memory). A
+non-empty `root` must be one of the configured roots.
 
 Signals: `IndexChanged(entries)` and `ScanProgress(phase, entries)`.
 
@@ -143,8 +144,10 @@ reported and the periodic rescan acts as the safety net.
 A background scheduler re-walks the roots and reconciles the index (adding new
 entries, dropping stale ones) only when the system is idle — measured from
 `/proc/loadavg`, `/proc/stat`, and `/proc/diskstats` — and only every
-`--scan-interval` seconds (default 900; 0 disables). `--no-watch` disables
-inotify entirely.
+`--scan-interval` seconds (default 900; 0 disables). The walk runs outside the
+index lock and the reconcile holds it only briefly, so a rescan neither blocks
+searches for the duration of the traversal nor clones the index. `--no-watch`
+disables inotify entirely.
 
 ## Persistence
 
