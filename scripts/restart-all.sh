@@ -162,14 +162,10 @@ if [[ "$sudo_daemon" == 1 ]]; then
 fi
 log "daemon running (pid $daemon_pid, log: $log_file)"
 
-# 4. Reinstall the shell plugin and ask the shell to rescan.
+# 4. Reinstall the shell plugin. install-plugin.sh restarts the shell, which is
+# required for changed QML to take effect: a plugin rescan keeps the previously
+# compiled component, so the shell process must restart.
 log "reinstalling shell plugin"
 scripts/install-plugin.sh
-
-if command -v omarchy-shell >/dev/null 2>&1; then
-  log "reloading shell plugins"
-  omarchy-shell shell rescanPlugins >/dev/null 2>&1 ||
-    log "warning: could not rescan plugins; run 'omarchy restart shell'"
-fi
 
 log "done"
