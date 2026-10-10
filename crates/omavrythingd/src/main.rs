@@ -1,8 +1,9 @@
 //! The `omavrythingd` index daemon.
 //!
-//! M2 walking skeleton: scans a root directory into a minimal in-memory index
-//! and serves newline-delimited JSON queries over a Unix domain socket. The
-//! production daemon (M3+) adds live updates, persistence, D-Bus, and NTFS.
+//! M4: discovers mounted filesystems (or uses explicit roots), scans them in
+//! parallel into the in-memory index, and serves newline-delimited JSON queries
+//! over a Unix domain socket. Live updates, persistence, D-Bus, and NTFS arrive
+//! in later milestones.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -13,17 +14,25 @@ use std::time::Instant;
 use omavrything_core::VERSION;
 use omavrything_core::index::Index;
 use omavrything_core::protocol::{Request, Response, ResultItem};
-use omavrything_core::scan::scan_into;
+use omavrything_core::scan::{ScanConfig, scan};
 
 fn main() {
     let args = Args::parse();
 
     eprintln!("omavrythingd {VERSION}");
-    eprintln!("scanning {} ...", args.root.display());
+    let config = args.scan_config();
     let started = Instant::now();
-    let mut index = Index::new();
-    scan_into(&args.root, &mut index);
-    eprintln!("indexed {} entries in {:?}", index.len(), started.elapsed());
+    let (index, report) = scan(&config);
+    eprintln!(
+        "indexed {} entries across {} root(s) in {:?} ({} skipped)",
+        report.entries,
+        report.roots,
+        started.elapsed(),
+        report.skipped
+    );
+    for root in index.roots() {
+        eprintln!("  root {} ({:?})", root.path, root.fs_kind);
+    }
 
     let index = Arc::new(RwLock::new(index));
 
@@ -117,15 +126,17 @@ fn serve(stream: UnixStream, index: Arc<RwLock<Index>>) {
 }
 
 struct Args {
-    root: PathBuf,
+    roots: Vec<PathBuf>,
+    auto: bool,
+    excludes: Vec<String>,
     socket: PathBuf,
 }
 
 impl Args {
     fn parse() -> Self {
-        let mut root = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/"));
+        let mut roots = Vec::new();
+        let mut auto = false;
+        let mut excludes = Vec::new();
         let mut socket = default_socket_path();
 
         let mut args = std::env::args().skip(1);
@@ -133,7 +144,13 @@ impl Args {
             match arg.as_str() {
                 "--root" => {
                     if let Some(value) = args.next() {
-                        root = PathBuf::from(value);
+                        roots.push(PathBuf::from(value));
+                    }
+                }
+                "--auto" => auto = true,
+                "--exclude" => {
+                    if let Some(value) = args.next() {
+                        excludes.push(value);
                     }
                 }
                 "--socket" => {
@@ -153,7 +170,34 @@ impl Args {
             }
         }
 
-        Self { root, socket }
+        Self {
+            roots,
+            auto,
+            excludes,
+            socket,
+        }
+    }
+
+    /// Build the scan configuration. `--auto` discovers roots from the mount
+    /// table; explicit `--root` flags take precedence; otherwise `$HOME` is
+    /// indexed (a development convenience).
+    fn scan_config(&self) -> ScanConfig {
+        let roots = if self.auto {
+            Vec::new()
+        } else if self.roots.is_empty() {
+            vec![
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("/")),
+            ]
+        } else {
+            self.roots.clone()
+        };
+        ScanConfig {
+            roots,
+            excludes: self.excludes.clone(),
+            skip_pseudo: true,
+        }
     }
 }
 
@@ -168,11 +212,13 @@ fn print_help() {
     println!(
         "omavrythingd {VERSION}\n\
          \n\
-         Usage: omavrythingd [--root <dir>] [--socket <path>]\n\
+         Usage: omavrythingd [--root <dir>]... [--auto] [--exclude <glob>]... [--socket <path>]\n\
          \n\
          Options:\n\
-           --root <dir>     Directory to index (default: $HOME)\n\
-           --socket <path>  Unix socket path (default: $XDG_RUNTIME_DIR/omavrything.sock)\n\
-           -h, --help       Show this help"
+           --root <dir>      Directory to index (repeatable; default: $HOME)\n\
+           --auto            Discover roots from the mount table (skip pseudo-fs)\n\
+           --exclude <glob>  Exclude glob, e.g. '**/.git/**' (repeatable)\n\
+           --socket <path>   Unix socket path (default: $XDG_RUNTIME_DIR/omavrything.sock)\n\
+           -h, --help        Show this help"
     );
 }

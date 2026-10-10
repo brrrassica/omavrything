@@ -1,7 +1,9 @@
 //! Core library for `omavrything`: the in-memory index, search engine,
 //! filesystem scanner, and IPC protocol.
 
+pub mod glob;
 pub mod index;
+pub mod mounts;
 pub mod protocol;
 pub mod query;
 pub mod scan;

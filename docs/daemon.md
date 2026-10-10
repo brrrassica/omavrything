@@ -1,19 +1,27 @@
 # Daemon and protocol
 
-`omavrythingd` is the index daemon. In the current walking skeleton it scans a
-root directory into a minimal in-memory index and serves queries over a Unix
-domain socket.
+`omavrythingd` is the index daemon. It scans mounted filesystems into an
+in-memory index and serves queries over a Unix domain socket.
 
 ## Running
 
 ```sh
 scripts/run-daemon.sh                              # indexes $HOME
 scripts/run-daemon.sh --root /home/sam/Documents   # indexes a subtree
+scripts/run-daemon.sh --auto                       # indexes all non-pseudo mounts
+scripts/run-daemon.sh --root / --exclude '**/.git/**' --exclude '**/node_modules/**'
 ```
 
+Roots are either explicit (`--root`, repeatable) or discovered from the mount
+table (`--auto`). With no arguments the daemon indexes `$HOME` as a development
+convenience. Pseudo-filesystems (`proc`, `sysfs`, `tmpfs`, `cgroup2`, `overlay`,
+…) and pseudo mount points (`/proc`, `/sys`, `/dev`, `/run`) are skipped, and
+`--exclude` globs prune matching paths during traversal. The scanner walks each
+root in parallel and does not cross into nested mounts.
+
 The socket defaults to `$XDG_RUNTIME_DIR/omavrything.sock` (falling back to
-`/tmp/omavrything.sock`). The daemon prints the indexed entry count and the
-socket path on startup.
+`/tmp/omavrything.sock`). The daemon prints the indexed entry count, the roots
+and their filesystem kinds, and the socket path on startup.
 
 ## Protocol
 
@@ -51,9 +59,9 @@ a client can report "showing X of Y" and page with `offset`.
 omavry search "report 2024"
 ```
 
-## Current limitations (walking skeleton)
+## Current limitations
 
 - The index is built once at startup; there are no live updates yet.
 - No persistence; the index is rebuilt on every start.
-- No excludes, parallelism, or mount discovery.
 - The daemon runs as the user; the root system service arrives later.
+- NTFS partitions are not yet read via the MFT (M8).

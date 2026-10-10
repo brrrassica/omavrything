@@ -132,6 +132,15 @@ impl Index {
         &self.roots
     }
 
+    /// Iterate over live (non-deleted) records as `(record index, record)`.
+    pub fn iter(&self) -> impl Iterator<Item = (u32, &FileRecord)> {
+        self.records
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| !r.is_deleted())
+            .map(|(i, r)| (i as u32, r))
+    }
+
     /// Insert a root directory record and register the mount point.
     pub fn add_root(&mut self, path: &Path, fs_kind: FsKind) -> u32 {
         let idx = self.insert(path, true, 0, 0);
