@@ -1,5 +1,8 @@
 //! Runtime configuration shared between the daemon threads and the D-Bus
 //! control interface.
+//!
+//! Changes made through [`SharedConfig::set`] are applied to the running daemon
+//! and persisted to the state config file, so they survive a restart.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -7,6 +10,25 @@ use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use omavrything_core::scan::ScanConfig;
+
+use crate::config_file::{FileConfig, parse_bool};
+use crate::logging::{self, LogLevel};
+
+/// Everything needed to build a [`SharedConfig`].
+pub struct ConfigInit {
+    pub scan: ScanConfig,
+    pub scan_interval: u64,
+    pub snapshot_interval: u64,
+    pub snapshot: Option<PathBuf>,
+    pub watch: bool,
+    pub ntfs: bool,
+    pub log_level: LogLevel,
+    pub background_opacity: f64,
+    /// The persisted runtime overrides, updated on every `set`.
+    pub state: FileConfig,
+    /// Where to persist `state`; `None` disables persistence.
+    pub state_path: Option<PathBuf>,
+}
 
 /// Runtime-tunable daemon configuration.
 pub struct SharedConfig {
@@ -17,23 +39,28 @@ pub struct SharedConfig {
     watch: bool,
     /// Whether a scan/rescan is currently in progress.
     scanning: AtomicBool,
+    ntfs: AtomicBool,
+    log_level: RwLock<LogLevel>,
+    /// `f64` bits, so the value can live in an atomic.
+    background_opacity: AtomicU64,
+    state: RwLock<FileConfig>,
+    state_path: Option<PathBuf>,
 }
 
 impl SharedConfig {
-    pub fn new(
-        scan: ScanConfig,
-        scan_interval: u64,
-        snapshot_interval: u64,
-        snapshot: Option<PathBuf>,
-        watch: bool,
-    ) -> Self {
+    pub fn new(init: ConfigInit) -> Self {
         Self {
-            scan: RwLock::new(scan),
-            scan_interval: AtomicU64::new(scan_interval),
-            snapshot_interval: AtomicU64::new(snapshot_interval),
-            snapshot,
-            watch,
+            scan: RwLock::new(init.scan),
+            scan_interval: AtomicU64::new(init.scan_interval),
+            snapshot_interval: AtomicU64::new(init.snapshot_interval),
+            snapshot: init.snapshot,
+            watch: init.watch,
             scanning: AtomicBool::new(false),
+            ntfs: AtomicBool::new(init.ntfs),
+            log_level: RwLock::new(init.log_level),
+            background_opacity: AtomicU64::new(init.background_opacity.to_bits()),
+            state: RwLock::new(init.state),
+            state_path: init.state_path,
         }
     }
 
@@ -64,8 +91,23 @@ impl SharedConfig {
         self.snapshot.clone()
     }
 
-    /// Apply a configuration change. Returns an error for unknown keys or
-    /// invalid values.
+    /// Whether NTFS detection and indexing is enabled.
+    pub fn ntfs(&self) -> bool {
+        self.ntfs.load(Ordering::Relaxed)
+    }
+
+    /// The current log level.
+    pub fn log_level(&self) -> LogLevel {
+        *self.log_level.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The scratchpad tile opacity (0.0–1.0).
+    pub fn background_opacity(&self) -> f64 {
+        f64::from_bits(self.background_opacity.load(Ordering::Relaxed))
+    }
+
+    /// Apply a configuration change and persist it. Returns an error for
+    /// unknown keys or invalid values.
     pub fn set(&self, key: &str, value: &str) -> Result<(), String> {
         match key {
             "excludes" => {
@@ -75,24 +117,51 @@ impl SharedConfig {
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .collect();
-                Ok(())
             }
             "scan_interval" => {
                 let v: u64 = value
                     .parse()
                     .map_err(|_| format!("invalid scan_interval: {value}"))?;
                 self.scan_interval.store(v, Ordering::Relaxed);
-                Ok(())
             }
             "snapshot_interval" => {
                 let v: u64 = value
                     .parse()
                     .map_err(|_| format!("invalid snapshot_interval: {value}"))?;
                 self.snapshot_interval.store(v, Ordering::Relaxed);
-                Ok(())
             }
-            other => Err(format!("unknown config key: {other}")),
+            "ntfs" => {
+                let v = parse_bool(value)?;
+                self.ntfs.store(v, Ordering::Relaxed);
+            }
+            "log_level" => {
+                let level: LogLevel = value.parse()?;
+                *self.log_level.write().unwrap_or_else(|e| e.into_inner()) = level;
+                logging::set_level(level);
+            }
+            "background_opacity" => {
+                let v: f64 = value
+                    .parse()
+                    .map_err(|_| format!("invalid background_opacity: {value}"))?;
+                if !(0.0..=1.0).contains(&v) {
+                    return Err(format!("background_opacity out of range: {v}"));
+                }
+                self.background_opacity
+                    .store(v.to_bits(), Ordering::Relaxed);
+            }
+            other => return Err(format!("unknown config key: {other}")),
         }
+        self.persist(key, value)
+    }
+
+    /// Record the change in the state config and write it to disk.
+    fn persist(&self, key: &str, value: &str) -> Result<(), String> {
+        let Some(path) = &self.state_path else {
+            return Ok(());
+        };
+        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+        state.set(key, value)?;
+        state.save(path)
     }
 
     /// The configuration as a string map, for `GetConfig`.
@@ -121,6 +190,12 @@ impl SharedConfig {
         );
         map.insert("watch".into(), self.watch.to_string());
         map.insert("scanning".into(), self.scanning().to_string());
+        map.insert("ntfs".into(), self.ntfs().to_string());
+        map.insert("log_level".into(), self.log_level().to_string());
+        map.insert(
+            "background_opacity".into(),
+            self.background_opacity().to_string(),
+        );
         map
     }
 }
@@ -131,7 +206,18 @@ mod tests {
     use omavrything_core::scan::ScanConfig;
 
     fn cfg() -> SharedConfig {
-        SharedConfig::new(ScanConfig::default(), 900, 300, None, true)
+        SharedConfig::new(ConfigInit {
+            scan: ScanConfig::default(),
+            scan_interval: 900,
+            snapshot_interval: 300,
+            snapshot: None,
+            watch: true,
+            ntfs: true,
+            log_level: LogLevel::Info,
+            background_opacity: 0.75,
+            state: FileConfig::default(),
+            state_path: None,
+        })
     }
 
     #[test]
@@ -146,10 +232,52 @@ mod tests {
     }
 
     #[test]
+    fn set_updates_ntfs_log_level_and_opacity() {
+        let c = cfg();
+        assert!(c.set("ntfs", "false").is_ok());
+        assert!(!c.ntfs());
+        assert!(c.set("log_level", "debug").is_ok());
+        assert_eq!(c.log_level(), LogLevel::Debug);
+        assert!(c.set("background_opacity", "0.5").is_ok());
+        assert_eq!(c.background_opacity(), 0.5);
+    }
+
+    #[test]
     fn set_rejects_unknown_and_invalid() {
         let c = cfg();
         assert!(c.set("bogus", "x").is_err());
         assert!(c.set("scan_interval", "not-a-number").is_err());
+        assert!(c.set("ntfs", "maybe").is_err());
+        assert!(c.set("background_opacity", "2").is_err());
+    }
+
+    #[test]
+    fn set_persists_to_the_state_file() {
+        let dir = std::env::temp_dir().join(format!("omavrything-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.toml");
+
+        let c = SharedConfig::new(ConfigInit {
+            scan: ScanConfig::default(),
+            scan_interval: 900,
+            snapshot_interval: 300,
+            snapshot: None,
+            watch: true,
+            ntfs: true,
+            log_level: LogLevel::Info,
+            background_opacity: 0.75,
+            state: FileConfig::default(),
+            state_path: Some(path.clone()),
+        });
+        c.set("ntfs", "false").unwrap();
+        c.set("background_opacity", "0.4").unwrap();
+
+        let reloaded = FileConfig::load(&path).unwrap();
+        assert_eq!(reloaded.ntfs, Some(false));
+        assert_eq!(reloaded.background_opacity, Some(0.4));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -164,6 +292,9 @@ mod tests {
             "snapshot",
             "watch",
             "scanning",
+            "ntfs",
+            "log_level",
+            "background_opacity",
         ] {
             assert!(map.contains_key(key), "missing {key}");
         }

@@ -4,10 +4,17 @@
 //! `TIMESTAMP LEVEL target: message field=value` format that journald captures
 //! and `journalctl -o json` can parse. The level is taken from the
 //! `OMAVRYTHING_LOG` environment variable when set, otherwise from the
-//! `log_level` configuration key (default `info`).
+//! `log_level` configuration key (default `info`). The level can be changed at
+//! runtime with [`set_level`] (used by the D-Bus `SetConfig` method).
 
 use std::fmt;
 use std::str::FromStr;
+use std::sync::OnceLock;
+
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::reload;
+use tracing_subscriber::util::SubscriberInitExt;
 
 /// A log level, ordered from least to most verbose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -62,17 +69,31 @@ impl fmt::Display for LogLevel {
 /// accepts the same syntax as `RUST_LOG` (e.g. `debug` or
 /// `omavrythingd=debug,zbus=warn`). A second call is a no-op, so this is safe to
 /// call from tests or a re-exec.
+/// The reload handle for the active filter, set by [`init`].
+static RELOAD: OnceLock<reload::Handle<EnvFilter, tracing_subscriber::Registry>> = OnceLock::new();
+
 pub fn init(level: LogLevel) {
     let spec = std::env::var("OMAVRYTHING_LOG").unwrap_or_else(|_| level.as_str().to_string());
-    let filter = tracing_subscriber::EnvFilter::try_new(&spec)
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let filter = EnvFilter::try_new(&spec).unwrap_or_else(|_| EnvFilter::new("info"));
+    let (filter, handle) = reload::Layer::new(filter);
     // `try_init` fails if a subscriber is already installed; that is fine.
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .with_target(true)
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_ansi(false)
+                .with_target(true),
+        )
         .try_init();
+    let _ = RELOAD.set(handle);
+}
+
+/// Change the active log level at runtime. A no-op before [`init`] has run.
+pub fn set_level(level: LogLevel) {
+    if let Some(handle) = RELOAD.get() {
+        let _ = handle.reload(EnvFilter::new(level.as_str()));
+    }
 }
 
 #[cfg(test)]

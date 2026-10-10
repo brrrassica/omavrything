@@ -125,6 +125,14 @@ impl Manager {
             )
             .await;
         }
+        // Enabling NTFS detection indexes any partitions that are already
+        // present; disabling it only records the preference (nothing is
+        // unmounted).
+        if key == "ntfs" && self.config.ntfs() {
+            let index = Arc::clone(&self.index);
+            let policy = Arc::clone(&self.policy);
+            std::thread::spawn(move || crate::run_ntfs_startup(index, policy));
+        }
         Ok(())
     }
 
@@ -352,13 +360,18 @@ mod tests {
         let mut index = Index::new();
         index.add_root(Path::new("/known"), FsKind::Other);
         let index = Arc::new(RwLock::new(index));
-        let config = Arc::new(SharedConfig::new(
-            ScanConfig::default(),
-            900,
-            300,
-            None,
-            true,
-        ));
+        let config = Arc::new(SharedConfig::new(crate::config::ConfigInit {
+            scan: ScanConfig::default(),
+            scan_interval: 900,
+            snapshot_interval: 300,
+            snapshot: None,
+            watch: true,
+            ntfs: true,
+            log_level: crate::logging::LogLevel::Info,
+            background_opacity: 0.75,
+            state: crate::config_file::FileConfig::default(),
+            state_path: None,
+        }));
         let (tx, _rx) = unbounded_channel();
 
         let err = run_rescan(Arc::clone(&index), config, tx, "/unknown")

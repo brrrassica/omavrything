@@ -64,6 +64,7 @@ dbus = true                                    # D-Bus control interface
 ntfs = true                                    # detect and index NTFS partitions
 metadata = true                                # collect per-file size/mtime
 log_level = "info"                             # error | warn | info | debug | trace
+background_opacity = 0.75                      # scratchpad tile opacity (UI setting)
 # socket = "/run/omavrything/omavrything.sock"
 # snapshot = "/var/lib/omavrything/index.snapshot"
 ```
@@ -71,6 +72,22 @@ log_level = "info"                             # error | warn | info | debug | t
 Command-line `--exclude` globs extend the file's rather than replacing them. A
 shipped default is installed to `/etc/omavrything/config.toml` (see
 `data/config/config.toml`).
+
+### Runtime settings and the state config
+
+Changes made through the D-Bus `SetConfig` method (used by the shell plugin's
+settings menu and by `omavry config set`) are applied to the running daemon and
+persisted to a separate **state** config, so the shipped
+`/etc/omavrything/config.toml` is never rewritten. The state path defaults to
+`/var/lib/omavrything/config.toml` for the system service and
+`$XDG_STATE_HOME/omavrything/config.toml` for a user-run daemon; override it with
+`--state-config <path>`. On start the daemon loads the base file, then overlays
+the state file, then applies command-line flags (CLI > state > base > defaults).
+
+The settable keys are `excludes`, `scan_interval`, `snapshot_interval`, `ntfs`,
+`log_level`, and `background_opacity`. `log_level` takes effect immediately;
+`ntfs = true` triggers NTFS detection and indexing; `background_opacity` is a
+UI-only value the daemon stores and serves but does not otherwise use.
 
 ## Logging
 

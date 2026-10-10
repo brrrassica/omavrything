@@ -37,7 +37,7 @@ use omavrything_core::watch::Watcher;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, error, info, warn};
 
-use config::SharedConfig;
+use config::{ConfigInit, SharedConfig};
 use config_file::{DEFAULT_CONFIG_PATH, FileConfig};
 use dbus::IndexEvent;
 use logging::LogLevel;
@@ -129,13 +129,18 @@ fn main() {
     trim_heap();
 
     let index = Arc::new(RwLock::new(index));
-    let config = Arc::new(SharedConfig::new(
-        scan_config,
-        args.scan_interval,
-        args.snapshot_interval,
-        args.snapshot.clone(),
-        args.watch,
-    ));
+    let config = Arc::new(SharedConfig::new(ConfigInit {
+        scan: scan_config,
+        scan_interval: args.scan_interval,
+        snapshot_interval: args.snapshot_interval,
+        snapshot: args.snapshot.clone(),
+        watch: args.watch,
+        ntfs: args.ntfs,
+        log_level: args.log_level,
+        background_opacity: args.background_opacity,
+        state: args.state.clone(),
+        state_path: args.state_path.clone(),
+    }));
     let identities = Arc::new(RwLock::new(identities));
     let policy = Arc::new(Mutex::new(ntfs::NtfsPolicy::load(
         ntfs::default_policy_path(),
@@ -485,7 +490,7 @@ fn run_scheduler(
 
 /// Detect NTFS partitions at startup: auto-mount and index previously indexed
 /// ones, and log newly seen ones as offers.
-fn run_ntfs_startup(index: Arc<RwLock<Index>>, policy: Arc<Mutex<ntfs::NtfsPolicy>>) {
+pub(crate) fn run_ntfs_startup(index: Arc<RwLock<Index>>, policy: Arc<Mutex<ntfs::NtfsPolicy>>) {
     {
         let p = policy.lock().unwrap_or_else(|e| e.into_inner());
         if !p.is_empty() {
@@ -788,8 +793,9 @@ fn trim_heap() {
     }
 }
 
-/// The resolved daemon configuration: command-line flags override the config
-/// file, which overrides the built-in defaults.
+/// The resolved daemon configuration: command-line flags override the state
+/// config, which overrides the base config file, which overrides the built-in
+/// defaults.
 struct Args {
     roots: Vec<PathBuf>,
     auto: bool,
@@ -803,6 +809,11 @@ struct Args {
     ntfs: bool,
     metadata: bool,
     log_level: LogLevel,
+    background_opacity: f64,
+    /// The persisted runtime overrides, carried for `SetConfig` persistence.
+    state: FileConfig,
+    /// Where to persist `state`; `None` disables persistence.
+    state_path: Option<PathBuf>,
 }
 
 /// Raw command-line options. `None` means "not specified on the command line",
@@ -822,63 +833,89 @@ struct RawArgs {
     ntfs: Option<bool>,
     no_metadata: bool,
     config: Option<PathBuf>,
+    state_config: Option<PathBuf>,
     no_config: bool,
     log_level: Option<String>,
 }
 
 impl Args {
-    /// Parse the command line, load the configuration file, and merge them.
+    /// Parse the command line, load the base and state configs, and merge them.
     fn parse() -> Result<Self, String> {
         let raw = RawArgs::parse()?;
-        let file = load_file_config(&raw)?;
-        Self::resolve(raw, file)
+        let base = load_file_config(&raw)?;
+        let state_path = resolve_state_path(&raw);
+        let state = load_state_config(&state_path)?;
+        Self::resolve(raw, base, state, state_path)
     }
 
-    /// Merge the command line over the file configuration over the defaults.
-    fn resolve(raw: RawArgs, file: FileConfig) -> Result<Self, String> {
-        // Resolve the log level first: it borrows `file`, which is moved below.
+    /// Merge the command line over the state config over the base config over
+    /// the defaults.
+    fn resolve(
+        raw: RawArgs,
+        base: FileConfig,
+        state: FileConfig,
+        state_path: Option<PathBuf>,
+    ) -> Result<Self, String> {
         let log_level = match &raw.log_level {
             Some(level) => level.parse::<LogLevel>()?,
-            None => file.log_level().unwrap_or_default(),
+            None => state
+                .log_level()
+                .or_else(|| base.log_level())
+                .unwrap_or_default(),
         };
 
-        let auto = raw.auto || file.auto.unwrap_or(false);
+        let auto = raw.auto || state.auto.or(base.auto).unwrap_or(false);
         let roots = if !raw.roots.is_empty() {
             raw.roots
         } else {
-            file.roots.unwrap_or_default()
+            state.roots.clone().or(base.roots).unwrap_or_default()
         };
 
-        // Command-line excludes extend the file's rather than replacing them.
-        let mut excludes = file.excludes.unwrap_or_default();
+        // Command-line excludes extend the state/base excludes.
+        let mut excludes = state.excludes.clone().or(base.excludes).unwrap_or_default();
         excludes.extend(raw.excludes);
 
         let socket = raw
             .socket
-            .or(file.socket)
+            .or(state.socket.clone())
+            .or(base.socket)
             .unwrap_or_else(default_socket_path);
 
-        let snapshot = if raw.no_snapshot || file.no_snapshot.unwrap_or(false) {
+        let no_snapshot = raw.no_snapshot
+            || state.no_snapshot.unwrap_or(false)
+            || base.no_snapshot.unwrap_or(false);
+        let snapshot = if no_snapshot {
             None
         } else {
             raw.snapshot
-                .or(file.snapshot)
+                .or(state.snapshot.clone())
+                .or(base.snapshot)
                 .or_else(|| Some(default_snapshot_path()))
         };
 
-        let scan_interval = raw.scan_interval.or(file.scan_interval).unwrap_or(900);
+        let scan_interval = raw
+            .scan_interval
+            .or(state.scan_interval)
+            .or(base.scan_interval)
+            .unwrap_or(900);
         let snapshot_interval = raw
             .snapshot_interval
-            .or(file.snapshot_interval)
+            .or(state.snapshot_interval)
+            .or(base.snapshot_interval)
             .unwrap_or(DEFAULT_SNAPSHOT_INTERVAL);
-        let watch = raw.watch.or(file.watch).unwrap_or(true);
-        let dbus = raw.dbus.or(file.dbus).unwrap_or(true);
-        let ntfs = raw.ntfs.or(file.ntfs).unwrap_or(true);
+        let watch = raw.watch.or(state.watch).or(base.watch).unwrap_or(true);
+        let dbus = raw.dbus.or(state.dbus).or(base.dbus).unwrap_or(true);
+        let ntfs = raw.ntfs.or(state.ntfs).or(base.ntfs).unwrap_or(true);
         let metadata = if raw.no_metadata {
             false
         } else {
-            file.metadata.unwrap_or(true)
+            state.metadata.or(base.metadata).unwrap_or(true)
         };
+        let background_opacity = state
+            .background_opacity
+            .or(base.background_opacity)
+            .unwrap_or(0.75);
+
         Ok(Self {
             roots,
             auto,
@@ -892,6 +929,9 @@ impl Args {
             ntfs,
             metadata,
             log_level,
+            background_opacity,
+            state,
+            state_path,
         })
     }
 
@@ -974,6 +1014,11 @@ impl RawArgs {
                         raw.config = Some(PathBuf::from(value));
                     }
                 }
+                "--state-config" => {
+                    if let Some(value) = args.next() {
+                        raw.state_config = Some(PathBuf::from(value));
+                    }
+                }
                 "--no-config" => raw.no_config = true,
                 "--log-level" => {
                     if let Some(value) = args.next() {
@@ -995,8 +1040,8 @@ impl RawArgs {
     }
 }
 
-/// Load the configuration file: the `--config` path when given, otherwise the
-/// default path when it exists. `--no-config` skips loading entirely.
+/// Load the base configuration file: the `--config` path when given, otherwise
+/// the default path when it exists. `--no-config` skips loading entirely.
 fn load_file_config(raw: &RawArgs) -> Result<FileConfig, String> {
     if raw.no_config {
         return Ok(FileConfig::default());
@@ -1011,6 +1056,27 @@ fn load_file_config(raw: &RawArgs) -> Result<FileConfig, String> {
                 Ok(FileConfig::default())
             }
         }
+    }
+}
+
+/// The state config path: `--state-config` when given, otherwise the default.
+/// `--no-config` disables persistence.
+fn resolve_state_path(raw: &RawArgs) -> Option<PathBuf> {
+    if raw.no_config {
+        return None;
+    }
+    Some(
+        raw.state_config
+            .clone()
+            .unwrap_or_else(default_state_config_path),
+    )
+}
+
+/// Load the state config, or an empty one when it does not exist.
+fn load_state_config(path: &Option<PathBuf>) -> Result<FileConfig, String> {
+    match path {
+        Some(p) if p.exists() => FileConfig::load(p),
+        _ => Ok(FileConfig::default()),
     }
 }
 
@@ -1040,6 +1106,21 @@ fn default_snapshot_path() -> PathBuf {
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
             .unwrap_or_else(|| PathBuf::from("/tmp"));
         base.join("omavrything/index.snapshot")
+    }
+}
+
+/// The default state config path: `/var/lib` for the root system service, the
+/// XDG state directory for a user-run daemon.
+fn default_state_config_path() -> PathBuf {
+    // SAFETY: `geteuid` has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        PathBuf::from("/var/lib/omavrything/config.toml")
+    } else {
+        let base = std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        base.join("omavrything/config.toml")
     }
 }
 

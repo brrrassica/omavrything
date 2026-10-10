@@ -47,6 +47,21 @@ Item {
   property int maxResults: 200
   property real backgroundOpacity: 0.75
 
+  // Settings menu state. The menu reads and writes the daemon configuration
+  // through the `omavry` CLI (which speaks the polkit-gated D-Bus interface).
+  property bool settingsOpen: false
+  property bool settingsBusy: false
+  property string settingsError: ""
+  property var settings: ({})
+  property string configCommand: "omavry"
+
+  // Snapshot-interval choices: 30 s to 300 s in 30 s steps.
+  readonly property var snapshotOptions: {
+    var opts = []
+    for (var s = 30; s <= 300; s += 30) opts.push({ value: String(s), label: s + " s" })
+    return opts
+  }
+
   readonly property string runtimeDir: Quickshell.env("XDG_RUNTIME_DIR") || "/tmp"
   readonly property string socketPath: runtimeDir + "/omavrything.sock"
   readonly property string queryFile: runtimeDir + "/omavrything-query"
@@ -81,6 +96,7 @@ Item {
   // Plugin lifecycle hooks, called by the shell host.
   function open(payloadJson) {
     root.opened = true
+    root.settingsOpen = false
     root.filterText = ""
     root.selectedIndex = 0
     root.cursorActive = false
@@ -97,15 +113,50 @@ Item {
 
   function dismiss() {
     root.opened = false
+    root.settingsOpen = false
     root.writeQuery("")
     if (root.shell && typeof root.shell.hide === "function")
       root.shell.hide((root.manifest && root.manifest.id) || "omavrything")
   }
 
-  // Placeholder for the settings menu (planned for a later milestone). The gear
-  // button in the top-right corner calls this.
+  // Open the settings menu and load the current daemon configuration.
   function openSettings() {
-    console.log("omavrything: settings requested (not implemented yet)")
+    root.settingsOpen = true
+    root.settingsError = ""
+    configGetProc.running = true
+  }
+
+  function closeSettings() {
+    root.settingsOpen = false
+  }
+
+  // Parse `omavry config get --json` output and apply the UI-side setting.
+  function applyConfig(text) {
+    var parsed
+    try { parsed = JSON.parse(text) } catch (e) { root.settingsError = "Could not read settings"; return }
+    if (!parsed || typeof parsed !== "object") return
+    root.settings = parsed
+    var opacity = Number(parsed.background_opacity)
+    if (!isNaN(opacity) && opacity > 0) root.backgroundOpacity = opacity
+  }
+
+  // Persist one setting through the daemon (polkit-gated D-Bus SetConfig).
+  function setSetting(key, value) {
+    root.settingsBusy = true
+    root.settingsError = ""
+    // Optimistically update the local copy so the control reflects the change.
+    var next = {}
+    for (var k in root.settings) next[k] = root.settings[k]
+    next[key] = String(value)
+    root.settings = next
+    configSetProc.command = [root.configCommand, "config", "set", key, String(value)]
+    configSetProc.running = true
+  }
+
+  // The current value of a setting, as a string.
+  function settingValue(key, fallback) {
+    var v = root.settings ? root.settings[key] : undefined
+    return (v === undefined || v === null) ? fallback : String(v)
   }
 
   // Mirror the query to the runtime file the bar widget watches.
@@ -270,6 +321,29 @@ Item {
     onConnectionStateChanged: {
       root.daemonAvailable = sock.connected
       if (sock.connected && root.opened) root.rebuild()
+    }
+  }
+
+  // Read the daemon configuration for the settings menu.
+  Process {
+    id: configGetProc
+    command: [root.configCommand, "config", "get", "--json"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.applyConfig(text)
+    }
+    onExited: function(exitCode) {
+      if (exitCode !== 0) root.settingsError = "Daemon unavailable"
+    }
+  }
+
+  // Write one setting back to the daemon.
+  Process {
+    id: configSetProc
+    stdout: StdioCollector { waitForEnd: true }
+    onExited: function(exitCode) {
+      root.settingsBusy = false
+      if (exitCode !== 0) root.settingsError = "Could not apply setting"
     }
   }
 
@@ -496,7 +570,7 @@ Item {
           ListView {
             id: resultList
             anchors.fill: parent
-            visible: root.results.length > 0
+            visible: root.results.length > 0 && !root.settingsOpen
             model: displayModel
             clip: true
             spacing: 0
@@ -577,7 +651,7 @@ Item {
 
           Text {
             anchors.centerIn: parent
-            visible: root.results.length === 0
+            visible: root.results.length === 0 && !root.settingsOpen
             text: !root.daemonAvailable
               ? "Search daemon unavailable"
               : (root.filterText ? "No matches for “" + root.filterText + "”" : "Type to search files")
@@ -585,6 +659,189 @@ Item {
             opacity: 0.6
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
+          }
+
+          // ---------------------------------------------------- settings menu
+          Column {
+            id: settingsPanel
+            anchors.fill: parent
+            visible: root.settingsOpen
+            spacing: root.contentSpacing
+
+            // Header: title + close button.
+            Item {
+              width: parent.width
+              height: root.headerHeight
+
+              Text {
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Settings"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                font.bold: true
+              }
+
+              Item {
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                width: Style.space(24)
+                height: Style.space(24)
+
+                Text {
+                  anchors.centerIn: parent
+                  text: "󰅖"
+                  color: root.foreground
+                  opacity: closeMouse.containsMouse ? 0.95 : 0.6
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                }
+
+                MouseArea {
+                  id: closeMouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.closeSettings()
+                }
+              }
+            }
+
+            // Transparency.
+            Item {
+              width: parent.width
+              height: root.rowHeight
+
+              Text {
+                width: root.nameWidth
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Transparency"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+              }
+
+              PanelSlider {
+                anchors.left: parent.left
+                anchors.leftMargin: root.nameWidth + root.columnGap
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                minimum: 0.3
+                maximum: 1.0
+                step: 0.05
+                value: root.backgroundOpacity
+                trackColor: Util.alpha(root.foreground, 0.2)
+                fillColor: root.foreground
+                knobColor: root.foreground
+                onMoved: function(v) { root.backgroundOpacity = v }
+                onReleased: function(v) {
+                  root.backgroundOpacity = v
+                  root.setSetting("background_opacity", v.toFixed(2))
+                }
+              }
+            }
+
+            // NTFS support.
+            Item {
+              width: parent.width
+              height: root.rowHeight
+
+              Text {
+                width: root.nameWidth
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                text: "NTFS support"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+              }
+
+              ToggleSwitch {
+                anchors.left: parent.left
+                anchors.leftMargin: root.nameWidth + root.columnGap
+                anchors.verticalCenter: parent.verticalCenter
+                checked: root.settingValue("ntfs", "true") === "true"
+                foreground: root.foreground
+                accent: Color.accent
+                onToggled: root.setSetting("ntfs", !checked)
+              }
+            }
+
+            // Snapshot interval.
+            Item {
+              width: parent.width
+              height: root.rowHeight
+
+              Text {
+                width: root.nameWidth
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Snapshot interval"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+              }
+
+              Dropdown {
+                anchors.left: parent.left
+                anchors.leftMargin: root.nameWidth + root.columnGap
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                showLabel: false
+                value: root.settingValue("snapshot_interval", "300")
+                options: root.snapshotOptions
+                foreground: root.foreground
+                background: root.background
+                popupBorder: root.border
+                accent: Color.accent
+                fontFamily: root.fontFamily
+                onChanged: function(v) { root.setSetting("snapshot_interval", v) }
+              }
+            }
+
+            // Log level.
+            Item {
+              width: parent.width
+              height: root.rowHeight
+
+              Text {
+                width: root.nameWidth
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Log level"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+              }
+
+              Dropdown {
+                anchors.left: parent.left
+                anchors.leftMargin: root.nameWidth + root.columnGap
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                showLabel: false
+                value: root.settingValue("log_level", "info")
+                options: ["error", "warn", "info", "debug", "trace"]
+                foreground: root.foreground
+                background: root.background
+                popupBorder: root.border
+                accent: Color.accent
+                fontFamily: root.fontFamily
+                onChanged: function(v) { root.setSetting("log_level", v) }
+              }
+            }
+
+            Text {
+              width: parent.width
+              visible: root.settingsError !== ""
+              text: root.settingsError
+              color: Color.accent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.WordWrap
+            }
           }
         }
       }

@@ -11,7 +11,7 @@ Type=simple
 # The socket and snapshot paths are fixed here so the service is independent of
 # the invoking user's XDG directories. Roots, excludes, intervals, and the log
 # level come from /etc/omavrything/config.toml (auto-loaded when present).
-ExecStart=/usr/bin/omavrythingd --socket /run/omavrything/omavrything.sock --snapshot /var/lib/omavrything/index.snapshot
+ExecStart=/usr/bin/omavrythingd --socket /run/omavrything/omavrything.sock --snapshot /var/lib/omavrything/index.snapshot --state-config /var/lib/omavrything/config.toml
 Restart=on-failure
 RestartSec=5s
 # Allow the clean snapshot write on SIGTERM before the process is killed.
