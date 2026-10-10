@@ -1,6 +1,7 @@
-//! A minimal in-memory index for the M2 walking skeleton.
+//! A minimal in-memory index for the walking skeleton.
 //!
-//! Stores full paths and answers case-insensitive substring queries with
+//! Stores full paths plus the metadata the UI needs to disambiguate duplicates
+//! (size and mtime), and answers case-insensitive substring queries with
 //! space-separated AND terms. The production index (M3) replaces this with a
 //! compact, arena-backed structure and ranked results.
 
@@ -11,6 +12,10 @@ use std::path::PathBuf;
 pub struct Entry {
     pub path: PathBuf,
     pub is_dir: bool,
+    /// Size in bytes. Zero for directories.
+    pub size: u64,
+    /// Last-modified time as Unix seconds. Zero when unavailable.
+    pub mtime: i64,
 }
 
 /// A flat, in-memory list of entries.
@@ -32,8 +37,13 @@ impl Index {
         self.entries.is_empty()
     }
 
-    pub fn insert(&mut self, path: PathBuf, is_dir: bool) {
-        self.entries.push(Entry { path, is_dir });
+    pub fn insert(&mut self, path: PathBuf, is_dir: bool, size: u64, mtime: i64) {
+        self.entries.push(Entry {
+            path,
+            is_dir,
+            size,
+            mtime,
+        });
     }
 
     /// Return up to `limit` entries matching every whitespace-separated term
@@ -66,10 +76,25 @@ mod tests {
 
     fn index() -> Index {
         let mut idx = Index::new();
-        idx.insert(PathBuf::from("/home/sam/Documents/report-2024.pdf"), false);
-        idx.insert(PathBuf::from("/home/sam/Documents/notes.md"), false);
-        idx.insert(PathBuf::from("/home/sam/Pictures"), true);
-        idx.insert(PathBuf::from("/etc/omavrything/config.toml"), false);
+        idx.insert(
+            PathBuf::from("/home/sam/Documents/report-2024.pdf"),
+            false,
+            1024,
+            100,
+        );
+        idx.insert(
+            PathBuf::from("/home/sam/Documents/notes.md"),
+            false,
+            2048,
+            200,
+        );
+        idx.insert(PathBuf::from("/home/sam/Pictures"), true, 0, 300);
+        idx.insert(
+            PathBuf::from("/etc/omavrything/config.toml"),
+            false,
+            512,
+            400,
+        );
         idx
     }
 
@@ -101,10 +126,15 @@ mod tests {
     }
 
     #[test]
-    fn is_dir_is_preserved() {
+    fn metadata_is_preserved() {
         let idx = index();
         let hits = idx.search("Pictures", 10);
         assert_eq!(hits.len(), 1);
         assert!(hits[0].is_dir);
+        assert_eq!(hits[0].size, 0);
+
+        let hits = idx.search("report", 10);
+        assert_eq!(hits[0].size, 1024);
+        assert_eq!(hits[0].mtime, 100);
     }
 }

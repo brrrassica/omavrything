@@ -51,11 +51,11 @@ calls its `open()`, which focuses the input.
 The Hyprland binding lives in `~/.config/hypr/bindings.lua`:
 
 ```lua
-o.bind("SUPER + SHIFT + SPACE", "Search files", "omarchy-shell omavrything focus")
+hl.unbind("SUPER + ALT + SPACE")
+o.bind("SUPER + ALT + SPACE", "Search files", "omarchy-shell omavrything focus")
 ```
 
-`SUPER + SPACE` is the Omarchy launcher, so the search uses
-`SUPER + SHIFT + SPACE`.
+`SUPER + ALT + SPACE` is reassigned from the Omarchy "Apps menu" binding.
 
 ## Install and enable
 
@@ -67,8 +67,20 @@ omarchy plugin enable omavrything --section center # place the widget + enable t
 The bar widget is placed in the center section, right of the `omarchy.clock`
 anchor. The overlay and service are enabled by the same command.
 
-## Result-window sizing
+## The scratchpad
 
-`SearchOverlay.qml` exposes `cardWidth`, `maxResults`, and `anchorFraction`.
-They are currently hardcoded defaults; wiring them to the plugin's `shell.json`
-entry settings is a follow-up.
+The overlay is a centered, high-transparency scratchpad tile (~70% x 70%) with
+the input at the top and a results table below. The table shows **name**,
+**size**, **modified**, and **path** so duplicates are distinguishable.
+
+`SearchOverlay.qml` exposes `widthFraction`, `heightFraction`, `maxWidth`,
+`maxHeight`, `maxResults`, and `backgroundOpacity`. They are currently hardcoded
+defaults; wiring them to the plugin's `shell.json` entry settings is a follow-up.
+
+## Bar query mirror
+
+The bar widget mirrors the query typed in the scratchpad so it reacts to every
+keystroke. The overlay writes the query to
+`$XDG_RUNTIME_DIR/omavrything-query`; the bar widget watches that file. This is a
+spike-level channel (the two components cannot share QML state directly) and can
+be replaced by a shared singleton or a daemon broadcast later.

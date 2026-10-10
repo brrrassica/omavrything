@@ -86,7 +86,14 @@ fn serve(stream: UnixStream, index: Arc<RwLock<Index>>) {
             let results: Vec<ResultItem> = hits
                 .iter()
                 .map(|entry| ResultItem {
+                    name: entry
+                        .path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
                     path: entry.path.to_string_lossy().into_owned(),
+                    size: entry.size,
+                    mtime: entry.mtime,
                     is_dir: entry.is_dir,
                 })
                 .collect();

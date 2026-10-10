@@ -1,5 +1,9 @@
 # omavrything
 
+<p align="center">
+  <img src="assets/file-managers.jpg" alt="File managers" width="720">
+</p>
+
 Are you a Wind*ws ~~user~~ survivor? Do you consider instant file searches with
 Voidtool's Everything indispensable and you miss it when daily driving Omarchy?
 
@@ -58,7 +62,8 @@ omarchy plugin enable omavrything --section center
 Then bind a hotkey in `~/.config/hypr/bindings.lua`:
 
 ```lua
-o.bind("SUPER + SHIFT + SPACE", "Search files", "omarchy-shell omavrything focus")
+hl.unbind("SUPER + ALT + SPACE")
+o.bind("SUPER + ALT + SPACE", "Search files", "omarchy-shell omavrything focus")
 ```
 
 See [`docs/omarchy-shell-integration.md`](docs/omarchy-shell-integration.md) for

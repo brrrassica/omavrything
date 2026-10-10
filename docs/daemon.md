@@ -33,8 +33,12 @@ Request:
 Response:
 
 ```json
-{"results":[{"path":"/home/sam/report-2024.pdf","is_dir":false}],"total":1,"took_ms":0}
+{"results":[{"name":"report-2024.pdf","path":"/home/sam/report-2024.pdf","size":245760,"mtime":1710000000,"is_dir":false}],"total":1,"took_ms":0}
 ```
+
+Each result carries the basename (`name`), the full `path`, the `size` in bytes,
+and the last-modified time (`mtime`, Unix seconds) so the UI can disambiguate
+duplicates.
 
 ## CLI
 

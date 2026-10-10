@@ -16,9 +16,19 @@ pub struct Request {
 }
 
 /// One result row.
+///
+/// Carries the metadata the UI needs to disambiguate duplicates: the basename,
+/// the full path, the size, and the last-modified time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResultItem {
+    /// The basename (final path component).
+    pub name: String,
+    /// The full path.
     pub path: String,
+    /// Size in bytes. Zero for directories.
+    pub size: u64,
+    /// Last-modified time as Unix seconds. Zero when unavailable.
+    pub mtime: i64,
     pub is_dir: bool,
 }
 
@@ -67,7 +77,10 @@ mod tests {
     fn response_round_trips() {
         let resp = Response {
             results: vec![ResultItem {
+                name: "a".into(),
                 path: "/tmp/a".into(),
+                size: 10,
+                mtime: 42,
                 is_dir: false,
             }],
             total: 1,
@@ -76,6 +89,8 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         let back: Response = serde_json::from_str(&json).unwrap();
         assert_eq!(back.total, 1);
-        assert_eq!(back.results[0].path, "/tmp/a");
+        assert_eq!(back.results[0].name, "a");
+        assert_eq!(back.results[0].size, 10);
+        assert_eq!(back.results[0].mtime, 42);
     }
 }
