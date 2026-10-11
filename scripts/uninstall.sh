@@ -93,10 +93,14 @@ fi
 
 # Resolve the user whose per-user plugin and symlink we should remove. When run
 # under sudo, $SUDO_USER is the real invoker; otherwise fall back to $USER.
+# In user mode, root is a legitimate target: the script runs as the target user
+# itself (e.g. a root container with an overridden HOME), so honour it.
 if [[ -z "$target_user" ]]; then
   target_user="${SUDO_USER:-${USER:-$(id -un)}}"
 fi
-if [[ -z "$target_user" || "$target_user" == "root" ]]; then
+if [[ -z "$target_user" ]]; then
+  warn "could not determine the target user; skipping the per-user plugin"
+elif [[ "$target_user" == "root" && "$mode" == "system" ]]; then
   warn "could not determine a non-root user; skipping the per-user plugin"
   target_user=""
 fi
