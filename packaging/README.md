@@ -28,7 +28,7 @@ cargo build --release --workspace
 
 ## Publishing to the AUR
 
-1. Tag the release (`v0.1.0`) and push it, so the `source` URL resolves.
+1. Tag the release (`v0.1.1`) and push it, so the `source` URL resolves.
 2. Replace the placeholder checksum:
 
    ```sh

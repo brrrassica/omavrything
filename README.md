@@ -16,9 +16,14 @@ system daemon (`omavrythingd`) keeps an in-memory index of all mounted
 filesystems — using directory traversal + inotify for Linux filesystems
 (btrfs/ext4/xfs/f2fs) and the MFT for NTFS partitions.
 
-> **Status:** v0.1.0. See [`docs/`](docs/) for documentation.
+> **Status:** v0.1.1. See [`docs/`](docs/) and the [changelog](CHANGELOG.md).
 
 ## Install from a release
+
+> **Use v0.1.1 or newer.** v0.1.0 shipped the plugin under the id `omavrything`
+> and the daemon under the `org.omarchy.*` D-Bus namespace. Both moved to
+> `tech.alatcerdas.omavrything` in v0.1.1, so 0.1.0 installs need the short
+> upgrade note in [`CHANGELOG.md`](CHANGELOG.md#upgrade-from-010).
 
 Download the latest `omavrything-<version>-<arch>.zip` from the
 [releases page](https://github.com/brrrassica/omavrything/releases), extract it,
@@ -64,8 +69,35 @@ o.bind("SUPER + ALT + SPACE", "Search files", "omarchy-shell tech.alatcerdas.oma
 See [`docs/install.md`](docs/install.md) for the full setup, including the
 optional D-Bus control interface.
 
+## Requirements
+
+- **Omarchy Quattro (4.x)** — Hyprland and `omarchy-shell` (Quickshell).
+- The shell plugin on its own needs **no privileges**.
+- The index daemon is **optional**: without it the plugin still loads, but there
+  are no results to show.
+
+The daemon (`omavrythingd`) is a system service, but it does not run as full
+root. It runs as the dedicated `omavrything` user holding only two capabilities:
+`CAP_DAC_READ_SEARCH` (to read paths the indexer could not otherwise see) and
+`CAP_SYS_ADMIN` (to mount an NTFS volume read-only when the kernel driver cannot
+read the MFT directly). It indexes mounted filesystems by traversal + inotify,
+and reads NTFS partitions from the MFT on the block device.
+
+**Nothing is sent anywhere.** The UI talks to the daemon over a local Unix socket
+(`/run/omavrything/omavrything.sock` for the system service, or
+`$XDG_RUNTIME_DIR/omavrything.sock` for a user-run daemon). There is no network
+client in the daemon and no telemetry.
+
+Control operations on the optional D-Bus interface are gated by the polkit action
+`tech.alatcerdas.omavrything.control` (`auth_admin_keep`).
+
+**Degraded mode.** Without the daemon the search bar still appears and the
+overlay still opens; it reports that the daemon is unavailable rather than
+returning results. The plugin never silently does nothing.
+
 ## Documentation
 
+- [`CHANGELOG.md`](CHANGELOG.md) — release notes, including the 0.1.0 → 0.1.1 upgrade notes.
 - [`docs/install.md`](docs/install.md) — installation and setup.
 - [`docs/daemon.md`](docs/daemon.md) — the daemon, its flags, and the socket protocol.
 - [`docs/search-syntax.md`](docs/search-syntax.md) — query syntax and ranking.
@@ -81,11 +113,46 @@ optional D-Bus control interface.
 
 ## Releasing
 
-Releases are built by CI. Pushing a `v*` tag (e.g. `v0.1.0`) runs
+Releases are built by CI. Pushing a `v*` tag (e.g. `v0.1.1`) runs
 [`.github/workflows/release.yml`](.github/workflows/release.yml), which builds the
 release archive with [`scripts/package-release.sh`](scripts/package-release.sh)
 and creates a GitHub release with the zip attached. The same archive can be built
 locally with `scripts/package-release.sh`.
+
+## Removal
+
+Uninstall the shell plugin:
+
+```sh
+omarchy plugin disable tech.alatcerdas.omavrything
+omarchy plugin remove tech.alatcerdas.omavrything --yes
+```
+
+Remove the hotkey binding from `~/.config/hypr/bindings.lua` if you added one.
+
+Uninstall the daemon and its system integration. From the AUR package:
+
+```sh
+sudo pacman -Rns omavrything
+```
+
+Or, for a release-archive or from-source install:
+
+```sh
+sudo systemctl disable --now omavrythingd
+sudo rm -f /usr/bin/omavrythingd /usr/bin/omavry /usr/bin/omavrything-install-plugin
+sudo rm -f /usr/lib/systemd/system/omavrythingd.service
+sudo rm -f /usr/lib/sysusers.d/omavrything.conf
+sudo rm -f /usr/share/dbus-1/system.d/tech.alatcerdas.omavrything.conf
+sudo rm -f /usr/share/polkit-1/actions/tech.alatcerdas.omavrything.policy
+sudo rm -rf /etc/omavrything /usr/share/doc/omavrything /usr/share/licenses/omavrything
+sudo rm -rf /var/lib/omavrything      # the cached index snapshot
+sudo userdel omavrything
+```
+
+The only state the daemon writes is the index snapshot under
+`/var/lib/omavrything` (`index.snapshot` plus its `.prev` fallback), so removing
+that directory is what erases the index. Nothing is left behind elsewhere.
 
 ## Target platform
 
