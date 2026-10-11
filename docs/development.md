@@ -29,6 +29,40 @@ Pushing a `v*` tag runs
 the archive in the same Arch container and creates a GitHub release with the zip
 attached.
 
+## Branching and releases
+
+The project is published on the **Omarchy Marketplace**, which tracks `main`, so
+`main` is protected and is never written to directly. All work lands on
+`develop` first and reaches `main` only through a reviewed merge.
+
+| Branch | Role |
+| --- | --- |
+| `main` | Protected marketplace/release branch. Always releasable. Updated only by merging `develop` via PR. |
+| `develop` | Integration branch. The default target for all work. |
+| `feat/*`, `fix/*`, `docs/*`, `chore/*` | Short-lived topic branches cut from `develop`. |
+
+- Branch off `develop`, not `main`, and open pull requests into `develop`.
+- Only a maintainer merges `develop` into `main` and tags a release.
+- `main` has **branch protection enabled on the upstream repository** as a
+  failsafe: direct pushes are rejected and changes must arrive through a pull
+  request. A rejected push to `main` means the change should be re-targeted at
+  `develop`; do not try to bypass the protection.
+
+To release, a maintainer merges `develop` into `main` via PR, updates
+[`CHANGELOG.md`](../CHANGELOG.md), then tags the merge commit on `main` with
+`v<version>` and pushes the tag. The tag triggers
+[`.github/workflows/release.yml`](../.github/workflows/release.yml), which builds
+the archive and creates the GitHub release. Releases are tag-driven and
+branch-independent; the branch model only governs how the tagged commit is
+produced.
+
+CI ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) runs on every push
+and pull request, so `develop` and topic branches are covered. The docs site
+([`.github/workflows/pages.yml`](../.github/workflows/pages.yml)) publishes only
+from `main`, so it reflects released content.
+
+See [`docs/decisions.md`](decisions.md) (ADR-016) for the rationale.
+
 ## Build and test
 
 ```sh
