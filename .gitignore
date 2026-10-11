@@ -5,6 +5,10 @@
 # Release archives
 /dist
 
+# Built documentation site (site/build.py output)
+/site/dist/
+_site/
+
 # Fuzzing artifacts
 /fuzz/target
 /fuzz/corpus
@@ -17,3 +21,7 @@
 # Editor / OS noise
 .DS_Store
 *.swp
+
+# Python build noise (site generator)
+__pycache__/
+*.pyc

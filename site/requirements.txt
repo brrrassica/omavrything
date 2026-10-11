@@ -1,0 +1,8 @@
+# Build dependencies for the omavrything documentation site.
+# Install into a virtualenv, then run site/build.py with that interpreter:
+#
+#   python3 -m venv .venv-site
+#   .venv-site/bin/pip install -r site/requirements.txt
+#   .venv-site/bin/python site/build.py
+markdown>=3.7,<4
+Pygments>=2.17,<3

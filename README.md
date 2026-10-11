@@ -97,6 +97,10 @@ returning results. The plugin never silently does nothing.
 
 ## Documentation
 
+Rendered at **<https://omavrything.alatcerdas.tech>**, mirrored to
+<https://brrrassica.github.io/omavrything>. The site is generated from these
+sources by `site/build.py`.
+
 - [`CHANGELOG.md`](CHANGELOG.md) — release notes, including the 0.1.0 → 0.1.1 upgrade notes.
 - [`docs/install.md`](docs/install.md) — installation and setup.
 - [`docs/daemon.md`](docs/daemon.md) — the daemon, its flags, and the socket protocol.
