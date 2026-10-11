@@ -171,6 +171,22 @@ if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
   fi
 fi
 
+# 0b. The release archive must carry the binaries and the manifest; a package
+# missing bin/ entries installs "successfully" and then fails at use-time.
+if compgen -G 'dist/omavrything-*.zip' >/dev/null; then
+  archive="$(ls dist/omavrything-*.zip | head -1)"
+  archive_listing="$(unzip -l "$archive" 2>/dev/null || true)"
+  for entry in bin/omavry bin/omavrythingd manifest.json INSTALL.txt; do
+    if grep -q "$entry" <<<"$archive_listing"; then
+      ok "release archive contains $entry"
+    else
+      fail "release archive contains $entry"
+    fi
+  done
+else
+  printf 'skip - release archive checks (no dist/omavrything-*.zip)\n'
+fi
+
 # 1. System install (idempotent: run twice), then verify what landed.
 expect "install.sh --system succeeds" 0 --grep "Installed omavrything" -- scripts/install.sh --system
 expect "install.sh --system is idempotent" 0 -- scripts/install.sh --system
@@ -286,6 +302,23 @@ expect "search finds the marker file" 0 \
   --grep "omavrything-smoke-marker" -- as_smoke /usr/bin/omavry search omavrything-smoke-marker
 expect "a no-match search exits 0" 0 -- as_smoke /usr/bin/omavry search zzzz-no-such-file-zzzz
 
+# The JSON contract must hold for empty results too: total == 0, no results.
+nomatch_json="$(as_smoke /usr/bin/omavry search --json zzzz-no-such-file-zzzz)"
+if command -v python3 >/dev/null 2>&1; then
+  if printf '%s' "$nomatch_json" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data.get("total", -1) == 0, data
+assert data.get("results") == [], data
+assert "took_ms" in data, data
+' >/dev/null 2>&1; then
+    ok "search --json for a no-match query returns total 0 and empty results"
+  else
+    fail "search --json for a no-match query returns total 0 and empty results"
+    printf '%s\n' "$nomatch_json" | sed 's/^/       /' >&2
+  fi
+fi
+
 # Piping into `head` closes the pipe early; the CLI must exit 0 quietly like
 # standard Unix tools, not panic with "failed printing to stdout: Broken pipe".
 pipe_out="$(as_smoke sh -c 'set -o pipefail; /usr/bin/omavry search omavrything-pipe 2>&1 | head -1')"; pipe_rc=$?
@@ -308,6 +341,40 @@ assert "took_ms" in data, data
     ok "search --json returns valid JSON with results"
   else
     fail "search --json returns valid JSON with results"
+    printf '%s\n' "$json_out" | sed 's/^/       /' >&2
+  fi
+fi
+
+# The JSON result entries must carry the documented schema: every result has
+# name, path, size, mtime and is_dir, and took_ms is a non-negative integer.
+if command -v python3 >/dev/null 2>&1; then
+  if printf '%s' "$json_out" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert data.get("results"), data
+for r in data["results"]:
+    assert set(("name", "path", "size", "mtime", "is_dir")) <= set(r), r
+    assert isinstance(r["size"], int) and r["size"] >= 0, r
+    assert isinstance(r["mtime"], int), r
+    assert isinstance(r["is_dir"], bool), r
+assert isinstance(data["took_ms"], int) and data["took_ms"] >= 0, data
+' >/dev/null 2>&1; then
+    ok "search --json result entries match the documented schema"
+  else
+    fail "search --json result entries match the documented schema"
+    printf '%s\n' "$json_out" | sed 's/^/       /' >&2
+  fi
+  # The marker file must be found by its exact path, not just by substring.
+  marker_path="$root_dir/omavrything-smoke-marker.txt"
+  if printf '%s' "$json_out" | MARKER_PATH="$marker_path" python3 -c '
+import json, os, sys
+data = json.load(sys.stdin)
+want = os.environ["MARKER_PATH"]
+assert any(r["path"] == want for r in data["results"]), data
+' >/dev/null 2>&1; then
+    ok "search --json returns the marker file at its exact path"
+  else
+    fail "search --json returns the marker file at its exact path"
     printf '%s\n' "$json_out" | sed 's/^/       /' >&2
   fi
 fi
@@ -365,7 +432,13 @@ assert "version" in data, data
   else
     fail "runtime directory /run/omavrything is 0750 (got: ${run_dir_mode:-missing})"
   fi
+  expect "config get exposes the documented keys" 0 \
+    --grep "scan_interval" -- as_smoke /usr/bin/omavry config get
+  # Stopping the daemon must remove the socket with it (RuntimeDirectory
+  # cleanup): a stale socket would make clients hang or fail confusingly.
   systemctl stop omavrythingd >/dev/null 2>&1 || true
+  expect_path "stopping the daemon removes the system socket" \
+    /run/omavrything/omavrything.sock absent
 else
   printf 'skip - D-Bus status check (no systemd on pid 1)\n'
 fi
