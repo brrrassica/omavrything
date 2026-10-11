@@ -10,6 +10,7 @@
 //! file on the next start. Keeping the two apart means the shipped
 //! `/etc/omavrything/config.toml` is never rewritten by the daemon.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -177,7 +178,16 @@ impl FileConfig {
                 .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
         }
         let tmp = path.with_extension("toml.tmp");
+        // `fs::write` creates with `0666 & ~umask` and the rename below publishes
+        // that mode as the config's, so set it explicitly rather than letting the
+        // umask decide. An existing file keeps its mode; a new one is owner-only,
+        // since the state config records the indexed roots and exclusions.
+        let mode = std::fs::metadata(path)
+            .map(|m| m.permissions().mode() & 0o777)
+            .unwrap_or(0o600);
         std::fs::write(&tmp, text).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))
+            .map_err(|e| format!("cannot set the mode of {}: {e}", tmp.display()))?;
         std::fs::rename(&tmp, path).map_err(|e| format!("cannot replace {}: {e}", path.display()))
     }
 }

@@ -24,7 +24,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Write};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::index::{FileRecord, FsKind, Index, Root};
@@ -273,6 +273,13 @@ pub fn save(index: &Index, identities: &[RootIdentity], path: &Path) -> io::Resu
     write_atomic(&bytes, path)
 }
 
+/// Permission bits for the snapshot and its `.prev` fallback.
+///
+/// The snapshot lists the path names and metadata of everything on the indexed
+/// filesystems, so it is owner-only. The daemon is its only reader: the CLI and
+/// the shell plugin reach the index over the socket or D-Bus, never this file.
+const SNAPSHOT_MODE: u32 = 0o600;
+
 /// Write `bytes` to `path` atomically: a temp file, `fsync`, `rename`, and a
 /// parent-directory `fsync` so the rename itself is durable. The previous
 /// snapshot is kept as `<path>.prev`.
@@ -286,12 +293,22 @@ pub fn write_atomic(bytes: &[u8], path: &Path) -> io::Result<()> {
     let tmp = with_suffix(path, ".tmp");
     {
         let mut file = File::create(&tmp)?;
+        // `File::create` applies `0666 & ~umask`, and the rename below publishes
+        // this inode as the snapshot, so the temp file's mode becomes the
+        // snapshot's mode. Set it before the rename: otherwise a private `0600`
+        // snapshot silently widens to `0644` under umask `022` on the next
+        // write, and other local users can read the indexed path names.
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(SNAPSHOT_MODE))?;
         file.write_all(bytes)?;
         file.sync_all()?;
     }
     // Keep the previous snapshot as a fallback.
     if path.exists() {
-        let _ = fs::rename(path, with_suffix(path, ".prev"));
+        let prev = with_suffix(path, ".prev");
+        let _ = fs::rename(path, &prev);
+        // The renamed inode keeps whatever mode it had, so tighten the fallback
+        // as well rather than leave an older readable copy behind.
+        let _ = fs::set_permissions(&prev, fs::Permissions::from_mode(SNAPSHOT_MODE));
     }
     fs::rename(&tmp, path)?;
     // Make the rename durable: fsync the containing directory.
@@ -563,6 +580,29 @@ mod tests {
         index.insert(Path::new("/home/sam/notes.md"), false, 10, 7);
         index.insert(Path::new("/home/sam"), true, 0, 0);
         index
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().mode() & 0o777
+    }
+
+    #[test]
+    fn writes_owner_only_snapshot() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("snapshot-mode");
+        let path = dir.join("index.snapshot");
+        let index = sample_index();
+
+        save(&index, &[], &path).unwrap();
+        assert_eq!(mode_of(&path), 0o600, "a fresh snapshot must be owner-only");
+
+        // A snapshot left readable by an older build must not survive the next
+        // write, and neither may the `.prev` copy of it.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        save(&index, &[], &path).unwrap();
+        assert_eq!(mode_of(&path), 0o600);
+        assert_eq!(mode_of(&with_suffix(&path, ".prev")), 0o600);
     }
 
     #[test]
