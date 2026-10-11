@@ -50,6 +50,21 @@ install_user() {
   mkdir -p "$user_bin"
   ln -sf "$bindir/omavry" "$user_bin/omavry"
   echo "Linked $user_bin/omavry -> $bindir/omavry"
+
+  # Restart the shell so the new QML is compiled and loaded, matching
+  # install-plugin.sh. A plugin rescan alone keeps the previously compiled
+  # component, so changed QML would not take effect until the shell restarts.
+  if command -v omarchy >/dev/null 2>&1; then
+    if omarchy restart shell >/dev/null 2>&1; then
+      echo "Restarted the shell."
+    else
+      echo "warning: could not restart the shell; run 'omarchy restart shell'" >&2
+    fi
+  elif command -v omarchy-shell >/dev/null 2>&1; then
+    omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+    echo "warning: 'omarchy' not found; rescanned plugins only (changed QML may not apply)" >&2
+  fi
+
   echo "Enable the plugin with: omarchy plugin enable tech.alatcerdas.omavrything --section center"
 }
 

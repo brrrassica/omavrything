@@ -94,6 +94,20 @@ limits). Edit `/etc/omavrything/config.toml` to choose roots, excludes, and
 intervals, then `sudo systemctl restart omavrythingd`. See
 [`daemon.md`](daemon.md) for the configuration keys and the hardening details.
 
+## 7. Uninstall
+
+`scripts/uninstall.sh` reverses the install. It has two modes:
+
+```sh
+scripts/uninstall.sh --user     # the shell plugin and CLI symlink (no root)
+sudo scripts/uninstall.sh       # the daemon, system integration, and plugin
+```
+
+`--keep-config` keeps `/etc/omavrything/config.toml`, `--keep-user` keeps the
+`omavrything` system user and group, and `--keep-state` keeps the cached index
+snapshot under `/var/lib/omavrything`. The release archive ships the script, so
+an archive install can be removed the same way.
+
 ## Next steps
 
 - [`omarchy-shell-integration.md`](omarchy-shell-integration.md) — the plugin
