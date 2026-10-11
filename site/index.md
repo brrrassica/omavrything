@@ -48,7 +48,7 @@ The UX is openly inspired by [Voidtools Everything](https://www.voidtools.com/).
 
 Grab the latest release archive, or use the AUR package on Arch/Omarchy.
 
-**From a release** — download `omavrything-&lt;version&gt;-&lt;arch&gt;.zip` from the
+**From a release** — download `omavrything-<version>-<arch>.zip` from the
 [releases page](https://github.com/brrrassica/omavrything/releases):
 
 ```sh

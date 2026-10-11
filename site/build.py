@@ -119,6 +119,8 @@ def page(title: str, body: str, *, depth: int, desc: str = DEFAULT_DESC,
     root = "../" * depth
     full_title = title if title.startswith("omavrything") else f"{title} — omavrything"
     desc_e = html.escape(desc, quote=True)
+    article = f'<article class="article">\n{body}\n{edit}\n</article>'
+    inner = f'<div class="docs">\n{sidebar}\n{article}\n</div>' if sidebar else article
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -148,10 +150,7 @@ def page(title: str, body: str, *, depth: int, desc: str = DEFAULT_DESC,
   </div>
 </header>
 <main class="wrap">
-{sidebar}<article class="article">
-{body}
-{edit}
-</article>
+{inner}
 </main>
 <footer class="site">
   <div class="wrap cols">
