@@ -67,4 +67,9 @@ jobs:
                 ./scripts/install-plugin.sh
                 omarchy plugin enable tech.alatcerdas.omavrything --section center
 
+            `install.sh --system` creates the omavrything user, adds you to the
+            omavrything group, reloads D-Bus, and enables and starts the daemon.
+            Log out and back in (or run `newgrp omavrything`) so the group change
+            takes effect. Pass `--no-start` to install without starting the daemon.
+
             See `docs/install.md` inside the archive for the full setup.

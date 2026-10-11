@@ -203,6 +203,31 @@ for f in \
   expect_path "installed: $f" "$f" present
 done
 
+# The install must create the dedicated user and add the invoking user to the
+# socket group; without both the daemon cannot start and the client cannot
+# connect (the 0.1.4 "Search daemon unavailable" regression).
+if id omavrything >/dev/null 2>&1; then
+  ok "install created the omavrything user"
+else
+  fail "install created the omavrything user"
+fi
+if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+  if id -nG "$SUDO_USER" 2>/dev/null | tr ' ' '\n' | grep -qx omavrything; then
+    ok "install added $SUDO_USER to the omavrything group"
+  else
+    fail "install added $SUDO_USER to the omavrything group"
+  fi
+fi
+# The new polkit action must be installed so the settings panel can save.
+expect_grep "polkit set-config action installed" \
+  /usr/share/polkit-1/actions/tech.alatcerdas.omavrything.policy \
+  "tech.alatcerdas.omavrything.set-config"
+# Source-level guards for the install-path fix.
+expect_grep "install.sh adds the user to the group" scripts/install.sh \
+  "usermod -aG omavrything"
+expect_grep "install.sh reloads D-Bus" scripts/install.sh "ReloadConfig"
+expect_grep "install.sh supports --no-start" scripts/install.sh "no_start"
+
 # 2. The usage contract of the installed binaries. Every binary must support
 # --version, and every usage error must exit 2 with a diagnostic.
 daemon_version="$(/usr/bin/omavrythingd --version 2>&1 || true)"
@@ -244,6 +269,12 @@ expect_grep "overlay QML references the system socket" "$overlay_qml" \
   "/run/omavrything/omavrything.sock"
 expect_grep "overlay QML probes the socket path before connecting" "$overlay_qml" \
   "socketProbe"
+# The probe must fall back to the user socket and force a reconnect, so a system
+# socket the user cannot reach does not leave the overlay stuck on "unavailable".
+expect_grep "overlay QML falls back to the user socket" "$overlay_qml" "echo user"
+expect_grep "overlay QML reports no usable socket" "$overlay_qml" "echo none"
+expect_grep "overlay QML forces a reconnect on open" "$overlay_qml" \
+  "root.opened = false"
 expect_path "CLI symlink installed" "$user_home/.local/bin/omavry" present
 expect_grep "install.sh --user restarts the shell" "$tmp/omarchy.log" "restart shell"
 
@@ -391,6 +422,13 @@ wait "$daemon_pid" 2>/dev/null || true
 # 6. D-Bus status, only where systemd is available (the CI container has none).
 if [[ "$(ps -p 1 -o comm= 2>/dev/null || true)" == "systemd" ]]; then
   expect "systemctl start omavrythingd" 0 -- systemctl start omavrythingd
+  # install.sh must have enabled the unit at boot, not just installed it.
+  enabled="$(systemctl is-enabled omavrythingd 2>/dev/null || true)"
+  if [[ "$enabled" == "enabled" ]]; then
+    ok "install enabled omavrythingd at boot"
+  else
+    fail "install enabled omavrythingd at boot (got: ${enabled:-unknown})"
+  fi
   for _ in $(seq 1 150); do
     busctl --system status tech.alatcerdas.omavrything >/dev/null 2>&1 && break
     sleep 0.2

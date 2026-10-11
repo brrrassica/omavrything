@@ -6,6 +6,45 @@ Notable changes to `omavrything`. The format follows
 
 ## [Unreleased]
 
+## [0.1.5] — 2026-10-12
+
+A hotfix release for four defects that made a fresh 0.1.4 install unusable.
+
+### Fixed
+
+- **A fresh install never started the daemon.** `scripts/install.sh --system`
+  installed the systemd unit but did not enable or start it, did not add the
+  invoking user to the `omavrything` group, and swallowed `systemd-sysusers`
+  errors. After the documented three commands the unit was inactive and the user
+  was not in the socket group, so the widget reported "Search daemon unavailable"
+  and the CLI could not connect. The installer now creates the user (failing
+  loudly), adds `$SUDO_USER` to the group, and enables and starts the daemon;
+  `--no-start` opts out. The release instructions and `INSTALL.txt` were updated.
+- **The D-Bus policy was installed but never reloaded.** A bus that was already
+  running before the install did not see the new policy, so the daemon could not
+  own its name and every control command returned
+  `ServiceUnknown: The name is not activatable`. `install.sh` and the AUR
+  install scriptlet now reload the bus.
+- **The overlay could not reach the system socket.** The socket probe only
+  checked that the system socket existed, not that it was reachable, and the
+  `Socket` held a failed connection instead of retrying. The probe now requires
+  the socket to be writable, falls back to the per-user socket, and forces a
+  reconnect on every open.
+- **polkit `SetConfig` could never prompt.** The daemon used a `unix-user`
+  subject, which polkit cannot prompt for, so `SetConfig` failed instantly with
+  `AccessDenied`. It now uses a `system-bus-name` subject. The cosmetic
+  `background_opacity` key moved to a new
+  `tech.alatcerdas.omavrything.set-config` action (`allow_active=yes`), so the
+  settings panel saves without a prompt and without sharing the privileged
+  `control` action with `MountNtfs`.
+
+### Changed
+
+- `scripts/doctor.sh` now checks group membership, daemon enablement, the
+  `set-config` polkit action, and hints at reloading D-Bus.
+- `scripts/ci-smoke.sh` asserts the user/group, daemon enablement, the new polkit
+  action, and the overlay socket fallback.
+
 ## [0.1.4] — 2026-10-12
 
 The install/uninstall completeness and hardening milestone (M13–M14), shipped as
@@ -167,6 +206,7 @@ Then install 0.1.1, run `omavrything-install-plugin`, and enable
 First release: the `omavrythingd` index daemon, the `omavry` CLI, and the
 `omarchy-shell` search plugin (bar widget, overlay, service).
 
+[0.1.5]: https://github.com/brrrassica/omavrything/releases/tag/v0.1.5
 [0.1.3]: https://github.com/brrrassica/omavrything/releases/tag/v0.1.3
 [0.1.2]: https://github.com/brrrassica/omavrything/releases/tag/v0.1.2
 [0.1.1]: https://github.com/brrrassica/omavrything/releases/tag/v0.1.1

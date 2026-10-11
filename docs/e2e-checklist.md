@@ -57,8 +57,10 @@ Record the result of each item as pass/fail with the date and the Omarchy versio
 
 - [ ] The gear button opens the settings menu.
 - [ ] Changing `backgroundOpacity` updates the tile live.
+- [ ] Releasing the transparency slider saves without a password prompt
+      (`set-config` action) and the value survives reopening the panel.
 - [ ] Toggling NTFS, changing the snapshot interval, and changing the log level
-      apply to the daemon.
+      apply to the daemon (these prompt for authentication).
 - [ ] The changes persist across a daemon restart (state config).
 
 ## 6. Persistence and warm start
@@ -70,10 +72,12 @@ Record the result of each item as pass/fail with the date and the Omarchy versio
 
 ## 7. D-Bus control (optional)
 
-- [ ] With the policy installed, `omavry status` works over D-Bus.
+- [ ] With the policy installed and the bus reloaded, `omavry status` works over
+      D-Bus.
 - [ ] `omavry rescan` prompts for polkit authentication and rescans.
-- [ ] `omavry config set scan_interval 1800` persists and is reflected by
+- [ ] `omavry config set scan_interval 1800` prompts and persists, reflected by
       `omavry config get`.
+- [ ] `omavry config set background_opacity 0.6` saves without a prompt.
 - [ ] Without the policy, the daemon logs the refusal and the socket path still
       works.
 
@@ -108,5 +112,8 @@ Record the result of each item as pass/fail with the date and the Omarchy versio
 - [ ] The zip contains `bin/`, `data/`, `shell/`, `scripts/`, `docs/`, `README.md`,
       and `LICENSE`.
 - [ ] Extracting the zip and running `sudo ./scripts/install.sh --system` installs
-      cleanly on a fresh system.
+      cleanly on a fresh system, creates the `omavrything` user, adds the invoking
+      user to the group, reloads D-Bus, and enables and starts the daemon.
+- [ ] `sudo ./scripts/install.sh --system --no-start` installs without starting
+      the daemon.
 - [ ] `./scripts/install-plugin.sh` installs the plugin from the extracted archive.

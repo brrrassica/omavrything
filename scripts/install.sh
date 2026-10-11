@@ -2,8 +2,12 @@
 # Install omavrything from a release archive or a source checkout.
 #
 # Usage:
-#   sudo scripts/install.sh --system   # daemon, CLI, systemd unit, D-Bus, polkit
-#        scripts/install.sh --user     # shell plugin + CLI for the current user
+#   sudo scripts/install.sh --system [--no-start]   # daemon, CLI, systemd unit, D-Bus, polkit
+#        scripts/install.sh --user                  # shell plugin + CLI for the current user
+#
+# --system installs the system integration, creates the omavrything user, adds the
+# invoking user to the omavrything group, reloads D-Bus, and enables+starts the
+# daemon. Pass --no-start to skip enabling/starting the daemon.
 #
 # The script auto-detects the layout: a release archive has bin/ and data/ at the
 # top level, while a source checkout has target/release/ and the same data/ tree.
@@ -12,19 +16,23 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 mode="system"
-case "${1:-}" in
-  --system) mode="system" ;;
-  --user) mode="user" ;;
-  "" ) mode="system" ;;
-  -h|--help)
-    sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
-    exit 0
-    ;;
-  *)
-    echo "error: unknown option: $1" >&2
-    exit 2
-    ;;
-esac
+no_start=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --system) mode="system" ;;
+    --user) mode="user" ;;
+    --no-start) no_start=1 ;;
+    -h|--help)
+      sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *)
+      echo "error: unknown option: $1" >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
 
 # Locate the built binaries: release archive first, then a source checkout.
 if [[ -x "$here/bin/omavrythingd" ]]; then
@@ -81,6 +89,20 @@ install_user() {
   echo "Enable the plugin with: omarchy plugin enable tech.alatcerdas.omavrything --section center"
 }
 
+# Reload the system D-Bus configuration so a newly installed policy takes effect.
+# A bus that was already running before the install does not see the new policy
+# otherwise, and the daemon cannot own its name (ServiceUnknown: The name is not
+# activatable). Prefer the portable ReloadConfig call; fall back to the service.
+reload_dbus() {
+  if command -v dbus-send >/dev/null 2>&1; then
+    if dbus-send --system --type=method_call --dest=org.freedesktop.DBus \
+      /org/freedesktop/DBus org.freedesktop.DBus.ReloadConfig >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+  systemctl reload dbus >/dev/null 2>&1 || true
+}
+
 install_system() {
   if [[ "$(id -u)" -ne 0 ]]; then
     echo "error: --system requires root (use sudo)" >&2
@@ -133,8 +155,19 @@ install_system() {
     install -m644 "$doc" "/usr/share/doc/omavrything/$name"
   done
 
-  systemd-sysusers >/dev/null 2>&1 || true
+  # Create the dedicated user/group from the sysusers drop-in. This must succeed:
+  # without it the service cannot start, and a silent failure is exactly what made
+  # 0.1.4 look installed but dead.
+  if ! systemd-sysusers; then
+    echo "error: systemd-sysusers failed; the omavrything user/group was not created" >&2
+    exit 1
+  fi
   systemctl daemon-reload >/dev/null 2>&1 || true
+
+  # Reload the system bus so it picks up the new policy. A bus that was already
+  # running before the install does not see the policy otherwise, and the daemon
+  # cannot own its name (ServiceUnknown: The name is not activatable).
+  reload_dbus
 
   # Health check: the installed daemon must run. Fail loudly if it does not.
   if ! /usr/bin/omavrythingd --version >/dev/null 2>&1; then
@@ -142,9 +175,31 @@ install_system() {
     exit 1
   fi
 
+  # Add the invoking user to the socket group so the shell plugin and the CLI can
+  # reach the system socket. Group membership only applies to new sessions.
+  local target_user="${SUDO_USER:-}"
+  if [[ -n "$target_user" && "$target_user" != "root" ]]; then
+    if usermod -aG omavrything "$target_user"; then
+      echo "Added $target_user to the omavrything group."
+    else
+      echo "warning: could not add $target_user to the omavrything group" >&2
+    fi
+  fi
+
   echo "Installed omavrything ${version:-unknown} system-wide."
-  echo "Enable the daemon with: sudo systemctl enable --now omavrythingd"
-  echo "Add your user to the socket group with: sudo usermod -aG omavrything \"\$USER\""
+
+  if [[ "$no_start" == 1 ]]; then
+    echo "Skipped starting the daemon (--no-start)."
+    echo "Start it with: sudo systemctl enable --now omavrythingd"
+  elif systemctl enable --now omavrythingd; then
+    echo "Enabled and started omavrythingd."
+  else
+    echo "warning: could not enable/start omavrythingd; run 'sudo systemctl enable --now omavrythingd'" >&2
+  fi
+
+  if [[ -n "$target_user" && "$target_user" != "root" ]]; then
+    echo "Log out and back in (or run 'newgrp omavrything') for the group change to take effect."
+  fi
 }
 
 case "$mode" in

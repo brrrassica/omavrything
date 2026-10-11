@@ -13,4 +13,17 @@
       <allow_active>auth_admin_keep</allow_active>
     </defaults>
   </action>
+  <!-- Cosmetic settings (the scratchpad opacity) are allowed for the active
+       local user without a prompt, so the settings panel can save. Privileged
+       keys (excludes, ntfs, intervals, log_level) still use the control action
+       above, so changing the UI does not also grant MountNtfs. -->
+  <action id="tech.alatcerdas.omavrything.set-config">
+    <description>Change the omavrything UI settings</description>
+    <message>Authentication is required to change the omavrything settings</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+  </action>
 </policyconfig>

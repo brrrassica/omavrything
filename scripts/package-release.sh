@@ -95,6 +95,11 @@ Quick start (system install, requires root):
 
     sudo ./scripts/install.sh --system
 
+This creates the omavrything user, adds you to the omavrything group, reloads
+D-Bus, and enables and starts the daemon. Log out and back in (or run
+`newgrp omavrything`) so the group change takes effect. Pass --no-start to
+install without enabling or starting the daemon.
+
 Then enable the shell plugin for your user:
 
     ./scripts/install-plugin.sh

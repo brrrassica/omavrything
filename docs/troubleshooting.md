@@ -75,12 +75,21 @@ allowed to connect.
 
 ## D-Bus control is unavailable
 
-**Symptom:** `omavry status` or `omavry config` fails, and the log shows
+**Symptom:** `omavry status` or `omavry config` fails with
+`ServiceUnknown: The name is not activatable`, or the log shows
 `Request to own name refused by policy`.
 
 The daemon can only own the well-known name `tech.alatcerdas.omavrything` if the
-system-bus policy is installed. Install the policy and the polkit action, then
-reload D-Bus:
+system-bus policy is installed **and the running bus has reloaded it**. A bus
+that was already running before the install does not see a new policy until it
+is reloaded:
+
+```sh
+sudo systemctl reload dbus
+```
+
+`scripts/install.sh --system` installs the policy and reloads the bus for you.
+To do it by hand:
 
 ```sh
 sudo install -Dm644 data/dbus/tech.alatcerdas.omavrything.conf \
@@ -94,8 +103,13 @@ A **user-run** daemon cannot own the name at all (the policy only permits the
 `omavrything` user and root), so it serves the socket search path but not D-Bus
 control. Use the system service for `status`/`config`/`rescan`/`mount`.
 
-Control methods (`Rescan`, `SetConfig`, `MountNtfs`) are gated by the
-`tech.alatcerdas.omavrything.control` polkit action and prompt for authentication.
+`Rescan` and `MountNtfs`, and the privileged `SetConfig` keys (`excludes`,
+`ntfs`, `scan_interval`, `snapshot_interval`, `log_level`), are gated by the
+`tech.alatcerdas.omavrything.control` polkit action (`auth_admin_keep`) and
+prompt for authentication. The cosmetic `background_opacity` key uses the
+separate `tech.alatcerdas.omavrything.set-config` action (`allow_active=yes`), so
+the settings panel can save the tile opacity without a prompt and without
+granting `MountNtfs`.
 
 ## inotify watch limits
 

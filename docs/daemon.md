@@ -171,7 +171,7 @@ Control and status are exposed on the system bus as
 | `GetStatus` | version, entries, roots, memory, scan state, uptime |
 | `Rescan(root)` | rescan all roots (empty `root`) or one configured root; returns entries added |
 | `GetConfig` | the current configuration |
-| `SetConfig(key, value)` | set `excludes`, `scan_interval`, or `snapshot_interval`; changing `excludes` triggers a rescan |
+| `SetConfig(key, value)` | set `excludes`, `scan_interval`, `snapshot_interval`, `ntfs`, `log_level`, or `background_opacity`; changing `excludes` triggers a rescan |
 | `ListRoots` | the indexed roots |
 | `MountNtfs(uuid)` | mount an NTFS partition and index it via the MFT; returns the mount point |
 
@@ -182,8 +182,12 @@ non-empty `root` must be one of the configured roots.
 
 Signals: `IndexChanged(entries)` and `ScanProgress(phase, entries)`.
 
-The read-only methods are open to all; `Rescan`, `SetConfig`, and `MountNtfs`
-are gated by the `tech.alatcerdas.omavrything.control` polkit action.
+The read-only methods are open to all. `Rescan` and `MountNtfs`, and the
+privileged `SetConfig` keys (`excludes`, `ntfs`, `scan_interval`,
+`snapshot_interval`, `log_level`), are gated by the
+`tech.alatcerdas.omavrything.control` polkit action. The cosmetic
+`background_opacity` key uses `tech.alatcerdas.omavrything.set-config`
+(`allow_active=yes`), so the settings panel can save without a prompt.
 
 The daemon can only own the well-known name if the system-bus policy is
 installed. Without it the daemon logs `Request to own name refused by policy`
@@ -221,10 +225,11 @@ omavry config get [--json]         # the current configuration
 omavry config set <key> <value>    # set a value (D-Bus, polkit)
 ```
 
-`search` and `status` are read-only; `rescan`, `mount`, and `config set` are
-gated by the `tech.alatcerdas.omavrything.control` polkit action and prompt for
-authentication. Every subcommand exits non-zero on failure, so it composes with
-shell scripts.
+`search` and `status` are read-only; `rescan`, `mount`, and `config set` for a
+privileged key are gated by the `tech.alatcerdas.omavrything.control` polkit
+action and prompt for authentication. `config set background_opacity` uses the
+`tech.alatcerdas.omavrything.set-config` action and does not prompt. Every
+subcommand exits non-zero on failure, so it composes with shell scripts.
 
 ## Live updates
 

@@ -1,6 +1,6 @@
 # Installation and setup
 
-`omavrything` is at **v0.1.3**: early, but released and used day to day. Install it
+`omavrything` is at **v0.1.5**:, but released and used day to day. Install it
 from a release archive or from source (§1–2). It targets
 **Omarchy Quattro (4.x)** only — Hyprland, `omarchy-shell` (Quickshell), Arch
 Linux. There is no backwards compatibility with earlier Omarchy releases that
@@ -74,8 +74,19 @@ D-Bus methods and the polkit action.
 
 ## 6. Run as a system service (optional)
 
-For a persistent, hardened daemon that starts at boot, install the systemd unit,
-the dedicated user, and the default configuration:
+For a persistent, hardened daemon that starts at boot, `install.sh --system`
+installs the systemd unit, the dedicated user, and the default configuration,
+then creates the user, adds you to the `omavrything` group, reloads D-Bus, and
+enables and starts the daemon:
+
+```sh
+sudo scripts/install.sh --system
+```
+
+Log out and back in (or run `newgrp omavrything`) so the group change takes
+effect. Pass `--no-start` to install without enabling or starting the daemon.
+
+The equivalent manual steps are:
 
 ```sh
 sudo install -Dm644 data/systemd/omavrythingd.service /usr/lib/systemd/system/omavrythingd.service

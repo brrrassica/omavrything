@@ -8,6 +8,12 @@
 post_install() {
   systemd-sysusers
   systemctl daemon-reload
+  # Reload the system bus so it picks up the new policy; a bus that was already
+  # running before the install does not see it otherwise, and the daemon cannot
+  # own its name (ServiceUnknown: The name is not activatable).
+  dbus-send --system --type=method_call --dest=org.freedesktop.DBus \
+    /org/freedesktop/DBus org.freedesktop.DBus.ReloadConfig >/dev/null 2>&1 ||
+    systemctl reload dbus >/dev/null 2>&1 || true
   cat <<'EOF'
 ==> omavrything installed.
 
@@ -29,6 +35,10 @@ EOF
 post_upgrade() {
   systemd-sysusers
   systemctl daemon-reload
+  # Reload the system bus so it picks up any policy change in the new version.
+  dbus-send --system --type=method_call --dest=org.freedesktop.DBus \
+    /org/freedesktop/DBus org.freedesktop.DBus.ReloadConfig >/dev/null 2>&1 ||
+    systemctl reload dbus >/dev/null 2>&1 || true
   cat <<'EOF'
 ==> omavrything upgraded.
 

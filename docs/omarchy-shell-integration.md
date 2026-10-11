@@ -118,6 +118,16 @@ daemon returns; clearing the sort (a fresh query) restores the daemon's ranking.
 `maxHeight`, `maxResults`, and `backgroundOpacity`. They are currently hardcoded
 defaults; wiring them to the plugin's `shell.json` entry settings is a follow-up.
 
+## Daemon socket
+
+The overlay talks to the daemon over a Unix socket. It probes for the system
+socket (`/run/omavrything/omavrything.sock`) first and falls back to the per-user
+socket (`$XDG_RUNTIME_DIR/omavrything.sock`), mirroring the CLI's
+`connect_default()`. A socket is only used if it exists and is writable, so a
+system socket the user cannot reach (not in the `omavrything` group) falls
+through to the user socket. The probe re-runs on every open, so a daemon that
+started after the shell is still found.
+
 ## Bar query mirror
 
 The bar widget mirrors the query typed in the scratchpad so it reacts to every
