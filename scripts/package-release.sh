@@ -63,6 +63,7 @@ install -Dm644 data/sysusers/omavrything.conf "$stage/data/sysusers/omavrything.
 install -Dm644 data/dbus/tech.alatcerdas.omavrything.conf "$stage/data/dbus/tech.alatcerdas.omavrything.conf"
 install -Dm644 data/polkit/tech.alatcerdas.omavrything.policy "$stage/data/polkit/tech.alatcerdas.omavrything.policy"
 install -Dm644 data/config/config.toml "$stage/data/config/config.toml"
+install -Dm644 data/man/omavrythingd.8 "$stage/data/man/omavrythingd.8"
 
 # The omarchy-shell plugin. The manifest sits at the archive root, exactly where
 # the marketplace and `omarchy plugin validate` expect it, so the extracted
@@ -78,6 +79,7 @@ install -m755 scripts/uninstall.sh "$stage/scripts/uninstall.sh"
 install -m755 scripts/install-plugin.sh "$stage/scripts/install-plugin.sh"
 install -m755 scripts/run-daemon.sh "$stage/scripts/run-daemon.sh"
 install -m755 scripts/restart-all.sh "$stage/scripts/restart-all.sh"
+install -m755 scripts/doctor.sh "$stage/scripts/doctor.sh"
 
 # Documentation and license.
 install -m644 README.md "$stage/README.md"

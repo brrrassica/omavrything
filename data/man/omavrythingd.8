@@ -1,0 +1,110 @@
+.TH OMAVRYTHINGD 8 "2026-10-11" "omavrything 0.1.3" "System Administration"
+.SH NAME
+omavrythingd \- index-backed file search daemon
+.SH SYNOPSIS
+.B omavrythingd
+.RI [ options ]
+.SH DESCRIPTION
+.B omavrythingd
+keeps an in-memory index of the mounted filesystems and answers search
+queries over a Unix domain socket. It discovers roots from the mount table
+(or from explicit
+.B \-\-root
+arguments), scans them in parallel, keeps the index current with
+.BR inotify ,
+runs idle-gated periodic rescans, and persists a snapshot for warm starts.
+.PP
+Queries are served as newline-delimited JSON over the socket. Control and
+status are exposed on the system D-Bus under
+.BR tech.alatcerdas.omavrything .
+.PP
+The daemon is normally started by
+.BR systemd (1)
+as the
+.B omavrythingd.service
+unit, running as the unprivileged
+.B omavrything
+user with only
+.B CAP_DAC_READ_SEARCH
+and
+.BR CAP_SYS_ADMIN .
+.SH OPTIONS
+.TP
+.B \-\-config \fIpath\fR
+Configuration file (default:
+.IR /etc/omavrything/config.toml ).
+.TP
+.B \-\-no-config
+Ignore the configuration file.
+.TP
+.B \-\-root \fIdir\fR
+Directory to index. Repeatable. Defaults to
+.IR $HOME .
+.TP
+.B \-\-auto
+Discover roots from the mount table, skipping pseudo filesystems.
+.TP
+.B \-\-exclude \fIglob\fR
+Exclude glob, for example
+.RB ' **/.git/** '.
+Repeatable.
+.TP
+.B \-\-no-watch
+Disable inotify live updates.
+.TP
+.B \-\-scan-interval \fIsecs\fR
+Idle-gated rescan interval in seconds (0 disables; default 900).
+.TP
+.B \-\-socket \fIpath\fR
+Unix socket path. Defaults to
+.I /run/omavrything/omavrything.sock
+as root, otherwise
+.IR $XDG_RUNTIME_DIR/omavrything.sock .
+.TP
+.B \-\-snapshot \fIpath\fR
+Snapshot path. Defaults to
+.I /var/lib/omavrything/index.snapshot
+as root, otherwise
+.IR $XDG_STATE_HOME/omavrything/index.snapshot .
+.TP
+.B \-\-no-snapshot
+Disable snapshot persistence.
+.TP
+.B \-\-snapshot-interval \fIsecs\fR
+Snapshot write interval in seconds (0 disables; default 300).
+.TP
+.B \-\-no-dbus
+Disable the D-Bus control interface.
+.TP
+.B \-\-no-ntfs
+Disable NTFS partition detection and indexing.
+.TP
+.B \-\-no-metadata
+Skip per-file size and mtime stats (names only; faster scan).
+.TP
+.B \-\-log-level \fIlevel\fR
+Log level: error, warn, info, debug, or trace (default: info).
+.TP
+.BR \-V ", " \-\-version
+Show the version and exit.
+.TP
+.BR \-h ", " \-\-help
+Show help and exit.
+.SH FILES
+.TP
+.I /etc/omavrything/config.toml
+Base configuration.
+.TP
+.I /var/lib/omavrything/index.snapshot
+Persisted index snapshot for warm starts.
+.TP
+.I /var/lib/omavrything/config.toml
+State written by the daemon (for example, remembered NTFS mounts).
+.TP
+.I /run/omavrything/omavrything.sock
+Unix socket for the search hot path.
+.SH SEE ALSO
+.BR omavry (1),
+.BR systemctl (1)
+.SH AUTHOR
+Sam Ralial <sam@alatcerdas.tech>

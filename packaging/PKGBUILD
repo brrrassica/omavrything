@@ -83,6 +83,10 @@ package() {
   # Default configuration (a backup is kept on upgrade by pacman).
   install -Dm644 data/config/config.toml "$pkgdir/etc/omavrything/config.toml"
 
+  # Man page (referenced by the systemd unit's Documentation=).
+  install -Dm644 data/man/omavrythingd.8 \
+    "$pkgdir/usr/share/man/man8/omavrythingd.8"
+
   # The omarchy-shell plugin, installed system-wide. The install helper copies
   # it into ~/.config/omarchy/plugins/tech.alatcerdas.omavrything/.
   install -d "$pkgdir/usr/share/omavrything/shell/omavrything"
@@ -99,5 +103,12 @@ package() {
   # License and documentation.
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -d "$pkgdir/usr/share/doc/$pkgname"
-  install -m644 README.md docs/*.md "$pkgdir/usr/share/doc/$pkgname/"
+  install -m644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  # docs/README.md is the documentation index; install it under a distinct name
+  # so it does not collide with the project README.
+  for doc in docs/*.md; do
+    name="$(basename "$doc")"
+    [[ "$name" == "README.md" ]] && name="docs-index.md"
+    install -m644 "$doc" "$pkgdir/usr/share/doc/$pkgname/$name"
+  done
 }

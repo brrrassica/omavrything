@@ -67,6 +67,10 @@ fn main() {
             }
         }
         "help" | "-h" | "--help" => print_help(),
+        "-V" | "--version" => {
+            println!("omavry {VERSION}");
+            std::process::exit(0);
+        }
         other => {
             eprintln!("unknown command: {other}");
             print_help();
@@ -87,6 +91,19 @@ fn parse_root(args: &[String]) -> Option<String> {
         }
     }
     None
+}
+
+/// Write one line to stdout, exiting quietly with 0 on a broken pipe.
+///
+/// `omavry search … | head` closes the pipe after `head` exits; the default
+/// Rust behaviour is to panic with "failed printing to stdout: Broken pipe".
+/// Standard Unix tools exit 0 in that situation, so we do the same.
+fn print_line(line: &str) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    if writeln!(out, "{line}").is_err() {
+        std::process::exit(0);
+    }
 }
 
 fn search(query: &str, json: bool) -> i32 {
@@ -114,7 +131,7 @@ fn search(query: &str, json: bool) -> i32 {
 
     if json {
         match serde_json::to_string(&response) {
-            Ok(text) => println!("{text}"),
+            Ok(text) => print_line(&text),
             Err(err) => {
                 eprintln!("search failed: {err}");
                 return 1;
@@ -122,7 +139,7 @@ fn search(query: &str, json: bool) -> i32 {
         }
     } else {
         for item in &response.results {
-            println!("{}", item.path);
+            print_line(&item.path);
         }
         eprintln!(
             "{} of {} result(s) in {} ms",
@@ -148,7 +165,7 @@ fn status(json: bool) -> i32 {
                 Ok(status) => {
                     if json {
                         match serde_json::to_string(&status) {
-                            Ok(text) => println!("{text}"),
+                            Ok(text) => print_line(&text),
                             Err(err) => {
                                 eprintln!("status failed: {err}");
                                 return 1;
@@ -158,7 +175,7 @@ fn status(json: bool) -> i32 {
                         let mut keys: Vec<&String> = status.keys().collect();
                         keys.sort();
                         for key in keys {
-                            println!("{key}: {}", status[key]);
+                            print_line(&format!("{key}: {}", status[key]));
                         }
                     }
                     0
@@ -185,8 +202,8 @@ fn rescan(root: Option<&str>) -> i32 {
             match client.rescan(root.unwrap_or("")).await {
                 Ok(added) => {
                     match root {
-                        Some(root) => println!("{added} entries added under {root}"),
-                        None => println!("{added} entries added"),
+                        Some(root) => print_line(&format!("{added} entries added under {root}")),
+                        None => print_line(&format!("{added} entries added")),
                     }
                     0
                 }
@@ -211,7 +228,7 @@ fn mount(uuid: &str) -> i32 {
             };
             match client.mount_ntfs(uuid).await {
                 Ok(mount_point) => {
-                    println!("{mount_point}");
+                    print_line(&mount_point);
                     0
                 }
                 Err(err) => {
@@ -237,7 +254,7 @@ fn config_get(json: bool) -> i32 {
                 Ok(map) => {
                     if json {
                         match serde_json::to_string(&map) {
-                            Ok(text) => println!("{text}"),
+                            Ok(text) => print_line(&text),
                             Err(err) => {
                                 eprintln!("config get failed: {err}");
                                 return 1;
@@ -247,7 +264,7 @@ fn config_get(json: bool) -> i32 {
                         let mut keys: Vec<&String> = map.keys().collect();
                         keys.sort();
                         for key in keys {
-                            println!("{key}: {}", map[key]);
+                            print_line(&format!("{key}: {}", map[key]));
                         }
                     }
                     0
@@ -298,7 +315,7 @@ fn with_runtime<F: FnOnce(&tokio::runtime::Runtime) -> i32>(f: F) -> i32 {
 }
 
 fn print_help() {
-    println!(
+    print_line(&format!(
         "omavry {VERSION}\n\
          \n\
          Usage: omavry <command> [args]\n\
@@ -310,6 +327,10 @@ fn print_help() {
            mount <uuid>              Mount and index an NTFS partition (D-Bus, polkit)\n\
            config get [--json]       Show the daemon configuration (D-Bus)\n\
            config set <key> <val>    Set a configuration value (D-Bus, polkit)\n\
-           help                      Show this help"
-    );
+           help                      Show this help\n\
+          \n\
+          Options:\n\
+           -V, --version             Show the version\n\
+           -h, --help                Show this help"
+    ));
 }

@@ -4,6 +4,23 @@ Notable changes to `omavrything`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `omavry --version` (and `-V`), matching `omavrythingd --version`, so both
+  binaries answer the version query the same way.
+
+### Changed
+
+- `scripts/ci-smoke.sh` now asserts every step instead of only running it:
+  exit codes and output of the install/uninstall scripts, the `--version` /
+  `--help` / usage-failure contract of both binaries, search as an
+  unprivileged user (including the refusal outside the `omavrything` group),
+  JSON search output, the second-daemon refusal, D-Bus status where systemd is
+  available, and that uninstall leaves nothing behind. It also builds as the
+  invoking user under sudo so `target/` is not left with root-owned artifacts.
+
 ## [0.1.3] — 2026-10-11
 
 A security release. The defect was found during the marketplace review of 0.1.2,

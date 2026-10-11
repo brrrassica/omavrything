@@ -171,6 +171,7 @@ if [[ "$mode" == "system" ]]; then
   rm -f /usr/lib/sysusers.d/omavrything.conf
   rm -f /usr/share/dbus-1/system.d/tech.alatcerdas.omavrything.conf
   rm -f /usr/share/polkit-1/actions/tech.alatcerdas.omavrything.policy
+  rm -f /usr/share/man/man8/omavrythingd.8
   rm -rf /usr/share/omavrything
   rm -rf /usr/share/licenses/omavrything
   rm -rf /usr/share/doc/omavrything

@@ -34,6 +34,15 @@ install -m644 "$src/manifest.json" "$dest/manifest.json"
 install -m644 "$src"/shell/omavrything/*.qml "$dest/shell/omavrything/"
 echo "Installed plugin to $dest"
 
+# Validate the plugin with omarchy when available; fail loudly on a bad plugin.
+if command -v omarchy >/dev/null 2>&1; then
+  if ! (cd "$dest" && omarchy plugin validate >/dev/null 2>&1); then
+    echo "error: 'omarchy plugin validate' rejected the installed plugin" >&2
+    exit 1
+  fi
+  echo "Validated the plugin with 'omarchy plugin validate'."
+fi
+
 # The settings menu reads and writes the daemon config through the `omavry` CLI,
 # so it must be on PATH. Link the release binary into ~/.local/bin for dev use;
 # a packaged install already provides `omavry` on PATH, so use that instead.

@@ -63,7 +63,15 @@ Item {
   }
 
   readonly property string runtimeDir: Quickshell.env("XDG_RUNTIME_DIR") || "/tmp"
-  readonly property string socketPath: runtimeDir + "/omavrything.sock"
+  // Socket selection mirrors the CLI's connect_default(): prefer the system
+  // daemon's socket (/run/omavrything/omavrything.sock), fall back to the
+  // per-user socket in $XDG_RUNTIME_DIR (user-mode daemon). Resolved by
+  // socketProbe at startup and re-probed on every open() so a daemon that
+  // started after the shell is still found.
+  property string socketPath: runtimeDir + "/omavrything.sock"
+  // Set when open() is waiting for socketProbe to resolve the socket path
+  // before the Socket is allowed to connect.
+  property bool pendingOpen: false
   readonly property string queryFile: runtimeDir + "/omavrything-query"
 
   // Theme: shares the [menu] surface tokens.
@@ -95,7 +103,6 @@ Item {
 
   // Plugin lifecycle hooks, called by the shell host.
   function open(payloadJson) {
-    root.opened = true
     root.settingsOpen = false
     root.filterText = ""
     root.selectedIndex = 0
@@ -103,8 +110,18 @@ Item {
     root.results = []
     displayModel.clear()
     root.writeQuery("")
-    root.rebuild()
-    Qt.callLater(function() { input.forceActiveFocus() })
+    if (sock.connected) {
+      root.opened = true
+      root.rebuild()
+      Qt.callLater(function() { input.forceActiveFocus() })
+    } else {
+      // Resolve the daemon socket path before the Socket connects: binding
+      // `connected` to `opened` makes the Socket connect the moment opened
+      // flips, so the path must already be correct. socketProbe's
+      // onStreamFinished sets opened once the path is known.
+      root.pendingOpen = true
+      socketProbe.running = true
+    }
   }
 
   function close() {
@@ -309,6 +326,29 @@ Item {
     interval: 40
     repeat: false
     onTriggered: root.sendQuery()
+  }
+
+  // Probe which daemon socket exists before the Socket binds to a path. Runs
+  // once at startup so the path is correct before the first open(), and again
+  // on every open() while disconnected so a daemon that started later is found.
+  Process {
+    id: socketProbe
+    running: true
+    command: ["sh", "-c", "test -S /run/omavrything/omavrything.sock && echo system || echo user"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        root.socketPath = text.trim() === "system"
+          ? "/run/omavrything/omavrything.sock"
+          : root.runtimeDir + "/omavrything.sock"
+        if (root.pendingOpen) {
+          root.pendingOpen = false
+          root.opened = true
+          root.rebuild()
+          Qt.callLater(function() { input.forceActiveFocus() })
+        }
+      }
+    }
   }
 
   Socket {

@@ -51,7 +51,7 @@ The UX is openly inspired by [Voidtools Everything](https://www.voidtools.com/).
 
 ## Install
 
-Grab the latest release archive, or use the AUR package on Arch/Omarchy.
+Grab the latest release archive.
 
 **From a release** — download `omavrything-<version>-<arch>.zip` from the
 [releases page](https://github.com/brrrassica/omavrything/releases):
@@ -64,13 +64,8 @@ sudo ./scripts/install.sh --system   # daemon, CLI, systemd unit, D-Bus, polkit
 omarchy plugin enable tech.alatcerdas.omavrything --section center
 ```
 
-**From the AUR:**
-
-```sh
-yay -S omavrything
-omavrything-install-plugin
-omarchy plugin enable tech.alatcerdas.omavrything --section center
-```
+An AUR package is prepared under `packaging/` but is **not published yet**;
+build it locally with `makepkg -si` if you prefer a package-managed install.
 
 Then bind a hotkey in `~/.config/hypr/bindings.lua`:
 

@@ -108,6 +108,18 @@ sudo scripts/uninstall.sh       # the daemon, system integration, and plugin
 snapshot under `/var/lib/omavrything`. The release archive ships the script, so
 an archive install can be removed the same way.
 
+## 8. Diagnostics
+
+`scripts/doctor.sh` queries every component in one pass and prints a status
+report with remediation hints. Run it with `sudo` so it can inspect the system
+service, the socket, and the daemon's state:
+
+```sh
+sudo scripts/doctor.sh
+```
+
+The daemon also ships a man page: `man omavrythingd`.
+
 ## Next steps
 
 - [`omarchy-shell-integration.md`](omarchy-shell-integration.md) — the plugin

@@ -110,20 +110,71 @@ else
   bad "uninstall.sh does not guard /var/lib/omavrything behind --keep-state"
 fi
 
-# --- C1: the release archive ships uninstall.sh -----------------------------
+# --- C9: install/uninstall are idempotent -----------------------------------
+home="$tmp/home-c9"
+mkdir -p "$home"
+run_user() {
+  HOME="$home" XDG_CONFIG_HOME="$home/.config" XDG_BIN_HOME="$home/.local/bin" \
+    OMARCHY_LOG="$tmp/omarchy-c9.log" PATH="$fake_bin:$PATH" "$@"
+}
+if run_user "$pkg/scripts/install.sh" --user >/dev/null 2>&1 &&
+  run_user "$pkg/scripts/install.sh" --user >/dev/null 2>&1; then
+  ok "install.sh --user is idempotent"
+else
+  bad "install.sh --user is not idempotent"
+fi
+if run_user "$pkg/scripts/uninstall.sh" --user >/dev/null 2>&1 &&
+  run_user "$pkg/scripts/uninstall.sh" --user >/dev/null 2>&1; then
+  ok "uninstall.sh --user is idempotent"
+else
+  bad "uninstall.sh --user is not idempotent"
+fi
+
+# --- C11: doctor.sh prints a report and flags a missing install -------------
+out="$("$here/scripts/doctor.sh" 2>&1 || true)"
+if printf '%s' "$out" | grep -q 'omavrything doctor'; then
+  ok "doctor.sh prints a report"
+else
+  bad "doctor.sh did not print a report"
+fi
+if printf '%s' "$out" | grep -q '\[fail\]'; then
+  ok "doctor.sh flags a missing install"
+else
+  bad "doctor.sh did not flag the missing install"
+fi
+
+# --- C1/C6/C11: the release archive ships the expected files ----------------
 if [[ -x target/release/omavrythingd && -x target/release/omavry ]]; then
   if scripts/package-release.sh --no-build >/dev/null 2>&1; then
     archive="$(ls -1 dist/omavrything-*.zip 2>/dev/null | tail -n1 || true)"
-    if [[ -n "$archive" ]] && unzip -l "$archive" | grep -q 'scripts/uninstall.sh'; then
-      ok "the release archive contains scripts/uninstall.sh"
-    else
-      bad "the release archive does not contain scripts/uninstall.sh"
-    fi
+    # Capture the listing first: `unzip -l | grep -q` would SIGPIPE unzip when
+    # grep exits on the first match, which `set -o pipefail` turns into a failure.
+    listing="$(unzip -l "$archive" 2>/dev/null || true)"
+    for entry in scripts/uninstall.sh data/man/omavrythingd.8 scripts/doctor.sh; do
+      if [[ -n "$listing" ]] && grep -qF "$entry" <<<"$listing"; then
+        ok "the release archive contains $entry"
+      else
+        bad "the release archive does not contain $entry"
+      fi
+    done
   else
     bad "scripts/package-release.sh --no-build failed"
   fi
 else
-  printf 'skip - C1 archive check (build target/release first)\n'
+  printf 'skip - archive check (build target/release first)\n'
+fi
+
+# --- C12: the overlay QML targets the system socket --------------------------
+# Regression guard (2026-10-12): the widget used to hardcode
+# $XDG_RUNTIME_DIR/omavrything.sock, which the system daemon never creates, so
+# the overlay always showed "Search daemon unavailable". The QML must select
+# the system socket the same way the CLI's connect_default() does, and must
+# resolve the path before the Socket connects (probe-before-connect).
+if grep -q '/run/omavrything/omavrything.sock' "$here/shell/omavrything/SearchOverlay.qml" &&
+  grep -q 'socketProbe' "$here/shell/omavrything/SearchOverlay.qml"; then
+  ok "overlay QML targets the system socket via a startup probe"
+else
+  bad "overlay QML does not target the system socket (widget shows 'Search daemon unavailable')"
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

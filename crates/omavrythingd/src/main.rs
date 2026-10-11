@@ -1069,6 +1069,10 @@ impl RawArgs {
                         raw.log_level = Some(value);
                     }
                 }
+                "-V" | "--version" => {
+                    println!("omavrythingd {VERSION}");
+                    std::process::exit(0);
+                }
                 "-h" | "--help" => {
                     print_help();
                     std::process::exit(0);
@@ -1195,6 +1199,7 @@ fn print_help() {
            --no-ntfs             Disable NTFS partition detection and indexing\n\
            --no-metadata         Skip per-file size/mtime stats (names-only; faster scan)\n\
            --log-level <level>   Log level: error, warn, info, debug, trace (default: info)\n\
+           -V, --version         Show the version\n\
            -h, --help            Show this help"
     );
 }

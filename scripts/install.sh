@@ -36,6 +36,10 @@ else
   exit 1
 fi
 
+# The version reported by the manifest, used for the install summary.
+version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+  "$here/manifest.json" 2>/dev/null | head -n1)"
+
 install_user() {
   # The destination mirrors the repository layout (root manifest.json plus
   # shell/omavrything/), which is exactly what `omarchy plugin add` produces.
@@ -45,6 +49,15 @@ install_user() {
   install -m644 "$plugin_src/manifest.json" "$dest/manifest.json"
   install -m644 "$plugin_src"/shell/omavrything/*.qml "$dest/shell/omavrything/"
   echo "Installed shell plugin to $dest"
+
+  # Validate the plugin with omarchy when available; fail loudly on a bad plugin.
+  if command -v omarchy >/dev/null 2>&1; then
+    if ! (cd "$dest" && omarchy plugin validate >/dev/null 2>&1); then
+      echo "error: 'omarchy plugin validate' rejected the installed plugin" >&2
+      exit 1
+    fi
+    echo "Validated the plugin with 'omarchy plugin validate'."
+  fi
 
   local user_bin="${XDG_BIN_HOME:-$HOME/.local/bin}"
   mkdir -p "$user_bin"
@@ -74,6 +87,10 @@ install_system() {
     exit 1
   fi
 
+  # Clear stale files from a previous version so an upgrade leaves nothing
+  # behind; the plugin tree is replaced wholesale below.
+  rm -rf /usr/share/omavrything
+
   install -Dm755 "$bindir/omavrythingd" /usr/bin/omavrythingd
   install -Dm755 "$bindir/omavry" /usr/bin/omavry
 
@@ -85,6 +102,8 @@ install_system() {
     /usr/share/dbus-1/system.d/tech.alatcerdas.omavrything.conf
   install -Dm644 "$here/data/polkit/tech.alatcerdas.omavrything.policy" \
     /usr/share/polkit-1/actions/tech.alatcerdas.omavrything.policy
+  install -Dm644 "$here/data/man/omavrythingd.8" \
+    /usr/share/man/man8/omavrythingd.8
 
   # Do not clobber an existing config on upgrade.
   if [[ ! -e /etc/omavrything/config.toml ]]; then
@@ -104,12 +123,26 @@ install_system() {
 
   install -Dm644 "$here/LICENSE" /usr/share/licenses/omavrything/LICENSE
   install -d /usr/share/doc/omavrything
-  install -m644 "$here/README.md" "$here"/docs/*.md /usr/share/doc/omavrything/
+  install -m644 "$here/README.md" /usr/share/doc/omavrything/README.md
+  # docs/README.md is the documentation index; install it under a distinct name
+  # so it does not collide with the project README (install refuses to overwrite
+  # a file it just created in the same invocation).
+  for doc in "$here"/docs/*.md; do
+    name="$(basename "$doc")"
+    [[ "$name" == "README.md" ]] && name="docs-index.md"
+    install -m644 "$doc" "/usr/share/doc/omavrything/$name"
+  done
 
   systemd-sysusers >/dev/null 2>&1 || true
   systemctl daemon-reload >/dev/null 2>&1 || true
 
-  echo "Installed omavrything system-wide."
+  # Health check: the installed daemon must run. Fail loudly if it does not.
+  if ! /usr/bin/omavrythingd --version >/dev/null 2>&1; then
+    echo "error: the installed omavrythingd failed to run" >&2
+    exit 1
+  fi
+
+  echo "Installed omavrything ${version:-unknown} system-wide."
   echo "Enable the daemon with: sudo systemctl enable --now omavrythingd"
   echo "Add your user to the socket group with: sudo usermod -aG omavrything \"\$USER\""
 }
