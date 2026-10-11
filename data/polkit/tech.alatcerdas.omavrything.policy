@@ -4,7 +4,7 @@
  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
 <policyconfig>
   <vendor>omavrything</vendor>
-  <action id="org.omarchy.omavrything.control">
+  <action id="tech.alatcerdas.omavrything.control">
     <description>Control the omavrything index daemon</description>
     <message>Authentication is required to control the omavrything index daemon</message>
     <defaults>

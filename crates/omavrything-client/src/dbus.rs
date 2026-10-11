@@ -6,9 +6,9 @@ use zbus::proxy;
 
 /// The control interface exposed by `omavrythingd` on the system bus.
 #[proxy(
-    interface = "org.omarchy.omavrything.Manager",
-    default_service = "org.omarchy.omavrything",
-    default_path = "/org/omarchy/omavrything"
+    interface = "tech.alatcerdas.omavrything.Manager",
+    default_service = "tech.alatcerdas.omavrything",
+    default_path = "/tech/alatcerdas/omavrything"
 )]
 pub trait Manager {
     /// Daemon status: version, entries, roots, uptime.

@@ -66,10 +66,10 @@ install_system() {
     /usr/lib/systemd/system/omavrythingd.service
   install -Dm644 "$here/data/sysusers/omavrything.conf" \
     /usr/lib/sysusers.d/omavrything.conf
-  install -Dm644 "$here/data/dbus/org.omarchy.omavrything.conf" \
-    /usr/share/dbus-1/system.d/org.omarchy.omavrything.conf
-  install -Dm644 "$here/data/polkit/org.omarchy.omavrything.policy" \
-    /usr/share/polkit-1/actions/org.omarchy.omavrything.policy
+  install -Dm644 "$here/data/dbus/tech.alatcerdas.omavrything.conf" \
+    /usr/share/dbus-1/system.d/tech.alatcerdas.omavrything.conf
+  install -Dm644 "$here/data/polkit/tech.alatcerdas.omavrything.policy" \
+    /usr/share/polkit-1/actions/tech.alatcerdas.omavrything.policy
 
   # Do not clobber an existing config on upgrade.
   if [[ ! -e /etc/omavrything/config.toml ]]; then

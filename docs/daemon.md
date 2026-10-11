@@ -164,7 +164,7 @@ results:
 ## D-Bus control interface
 
 Control and status are exposed on the system bus as
-`org.omarchy.omavrything.Manager` at `/org/omarchy/omavrything`:
+`tech.alatcerdas.omavrything.Manager` at `/tech/alatcerdas/omavrything`:
 
 | Method | Description |
 | --- | --- |
@@ -183,7 +183,7 @@ non-empty `root` must be one of the configured roots.
 Signals: `IndexChanged(entries)` and `ScanProgress(phase, entries)`.
 
 The read-only methods are open to all; `Rescan`, `SetConfig`, and `MountNtfs`
-are gated by the `org.omarchy.omavrything.control` polkit action.
+are gated by the `tech.alatcerdas.omavrything.control` polkit action.
 
 The daemon can only own the well-known name if the system-bus policy is
 installed. Without it the daemon logs `Request to own name refused by policy`
@@ -191,10 +191,10 @@ and continues serving the socket search path. Install the policy and the polkit
 action, then reload D-Bus:
 
 ```sh
-sudo install -Dm644 data/dbus/org.omarchy.omavrything.conf \
-  /usr/share/dbus-1/system.d/org.omarchy.omavrything.conf
-sudo install -Dm644 data/polkit/org.omarchy.omavrything.policy \
-  /usr/share/polkit-1/actions/org.omarchy.omavrything.policy
+sudo install -Dm644 data/dbus/tech.alatcerdas.omavrything.conf \
+  /usr/share/dbus-1/system.d/tech.alatcerdas.omavrything.conf
+sudo install -Dm644 data/polkit/tech.alatcerdas.omavrything.policy \
+  /usr/share/polkit-1/actions/tech.alatcerdas.omavrything.policy
 sudo systemctl reload dbus
 ```
 
@@ -222,7 +222,7 @@ omavry config set <key> <value>    # set a value (D-Bus, polkit)
 ```
 
 `search` and `status` are read-only; `rescan`, `mount`, and `config set` are
-gated by the `org.omarchy.omavrything.control` polkit action and prompt for
+gated by the `tech.alatcerdas.omavrything.control` polkit action and prompt for
 authentication. Every subcommand exits non-zero on failure, so it composes with
 shell scripts.
 

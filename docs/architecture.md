@@ -187,9 +187,9 @@ flowchart TD
 
 ### 8.2 D-Bus (control and status)
 
-- **Bus:** system bus. **Name:** `org.omarchy.omavrything`.
-  **Path:** `/org/omarchy/omavrything`. **Interface:**
-  `org.omarchy.omavrything.Manager`.
+- **Bus:** system bus. **Name:** `tech.alatcerdas.omavrything`.
+  **Path:** `/tech/alatcerdas/omavrything`. **Interface:**
+  `tech.alatcerdas.omavrything.Manager`.
 
 | Member | Kind | Description |
 | --- | --- | --- |
@@ -202,7 +202,7 @@ flowchart TD
 | `ScanProgress` | signal | Emitted during scans. |
 
 - **polkit:** control methods (`Rescan`, `SetConfig`, `MountNtfs`) are gated by a
-  polkit action `org.omarchy.omavrything.control` (`auth_admin_keep`).
+  polkit action `tech.alatcerdas.omavrything.control` (`auth_admin_keep`).
 
 ## 9. NTFS
 

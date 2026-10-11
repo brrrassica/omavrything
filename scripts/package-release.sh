@@ -50,8 +50,8 @@ install -m755 target/release/omavry "$stage/bin/omavry"
 # PKGBUILD can share it.
 install -Dm644 data/systemd/omavrythingd.service "$stage/data/systemd/omavrythingd.service"
 install -Dm644 data/sysusers/omavrything.conf "$stage/data/sysusers/omavrything.conf"
-install -Dm644 data/dbus/org.omarchy.omavrything.conf "$stage/data/dbus/org.omarchy.omavrything.conf"
-install -Dm644 data/polkit/org.omarchy.omavrything.policy "$stage/data/polkit/org.omarchy.omavrything.policy"
+install -Dm644 data/dbus/tech.alatcerdas.omavrything.conf "$stage/data/dbus/tech.alatcerdas.omavrything.conf"
+install -Dm644 data/polkit/tech.alatcerdas.omavrything.policy "$stage/data/polkit/tech.alatcerdas.omavrything.policy"
 install -Dm644 data/config/config.toml "$stage/data/config/config.toml"
 
 # The omarchy-shell plugin. The manifest sits at the archive root, exactly where

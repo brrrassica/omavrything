@@ -53,8 +53,8 @@ cargo build --release --workspace
 | `/usr/bin/omavrything-install-plugin` | Copies the shell plugin into the user's config. |
 | `/usr/lib/systemd/system/omavrythingd.service` | Hardened system service. |
 | `/usr/lib/sysusers.d/omavrything.conf` | The dedicated `omavrything` user/group. |
-| `/usr/share/dbus-1/system.d/org.omarchy.omavrything.conf` | System-bus policy. |
-| `/usr/share/polkit-1/actions/org.omarchy.omavrything.policy` | Polkit control action. |
+| `/usr/share/dbus-1/system.d/tech.alatcerdas.omavrything.conf` | System-bus policy. |
+| `/usr/share/polkit-1/actions/tech.alatcerdas.omavrything.policy` | Polkit control action. |
 | `/etc/omavrything/config.toml` | Default daemon configuration. |
 | `/usr/share/omavrything/shell/omavrything/` | The `omarchy-shell` plugin. |
 | `/usr/share/doc/omavrything/` | Documentation. |

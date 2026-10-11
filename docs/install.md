@@ -61,10 +61,10 @@ Control and status are exposed on the system bus. The daemon can only own the
 well-known name if the system-bus policy is installed:
 
 ```sh
-sudo install -Dm644 data/dbus/org.omarchy.omavrything.conf \
-  /usr/share/dbus-1/system.d/org.omarchy.omavrything.conf
-sudo install -Dm644 data/polkit/org.omarchy.omavrything.policy \
-  /usr/share/polkit-1/actions/org.omarchy.omavrything.policy
+sudo install -Dm644 data/dbus/tech.alatcerdas.omavrything.conf \
+  /usr/share/dbus-1/system.d/tech.alatcerdas.omavrything.conf
+sudo install -Dm644 data/polkit/tech.alatcerdas.omavrything.policy \
+  /usr/share/polkit-1/actions/tech.alatcerdas.omavrything.policy
 sudo systemctl reload dbus
 ```
 

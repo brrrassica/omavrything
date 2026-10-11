@@ -1,8 +1,8 @@
-//! D-Bus control interface (`org.omarchy.omavrything.Manager`).
+//! D-Bus control interface (`tech.alatcerdas.omavrything.Manager`).
 //!
 //! The search hot path stays on the Unix socket; this interface carries control
 //! and status. It is served on the system bus and gated by the bus policy and
-//! the `org.omarchy.omavrything.control` polkit action.
+//! the `tech.alatcerdas.omavrything.control` polkit action.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -21,9 +21,9 @@ use crate::ntfs::{self, NtfsPolicy};
 use crate::polkit;
 
 /// The well-known bus name.
-pub const SERVICE_NAME: &str = "org.omarchy.omavrything";
+pub const SERVICE_NAME: &str = "tech.alatcerdas.omavrything";
 /// The object path the manager is registered at.
-pub const OBJECT_PATH: &str = "/org/omarchy/omavrything";
+pub const OBJECT_PATH: &str = "/tech/alatcerdas/omavrything";
 
 /// An index event forwarded to the D-Bus signal task.
 #[derive(Debug, Clone)]
@@ -34,7 +34,7 @@ pub enum IndexEvent {
     ScanProgress { phase: String, entries: u64 },
 }
 
-/// The `org.omarchy.omavrything.Manager` interface.
+/// The `tech.alatcerdas.omavrything.Manager` interface.
 pub struct Manager {
     index: Arc<RwLock<Index>>,
     config: Arc<SharedConfig>,
@@ -61,7 +61,7 @@ impl Manager {
     }
 }
 
-#[interface(name = "org.omarchy.omavrything.Manager")]
+#[interface(name = "tech.alatcerdas.omavrything.Manager")]
 impl Manager {
     /// Daemon status: version, entries, roots, memory, scan state, uptime.
     async fn get_status(&self) -> HashMap<String, String> {

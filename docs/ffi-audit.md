@@ -91,7 +91,7 @@ mount), and `ProtectSystem=strict` makes the rest of the filesystem read-only.
 - **Peer identity** is enforced with `SO_PEERCRED`; only root, the daemon's own
   uid, and members of the `omavrything` group may connect.
 - **Control methods** (`Rescan`, `SetConfig`, `MountNtfs`) are gated by the
-  `org.omarchy.omavrything.control` polkit action.
+  `tech.alatcerdas.omavrything.control` polkit action.
 
 ## 5. Findings and follow-ups
 

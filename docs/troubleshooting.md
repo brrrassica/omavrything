@@ -68,15 +68,15 @@ allowed to connect.
 **Symptom:** `omavry status` or `omavry config` fails, and the log shows
 `Request to own name refused by policy`.
 
-The daemon can only own the well-known name `org.omarchy.omavrything` if the
+The daemon can only own the well-known name `tech.alatcerdas.omavrything` if the
 system-bus policy is installed. Install the policy and the polkit action, then
 reload D-Bus:
 
 ```sh
-sudo install -Dm644 data/dbus/org.omarchy.omavrything.conf \
-  /usr/share/dbus-1/system.d/org.omarchy.omavrything.conf
-sudo install -Dm644 data/polkit/org.omarchy.omavrything.policy \
-  /usr/share/polkit-1/actions/org.omarchy.omavrything.policy
+sudo install -Dm644 data/dbus/tech.alatcerdas.omavrything.conf \
+  /usr/share/dbus-1/system.d/tech.alatcerdas.omavrything.conf
+sudo install -Dm644 data/polkit/tech.alatcerdas.omavrything.policy \
+  /usr/share/polkit-1/actions/tech.alatcerdas.omavrything.policy
 sudo systemctl reload dbus
 ```
 
@@ -85,7 +85,7 @@ A **user-run** daemon cannot own the name at all (the policy only permits the
 control. Use the system service for `status`/`config`/`rescan`/`mount`.
 
 Control methods (`Rescan`, `SetConfig`, `MountNtfs`) are gated by the
-`org.omarchy.omavrything.control` polkit action and prompt for authentication.
+`tech.alatcerdas.omavrything.control` polkit action and prompt for authentication.
 
 ## inotify watch limits
 

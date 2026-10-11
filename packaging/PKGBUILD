@@ -67,10 +67,10 @@ package() {
     "$pkgdir/usr/lib/sysusers.d/omavrything.conf"
 
   # D-Bus system-bus policy and the polkit control action.
-  install -Dm644 data/dbus/org.omarchy.omavrything.conf \
-    "$pkgdir/usr/share/dbus-1/system.d/org.omarchy.omavrything.conf"
-  install -Dm644 data/polkit/org.omarchy.omavrything.policy \
-    "$pkgdir/usr/share/polkit-1/actions/org.omarchy.omavrything.policy"
+  install -Dm644 data/dbus/tech.alatcerdas.omavrything.conf \
+    "$pkgdir/usr/share/dbus-1/system.d/tech.alatcerdas.omavrything.conf"
+  install -Dm644 data/polkit/tech.alatcerdas.omavrything.policy \
+    "$pkgdir/usr/share/polkit-1/actions/tech.alatcerdas.omavrything.policy"
 
   # Default configuration (a backup is kept on upgrade by pacman).
   install -Dm644 data/config/config.toml "$pkgdir/etc/omavrything/config.toml"

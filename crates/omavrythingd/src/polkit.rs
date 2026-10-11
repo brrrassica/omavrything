@@ -1,7 +1,7 @@
 //! polkit authorization for the D-Bus control methods.
 //!
 //! Control methods (`Rescan`, `SetConfig`, `MountNtfs`) are gated by the
-//! `org.omarchy.omavrything.control` action. Root is always allowed; other
+//! `tech.alatcerdas.omavrything.control` action. Root is always allowed; other
 //! callers are checked against the polkit authority, and denied if it is
 //! unavailable.
 
@@ -11,7 +11,7 @@ use zbus::Connection;
 use zbus::zvariant::Value;
 
 /// The polkit action that gates control methods.
-pub const ACTION: &str = "org.omarchy.omavrything.control";
+pub const ACTION: &str = "tech.alatcerdas.omavrything.control";
 
 /// Whether `uid` is authorized for the control action.
 pub async fn is_authorized(connection: &Connection, uid: u32) -> bool {
