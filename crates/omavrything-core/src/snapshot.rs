@@ -292,13 +292,11 @@ pub fn write_atomic(bytes: &[u8], path: &Path) -> io::Result<()> {
     }
     let tmp = with_suffix(path, ".tmp");
     {
-        let mut file = File::create(&tmp)?;
-        // `File::create` applies `0666 & ~umask`, and the rename below publishes
-        // this inode as the snapshot, so the temp file's mode becomes the
-        // snapshot's mode. Set it before the rename: otherwise a private `0600`
-        // snapshot silently widens to `0644` under umask `022` on the next
-        // write, and other local users can read the indexed path names.
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(SNAPSHOT_MODE))?;
+        // The rename below publishes this inode as the snapshot, so the temp
+        // file's mode becomes the snapshot's mode. It is created owner-only, with
+        // the mode applied by `open` rather than by a later `chmod`, so that it is
+        // never readable by anyone else -- not even for an instant.
+        let mut file = crate::private_file::open_private(&tmp, SNAPSHOT_MODE)?;
         file.write_all(bytes)?;
         file.sync_all()?;
     }

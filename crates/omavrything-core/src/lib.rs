@@ -6,6 +6,7 @@ pub mod idle;
 pub mod index;
 pub mod live;
 pub mod mounts;
+pub mod private_file;
 pub mod protocol;
 pub mod query;
 pub mod scan;

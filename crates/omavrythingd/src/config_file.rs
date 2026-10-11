@@ -10,6 +10,7 @@
 //! file on the next start. Keeping the two apart means the shipped
 //! `/etc/omavrything/config.toml` is never rewritten by the daemon.
 
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -178,16 +179,23 @@ impl FileConfig {
                 .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
         }
         let tmp = path.with_extension("toml.tmp");
-        // `fs::write` creates with `0666 & ~umask` and the rename below publishes
-        // that mode as the config's, so set it explicitly rather than letting the
-        // umask decide. An existing file keeps its mode; a new one is owner-only,
-        // since the state config records the indexed roots and exclusions.
+        // An existing config keeps its mode; a new one is owner-only, since the
+        // state config records the indexed roots and exclusions.
         let mode = std::fs::metadata(path)
             .map(|m| m.permissions().mode() & 0o777)
             .unwrap_or(0o600);
-        std::fs::write(&tmp, text).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))
-            .map_err(|e| format!("cannot set the mode of {}: {e}", tmp.display()))?;
+        // The temp file carries its final mode from the moment it exists, rather
+        // than being written and tightened afterwards: another local process could
+        // otherwise open it while it was still `0666 & ~umask` and keep read access
+        // to the document through its descriptor. See `private_file`.
+        {
+            let mut file = omavrything_core::private_file::open_private(&tmp, mode)
+                .map_err(|e| format!("cannot create {}: {e}", tmp.display()))?;
+            file.write_all(text.as_bytes())
+                .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+            file.sync_all()
+                .map_err(|e| format!("cannot flush {}: {e}", tmp.display()))?;
+        }
         std::fs::rename(&tmp, path).map_err(|e| format!("cannot replace {}: {e}", path.display()))
     }
 }
@@ -336,6 +344,30 @@ background_opacity = 0.6
         assert_eq!(reloaded.background_opacity, Some(0.4));
         // Unset keys are omitted, not written as null.
         assert!(reloaded.roots.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_new_state_config_is_owner_only_and_an_existing_mode_is_kept() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn mode_of(path: &Path) -> u32 {
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+
+        let dir = temp_dir("save-mode");
+        let path = dir.join("state.toml");
+        let config = FileConfig::default();
+
+        // A config that does not exist yet is created owner-only: it records the
+        // indexed roots and exclusions.
+        config.save(&path).unwrap();
+        assert_eq!(mode_of(&path), 0o600);
+
+        // An existing file keeps the mode its owner chose, including a widened one.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        config.save(&path).unwrap();
+        assert_eq!(mode_of(&path), 0o640);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

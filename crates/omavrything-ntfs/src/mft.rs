@@ -15,6 +15,10 @@ pub const ATTR_DATA: u32 = 0x80;
 /// The end-of-attributes marker.
 pub const ATTR_END: u32 = 0xFFFF_FFFF;
 
+/// The fixed part of an attribute header: the type, the length, the
+/// resident/non-resident flag at +8, and the name fields this parser reads.
+const ATTR_HEADER_LEN: usize = 0x10;
+
 /// The MFT record number of the root directory.
 pub const ROOT_RECORD: u64 = 5;
 
@@ -74,7 +78,11 @@ pub fn apply_fixups(record: &mut [u8], sector_size: usize) -> bool {
     let usn = u16::from_le_bytes([record[usa_off], record[usa_off + 1]]);
     for i in 1..usa_count {
         let end = i * sector_size;
-        if end > record.len() {
+        // `sector_size` comes from the volume's boot sector, and `end - 2` below
+        // underflows if it is smaller than two bytes. Guard it here rather than
+        // relying on the caller: a one-byte sector is nonsense, but it is only
+        // rejected as zero today, and `parse` accepts any other value.
+        if end < 2 || end > record.len() {
             return false;
         }
         let found = u16::from_le_bytes([record[end - 2], record[end - 1]]);
@@ -111,7 +119,12 @@ pub fn parse_record(bytes: &[u8], number: u64) -> Option<MftRecord> {
             break;
         }
         let alen = u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap()) as usize;
-        if alen < 8 || off + alen > end {
+        // An attribute is at least `ATTR_HEADER_LEN` bytes long. Requiring only
+        // `alen >= 8` accepts an attribute that ends exactly on `end` and then
+        // reads the header fields below past the end of the record: an 8-byte
+        // attribute filling the last bytes of a record reads `bytes[end]`, which
+        // is out of bounds and panics the indexing thread.
+        if alen < ATTR_HEADER_LEN || off + alen > end {
             break;
         }
         let non_resident = bytes[off + 8] != 0;
@@ -139,7 +152,9 @@ pub fn parse_record(bytes: &[u8], number: u64) -> Option<MftRecord> {
             }
         } else if atype == ATTR_DATA {
             // Only the unnamed `$DATA` stream is the file's contents; named
-            // streams (e.g. `Zone.Identifier`) must not override its size.
+            // streams (e.g. `Zone.Identifier`) must not override its size. The
+            // name length at +9 sits inside the header, so it is in bounds now
+            // that `alen >= ATTR_HEADER_LEN` is enforced above.
             if bytes[off + 9] != 0 {
                 off += alen;
                 continue;
@@ -303,5 +318,46 @@ mod tests {
         assert_eq!(f.real_size, 1234);
         assert_eq!(f.mtime, 1_700_000_000);
         assert!(!f.is_dir);
+    }
+
+    #[test]
+    fn an_attribute_ending_on_the_record_end_does_not_read_past_it() {
+        // The only attribute is an 8-byte stub in the last eight bytes of the
+        // record, so its non-resident flag would sit at `bytes[0x40]`, one past
+        // the end of the buffer. Used to panic with an index-out-of-bounds.
+        let mut rec = vec![0u8; 0x40];
+        rec[0..4].copy_from_slice(b"FILE");
+        rec[0x16..0x18].copy_from_slice(&1u16.to_le_bytes());
+        rec[0x14..0x16].copy_from_slice(&0x38u16.to_le_bytes());
+        rec[0x18..0x1C].copy_from_slice(&0x40u32.to_le_bytes());
+        rec[0x38..0x3C].copy_from_slice(&ATTR_DATA.to_le_bytes());
+        rec[0x3C..0x40].copy_from_slice(&8u32.to_le_bytes());
+        assert!(parse_record(&rec, 1).is_some());
+    }
+
+    #[test]
+    fn a_truncated_data_attribute_does_not_read_its_name_length_past_the_end() {
+        // As above, but the stub is nine bytes and typed `$DATA`, so the read of
+        // the name length at +9 is what would run off the record.
+        let mut rec = vec![0u8; 0x40];
+        rec[0..4].copy_from_slice(b"FILE");
+        rec[0x16..0x18].copy_from_slice(&1u16.to_le_bytes());
+        rec[0x14..0x16].copy_from_slice(&0x37u16.to_le_bytes());
+        rec[0x18..0x1C].copy_from_slice(&0x40u32.to_le_bytes());
+        rec[0x37..0x3B].copy_from_slice(&ATTR_DATA.to_le_bytes());
+        rec[0x3B..0x3F].copy_from_slice(&9u32.to_le_bytes());
+        assert!(parse_record(&rec, 1).is_some());
+    }
+
+    #[test]
+    fn rejects_a_sector_size_that_would_underflow_the_fixup_offset() {
+        // A one-byte sector makes the first fixup target `record[end - 2]` with
+        // `end == 1`, a usize underflow. Only zero is rejected today, so the
+        // guard has to live in `apply_fixups` itself.
+        let mut rec = vec![0u8; 0x100];
+        rec[0x04..0x06].copy_from_slice(&0x30u16.to_le_bytes());
+        rec[0x06..0x08].copy_from_slice(&2u16.to_le_bytes());
+        assert!(!apply_fixups(&mut rec, 1));
+        assert!(!apply_fixups(&mut rec, 0));
     }
 }

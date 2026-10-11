@@ -491,6 +491,12 @@ fn run_scheduler(
 
 /// Detect NTFS partitions at startup: auto-mount and index previously indexed
 /// ones, and log newly seen ones as offers.
+/// Run `job`, converting a panic into `Err` so that one bad input cannot stop a
+/// whole startup pass.
+fn contain_panic<T>(job: impl FnOnce() -> T) -> Result<T, ()> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).map_err(|_| ())
+}
+
 pub(crate) fn run_ntfs_startup(index: Arc<RwLock<Index>>, policy: Arc<Mutex<ntfs::NtfsPolicy>>) {
     {
         let p = policy.lock().unwrap_or_else(|e| e.into_inner());
@@ -516,16 +522,25 @@ pub(crate) fn run_ntfs_startup(index: Arc<RwLock<Index>>, policy: Arc<Mutex<ntfs
             );
             continue;
         }
-        match ntfs::mount_index_and_remember(&index, &policy, part) {
-            Ok(mount_point) => info!(
+        // Parsing reads attacker-controlled on-disk structures. Contain a panic to
+        // this one partition: without it, a single malformed volume unwinds the
+        // whole startup thread and no later partition is indexed at all. The index
+        // and policy locks are reached through `unwrap_or_else(|e| e.into_inner())`
+        // everywhere, so a lock poisoned by a contained panic stays usable.
+        match contain_panic(|| ntfs::mount_index_and_remember(&index, &policy, part)) {
+            Ok(Ok(mount_point)) => info!(
                 device = %part.device.display(),
                 mount_point = %mount_point.display(),
                 "ntfs: indexed"
             ),
-            Err(err) => error!(
+            Ok(Err(err)) => error!(
                 device = %part.device.display(),
                 error = %err,
                 "ntfs: failed to index"
+            ),
+            Err(()) => error!(
+                device = %part.device.display(),
+                "ntfs: panic while indexing; skipping this partition"
             ),
         }
     }
@@ -1226,5 +1241,13 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(line, "hello");
+    }
+
+    #[test]
+    fn contain_panic_turns_a_panic_into_an_error() {
+        // The NTFS startup pass uses this so that a malformed volume cannot unwind
+        // the thread and stop the remaining partitions from being indexed.
+        assert_eq!(contain_panic(|| 7), Ok(7));
+        assert!(contain_panic(|| panic!("malformed volume")).is_err());
     }
 }
