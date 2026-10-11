@@ -4,6 +4,40 @@ Notable changes to `omavrything`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] — 2026-10-11
+
+A security release. Both defects were found during the marketplace review of
+0.1.1.
+
+### Security
+
+- **The index snapshot and the state configuration were group- and
+  world-readable while being written.** Both are written to a temporary file that
+  is renamed into place, and that temporary file was created as `0666 & ~umask`
+  (`0644` under the usual `022`), with the mode corrected by a later `chmod`.
+  Permissions are checked only when a file is *opened*, so another local process
+  that opened the temporary file during the interval between the two kept read
+  access to everything written through its descriptor, however the mode ended up.
+  The snapshot lists the path names and metadata of every indexed file, so this
+  exposed the user's file list; the state configuration exposes the indexed roots
+  and exclusions. Both files are now created with their final mode, so the
+  interval does not exist. Reported by @HANCORE-linux.
+- **A malformed NTFS record could stop the indexer.** `parse_record` accepted an
+  eight-byte attribute ending exactly on the record's last used byte and then read
+  the attribute header past the end of the record, which panicked the NTFS startup
+  thread and left the remaining partitions unindexed. The read of a truncated
+  `$DATA` attribute ran off the end in the same way, and a one-byte sector size in
+  a crafted boot sector underflowed the update-sequence fixup offsets. All three
+  reads are now bounds-checked, and a panic while parsing one partition is
+  contained so the other partitions are still indexed. Reported by
+  @HANCORE-linux.
+
+### Changed
+
+- `omavrything_core::private_file::open_private` is now the single implementation
+  of the create-with-final-mode pattern, used by both the snapshot and the state
+  configuration, so the two cannot drift apart again.
+
 ## [0.1.1] — 2026-10-11
 
 Packaging and identity release: the project is now installable from the Omarchy
@@ -62,5 +96,6 @@ Then install 0.1.1, run `omavrything-install-plugin`, and enable
 First release: the `omavrythingd` index daemon, the `omavry` CLI, and the
 `omarchy-shell` search plugin (bar widget, overlay, service).
 
+[0.1.2]: https://github.com/brrrassica/omavrything/releases/tag/v0.1.2
 [0.1.1]: https://github.com/brrrassica/omavrything/releases/tag/v0.1.1
 [0.1.0]: https://github.com/brrrassica/omavrything/releases/tag/v0.1.0

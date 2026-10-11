@@ -1,9 +1,9 @@
 <div class="hero">
 <h1>omavrything</h1>
 <p class="tagline">Instant, index-backed file search: "Everything" built for Omarchy.</p>
-<p class="lede">A search bar in your <code>omarchy-shell</code>. Start typing and a translucent scratchpad of results drops over whatever you are doing, backed by a daemon that keeps every mounted filesystem indexed in memory.</p>
+<p class="lede">A search bar in your <code>omarchy-shell</code>. Start typing and a scratchpad pane of results drops over whatever you are doing, backed by a daemon that keeps every mounted filesystem indexed in memory.</p>
 <div class="badges">
-<span class="badge ok">v0.1.1</span>
+<span class="badge ok">v0.1.2</span>
 <span class="badge">Omarchy Quattro 4.x</span>
 <span class="badge">Quickshell / Qt</span>
 <span class="badge">MIT</span>
