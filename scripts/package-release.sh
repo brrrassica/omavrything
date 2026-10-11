@@ -9,16 +9,24 @@
 #   docs/           user documentation
 #   README.md, LICENSE
 #
-# Usage: scripts/package-release.sh [version]
+# Usage: scripts/package-release.sh [--no-build] [version]
 # The version defaults to the workspace version in Cargo.toml. The archive is
 # what the GitHub release workflow uploads; running it locally verifies the
-# release can be assembled before a tag is pushed.
+# release can be assembled before a tag is pushed. --no-build reuses the
+# existing target/release binaries instead of rebuilding.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$here"
 
-version="${1:-}"
+build=1
+version=""
+for arg in "$@"; do
+  case "$arg" in
+    --no-build) build=0 ;;
+    *) version="$arg" ;;
+  esac
+done
 if [[ -z "$version" ]]; then
   version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
 fi
@@ -36,8 +44,10 @@ archive="$dist/$name.zip"
 echo "Packaging $name"
 
 # Build the release binaries. --locked keeps the build reproducible against the
-# committed Cargo.lock.
-cargo build --release --locked --workspace
+# committed Cargo.lock. --no-build reuses the existing target/release binaries.
+if [[ "$build" == 1 ]]; then
+  cargo build --release --locked --workspace
+fi
 
 rm -rf "$stage"
 mkdir -p "$stage"/{bin,data,shell,scripts,docs}
@@ -53,6 +63,7 @@ install -Dm644 data/sysusers/omavrything.conf "$stage/data/sysusers/omavrything.
 install -Dm644 data/dbus/tech.alatcerdas.omavrything.conf "$stage/data/dbus/tech.alatcerdas.omavrything.conf"
 install -Dm644 data/polkit/tech.alatcerdas.omavrything.policy "$stage/data/polkit/tech.alatcerdas.omavrything.policy"
 install -Dm644 data/config/config.toml "$stage/data/config/config.toml"
+install -Dm644 data/man/omavrythingd.8 "$stage/data/man/omavrythingd.8"
 
 # The omarchy-shell plugin. The manifest sits at the archive root, exactly where
 # the marketplace and `omarchy plugin validate` expect it, so the extracted
@@ -64,9 +75,11 @@ install -Dm644 shell/omavrything/Service.qml "$stage/shell/omavrything/Service.q
 
 # Install and helper scripts.
 install -m755 scripts/install.sh "$stage/scripts/install.sh"
+install -m755 scripts/uninstall.sh "$stage/scripts/uninstall.sh"
 install -m755 scripts/install-plugin.sh "$stage/scripts/install-plugin.sh"
 install -m755 scripts/run-daemon.sh "$stage/scripts/run-daemon.sh"
 install -m755 scripts/restart-all.sh "$stage/scripts/restart-all.sh"
+install -m755 scripts/doctor.sh "$stage/scripts/doctor.sh"
 
 # Documentation and license.
 install -m644 README.md "$stage/README.md"
@@ -86,6 +99,11 @@ Then enable the shell plugin for your user:
 
     ./scripts/install-plugin.sh
     omarchy plugin enable tech.alatcerdas.omavrything --section center
+
+To remove everything again:
+
+    ./scripts/uninstall.sh --user     # the shell plugin and CLI symlink (no root)
+    sudo ./scripts/uninstall.sh       # the daemon and system integration
 
 See docs/install.md for the full setup, including the optional D-Bus control
 interface and the hardened systemd service.

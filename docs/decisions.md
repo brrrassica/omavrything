@@ -281,3 +281,30 @@ Settings are read from the plugin entry and written via the shell's
 `updateEntryInline`.
 
 **Alternatives considered:** A separate config file; CLI-only settings.
+
+---
+
+## ADR-016 — Branching and release model
+
+**Decision:** `main` is a **protected marketplace/release branch** that is never
+written to directly. All work lands on the **`develop`** integration branch via
+short-lived topic branches (`feat/*`, `fix/*`, `docs/*`, `chore/*`), and reaches
+`main` only through a reviewed pull request. Releases are tagged on `main` after
+the `develop` → `main` merge.
+
+**Rationale:** The Omarchy Marketplace tracks `main`, so a direct commit there
+changes what every marketplace user installs, with no review and no chance to run
+the full CI matrix first. Keeping `main` releasable at all times and routing work
+through `develop` gives a review gate and a stable release branch.
+
+**Consequences:** Contributors and agents must branch off `develop` and open PRs
+into `develop`; only a maintainer merges into `main` and tags a release. `main`
+has **branch protection enabled on the upstream repository** as a server-side
+failsafe, so a direct push is rejected even if the convention is forgotten. CI
+already runs on every push and PR, so `develop` is covered without workflow
+changes; the docs site still publishes only from `main`.
+
+**Alternatives considered:** Committing directly to `main` (rejected: no review
+gate on the marketplace-tracked branch); a `release/*` branch per version
+(rejected: unnecessary for a single-package project); tagging on `develop`
+(rejected: the marketplace and docs site track `main`).

@@ -146,34 +146,22 @@ locally with `scripts/package-release.sh`.
 
 ## Removal
 
-Uninstall the shell plugin:
+`scripts/uninstall.sh` removes everything the installer added. It has two modes:
 
 ```sh
-omarchy plugin disable tech.alatcerdas.omavrything
-omarchy plugin remove tech.alatcerdas.omavrything --yes
+scripts/uninstall.sh --user     # the shell plugin and CLI symlink (no root)
+sudo scripts/uninstall.sh       # the daemon, system integration, and plugin
 ```
 
-Remove the hotkey binding from `~/.config/hypr/bindings.lua` if you added one.
+`--keep-config` keeps `/etc/omavrything/config.toml`, `--keep-user` keeps the
+`omavrything` system user and group, and `--keep-state` keeps the cached index
+snapshot under `/var/lib/omavrything`. Remove the hotkey binding from
+`~/.config/hypr/bindings.lua` if you added one.
 
-Uninstall the daemon and its system integration. With the AUR package (once
-published):
+With the AUR package (once published):
 
 ```sh
 sudo pacman -Rns omavrything
-```
-
-Or, for a release-archive or from-source install:
-
-```sh
-sudo systemctl disable --now omavrythingd
-sudo rm -f /usr/bin/omavrythingd /usr/bin/omavry /usr/bin/omavrything-install-plugin
-sudo rm -f /usr/lib/systemd/system/omavrythingd.service
-sudo rm -f /usr/lib/sysusers.d/omavrything.conf
-sudo rm -f /usr/share/dbus-1/system.d/tech.alatcerdas.omavrything.conf
-sudo rm -f /usr/share/polkit-1/actions/tech.alatcerdas.omavrything.policy
-sudo rm -rf /etc/omavrything /usr/share/doc/omavrything /usr/share/licenses/omavrything
-sudo rm -rf /var/lib/omavrything      # the cached index snapshot
-sudo userdel omavrything
 ```
 
 The only state the daemon writes is the index snapshot under

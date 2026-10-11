@@ -56,6 +56,7 @@ cargo build --release --workspace
 | `/usr/share/dbus-1/system.d/tech.alatcerdas.omavrything.conf` | System-bus policy. |
 | `/usr/share/polkit-1/actions/tech.alatcerdas.omavrything.policy` | Polkit control action. |
 | `/etc/omavrything/config.toml` | Default daemon configuration. |
+| `/usr/share/man/man8/omavrythingd.8` | Man page for the daemon. |
 | `/usr/share/omavrything/shell/omavrything/` | The `omarchy-shell` plugin. |
 | `/usr/share/doc/omavrything/` | Documentation. |
 | `/usr/share/licenses/omavrything/LICENSE` | MIT license. |

@@ -88,6 +88,26 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  smoke:
+    name: install/uninstall smoke (Arch)
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    needs: build
+    steps:
+      - name: Install dependencies
+        run: pacman -Syu --noconfirm --needed --overwrite '*' git curl zip
+
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run the install/uninstall smoke test
+        run: scripts/ci-smoke.sh
+
   package:
     name: package release archive (Arch)
     runs-on: ubuntu-latest

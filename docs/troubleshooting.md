@@ -11,6 +11,16 @@ tail -f "${XDG_STATE_HOME:-$HOME/.local/state}/omavrything/daemon.log"  # user-r
 Raise the verbosity with `--log-level debug` (or the `log_level` config key, or
 `OMAVRYTHING_LOG=omavrythingd=debug`).
 
+For a one-shot diagnosis of every component, run:
+
+```sh
+sudo scripts/doctor.sh
+```
+
+It checks the daemon, the systemd unit, the D-Bus and polkit policy, the socket,
+the index snapshot, the inotify limits, and the shell plugin, and prints
+remediation hints for anything that is broken.
+
 ## The shell plugin cannot reach the daemon
 
 **Symptom:** the scratchpad opens but shows no results, or `omavry search` prints
