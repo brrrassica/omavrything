@@ -1,7 +1,7 @@
 <div class="hero">
 <h1>omavrything</h1>
-<p class="tagline">Instant, index-backed file search for Omarchy — Everything for Linux.</p>
-<p class="lede">A search bar in your <code>omarchy-shell</code>. Start typing and a translucent scratchpad of results drops over whatever you are doing — backed by a root daemon that keeps every mounted filesystem indexed in memory.</p>
+<p class="tagline">Instant, index-backed file search: "Everything" built for Omarchy.</p>
+<p class="lede">A search bar in your <code>omarchy-shell</code>. Start typing and a translucent scratchpad of results drops over whatever you are doing, backed by a daemon that keeps every mounted filesystem indexed in memory.</p>
 <div class="badges">
 <span class="badge ok">v0.1.1</span>
 <span class="badge">Omarchy Quattro 4.x</span>
@@ -18,13 +18,18 @@
 
 <!--screenshot-->
 
+<figure>
+<img src="assets/file-managers.jpg" alt="Meme: File managers? Where we're going we don't need file managers.">
+<figcaption>Where we're going, we don't need file managers.</figcaption>
+</figure>
+
 ## What it is
 
-Are you a Wind\*ws ~~user~~ survivor? Do you consider instant file searching
-indispensable — the thing you miss most since moving to Omarchy?
+Are you a Windows refugee or simply trying out Omarchy with dual-booting? Are Voidtool's Everything a must-have on your tool belt?
+Do you hate doing file management and consider instant file searching indispensable; the thing you miss most since moving to Omarchy?
 
 Omavrything brings it back. The UI lives in the `omarchy-shell` as a persistent
-search bar; typing opens a centred, high-transparency scratchpad with a results
+search bar; typing opens a centered, high-transparency scratchpad with a results
 table. A root system daemon (`omavrythingd`) keeps an in-memory index of all
 mounted filesystems — using directory traversal plus `inotify` for Linux
 filesystems (btrfs/ext4/xfs/f2fs) and the MFT for NTFS partitions.
@@ -108,8 +113,3 @@ namespace. Both moved to <code>tech.alatcerdas.omavrything</code> in v0.1.1, so 
 Thank you to David Carpenter at [voidtools](https://www.voidtools.com/) — for the
 inspiration, and for the years of blazing-fast searches that saved a lot of
 scrambling. This project is a grateful homage.
-
-<figure>
-<img src="assets/file-managers.jpg" alt="Meme: File managers? Where we're going we don't need file managers.">
-<figcaption>Where we're going, we don't need file managers.</figcaption>
-</figure>
