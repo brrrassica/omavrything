@@ -41,14 +41,9 @@ The archive contains the `omavrythingd` daemon and the `omavry` CLI under `bin/`
 the system integration files under `data/`, the shell plugin under `shell/`, the
 install scripts under `scripts/`, and the documentation under `docs/`.
 
-On Arch/Omarchy you can also install from the AUR (see
-[`packaging/`](packaging/)):
-
-```sh
-yay -S omavrything
-omavrything-install-plugin
-omarchy plugin enable tech.alatcerdas.omavrything --section center
-```
+An AUR package is prepared under [`packaging/`](packaging/) but is **not
+published yet**. Until it is, build it locally with `makepkg -si` in that
+directory, or use the release archive / a source build as above.
 
 ## Quick start (from source)
 
@@ -75,6 +70,25 @@ optional D-Bus control interface.
 - The shell plugin on its own needs **no privileges**.
 - The index daemon is **optional**: without it the plugin still loads, but there
   are no results to show.
+- **License:** MIT — see [`LICENSE`](LICENSE). The same license is declared in
+  `manifest.json` (`"license": "MIT"`) and in the `PKGBUILD` under
+  `packaging/`.
+
+### External dependencies
+
+Nothing outside this repository is vendored, and the daemon ships no third-party
+service. The full list:
+
+| Dependency | Needed for | Notes |
+| --- | --- | --- |
+| Omarchy Quattro (4.x), Hyprland, `omarchy-shell` (Quickshell) | the shell plugin | already present on a Quattro system |
+| Rust stable with `cargo` | building from source | not needed when installing a release archive |
+| `glibc`, `gcc-libs` | running the binaries | standard Arch base packages |
+| `systemd` | the packaged daemon service | optional; a user-run daemon needs no systemd |
+| `polkit` | the optional D-Bus control interface | gates `tech.alatcerdas.omavrything.control` |
+
+There is no network client in the daemon and no telemetry: the UI and the daemon
+communicate over a local Unix socket.
 
 The daemon (`omavrythingd`) is a system service, but it does not run as full
 root. It runs as the dedicated `omavrything` user holding only two capabilities:
@@ -134,7 +148,8 @@ omarchy plugin remove tech.alatcerdas.omavrything --yes
 
 Remove the hotkey binding from `~/.config/hypr/bindings.lua` if you added one.
 
-Uninstall the daemon and its system integration. From the AUR package:
+Uninstall the daemon and its system integration. With the AUR package (once
+published):
 
 ```sh
 sudo pacman -Rns omavrything
