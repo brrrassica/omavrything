@@ -4,6 +4,39 @@ Notable changes to `omavrything`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] — 2026-10-11
+
+A security release. The defect was found during the marketplace review of 0.1.2,
+and it is the same mistake 0.1.2 set out to fix, one step further on.
+
+### Security
+
+- **A temporary file left behind by an interrupted run was reopened rather than
+  replaced.** `open_private`, the shared helper added in 0.1.2, still opened
+  whatever was already at the temp path and corrected the mode afterwards.
+  `open` ignores the mode for a file that already exists, so a `0644`
+  `index.snapshot.tmp` left by an interrupted run was reopened `0644`, truncated
+  and written, with the mode forced only after that -- the same interval as in
+  0.1.2, and the guard added in 0.1.2 is what made it look closed. A local
+  process that opened the leftover during the interval kept read access to the
+  snapshot written through it, which lists the path names and metadata of every
+  indexed file; the state configuration behaved identically. The helper now
+  removes any leftover and creates a fresh inode with `O_EXCL`, so no data is
+  ever written to an inode this process did not create, and a symlink planted at
+  the temp path is removed rather than followed. Reported by @HANCORE-linux.
+- **`<snapshot>.prev` was published before it was tightened.** The previous
+  snapshot was renamed to `.prev` and only then corrected, so a snapshot left
+  `0644` by an older build produced a complete, readable `.prev` for the length
+  of that interval. The outgoing snapshot is now tightened before the rename --
+  the same fix as above, one path over. Found while fixing the report; not
+  reported separately.
+
+### Changed
+
+- `open_private` now fails (`O_EXCL`) rather than writing through a file that
+  appears at the temp path between the removal and the creation, so two writers
+  that fail to serialize can no longer write through the same temp file.
+
 ## [0.1.2] — 2026-10-11
 
 A security release. Both defects were found during the marketplace review of
@@ -96,6 +129,7 @@ Then install 0.1.1, run `omavrything-install-plugin`, and enable
 First release: the `omavrythingd` index daemon, the `omavry` CLI, and the
 `omarchy-shell` search plugin (bar widget, overlay, service).
 
+[0.1.3]: https://github.com/brrrassica/omavrything/releases/tag/v0.1.3
 [0.1.2]: https://github.com/brrrassica/omavrything/releases/tag/v0.1.2
 [0.1.1]: https://github.com/brrrassica/omavrything/releases/tag/v0.1.1
 [0.1.0]: https://github.com/brrrassica/omavrything/releases/tag/v0.1.0

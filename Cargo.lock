@@ -528,7 +528,7 @@ dependencies = [
 
 [[package]]
 name = "omavrything-cli"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "omavrything-client",
  "omavrything-core",
@@ -538,7 +538,7 @@ dependencies = [
 
 [[package]]
 name = "omavrything-client"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "omavrything-core",
  "serde_json",
@@ -548,7 +548,7 @@ dependencies = [
 
 [[package]]
 name = "omavrything-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "criterion",
  "inotify",
@@ -561,11 +561,11 @@ dependencies = [
 
 [[package]]
 name = "omavrything-ntfs"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "omavrythingd"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "libc",
  "omavrything-client",

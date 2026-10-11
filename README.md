@@ -16,19 +16,21 @@ system daemon (`omavrythingd`) keeps an in-memory index of all mounted
 filesystems — using directory traversal + inotify for Linux filesystems
 (btrfs/ext4/xfs/f2fs) and the MFT for NTFS partitions.
 
-> **Status:** v0.1.2 (security release). See [`docs/`](docs/) and the
+> **Status:** v0.1.3 (security release). See [`docs/`](docs/) and the
 > [changelog](CHANGELOG.md).
 
 ## Install from a release
 
-> **Use v0.1.2 or newer.** v0.1.1 and earlier wrote the index snapshot and the
+> **Use v0.1.3 or newer.** v0.1.1 and earlier wrote the index snapshot and the
 > state configuration through a temporary file that was briefly group- and
-> world-readable, and a malformed NTFS record could stop the indexer. Both are
-> fixed in v0.1.2; see the [changelog](CHANGELOG.md). v0.1.0 additionally shipped
-> the plugin under the id `omavrything` and the daemon under the `org.omarchy.*`
-> D-Bus namespace, both renamed to `tech.alatcerdas.omavrything` in v0.1.1, so
-> 0.1.0 installs need the upgrade note in
-> [`CHANGELOG.md`](CHANGELOG.md#upgrade-from-010).
+> world-readable, and a malformed NTFS record could stop the indexer; v0.1.2
+> fixed both. v0.1.2 in turn reopened a leftover temporary file instead of
+> replacing it, which left a comparable window on the first write after an
+> interrupted run, so use v0.1.3 or newer; see the [changelog](CHANGELOG.md).
+> v0.1.0 additionally shipped the plugin under the id `omavrything` and the
+> daemon under the `org.omarchy.*` D-Bus namespace, both renamed to
+> `tech.alatcerdas.omavrything` in v0.1.1, so 0.1.0 installs need the upgrade note
+> in [`CHANGELOG.md`](CHANGELOG.md#upgrade-from-010).
 
 Download the latest `omavrything-<version>-<arch>.zip` from the
 [releases page](https://github.com/brrrassica/omavrything/releases), extract it,
@@ -136,7 +138,7 @@ sources by `site/build.py`.
 
 ## Releasing
 
-Releases are built by CI. Pushing a `v*` tag (e.g. `v0.1.2`) runs
+Releases are built by CI. Pushing a `v*` tag (e.g. `v0.1.3`) runs
 [`.github/workflows/release.yml`](.github/workflows/release.yml), which builds the
 release archive with [`scripts/package-release.sh`](scripts/package-release.sh)
 and creates a GitHub release with the zip attached. The same archive can be built
