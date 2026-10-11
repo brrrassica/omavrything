@@ -32,18 +32,8 @@ a stable checkpoint before the indexing and mounting work.
 - `install.sh --system` clears stale `/usr/share/omavrything` files and reports
   the installed version.
 - Install and uninstall are idempotent: re-running either script is a no-op.
-- `omavry --version` (and `-V`), matching `omavrythingd --version`.
-- `scripts/ci-smoke.sh` asserts exit codes and output of every step instead of
-  only running it, including the JSON search contract and that uninstall leaves
-  nothing behind.
-
-### Added
-
 - `omavry --version` (and `-V`), matching `omavrythingd --version`, so both
   binaries answer the version query the same way.
-
-### Changed
-
 - `scripts/ci-smoke.sh` now asserts every step instead of only running it:
   exit codes and output of the install/uninstall scripts, the `--version` /
   `--help` / usage-failure contract of both binaries, search as an
