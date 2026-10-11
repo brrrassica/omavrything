@@ -285,17 +285,20 @@ const SNAPSHOT_MODE: u32 = 0o600;
 /// snapshot is kept as `<path>.prev`.
 ///
 /// Callers that may run concurrently (the periodic writer and the shutdown
-/// handler) must serialize their calls; the temp path is fixed.
+/// handler) must serialize their calls; the temp path is fixed. If they do not,
+/// the second writer fails on the `O_EXCL` in `open_private` rather than writing
+/// through the first writer's temp file.
 pub fn write_atomic(bytes: &[u8], path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let tmp = with_suffix(path, ".tmp");
     {
-        // The rename below publishes this inode as the snapshot, so the temp
-        // file's mode becomes the snapshot's mode. It is created owner-only, with
-        // the mode applied by `open` rather than by a later `chmod`, so that it is
-        // never readable by anyone else -- not even for an instant.
+        // The rename below publishes this inode as the snapshot, so the temp file's
+        // mode becomes the snapshot's mode. `open_private` creates a *fresh* inode
+        // with that mode rather than reopening and tightening whatever was at the
+        // temp path: a descriptor opened on a leftover would outlive the `chmod`
+        // that followed, and read the snapshot written through it afterwards.
         let mut file = crate::private_file::open_private(&tmp, SNAPSHOT_MODE)?;
         file.write_all(bytes)?;
         file.sync_all()?;
@@ -303,10 +306,12 @@ pub fn write_atomic(bytes: &[u8], path: &Path) -> io::Result<()> {
     // Keep the previous snapshot as a fallback.
     if path.exists() {
         let prev = with_suffix(path, ".prev");
+        // Tighten the outgoing snapshot *before* it becomes the fallback. The rename
+        // keeps the inode, so a `chmod` afterwards would publish a complete `.prev`
+        // and leave a window in which anyone could still open it -- the same
+        // publish-then-tighten mistake as the temp file above, one path over.
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(SNAPSHOT_MODE));
         let _ = fs::rename(path, &prev);
-        // The renamed inode keeps whatever mode it had, so tighten the fallback
-        // as well rather than leave an older readable copy behind.
-        let _ = fs::set_permissions(&prev, fs::Permissions::from_mode(SNAPSHOT_MODE));
     }
     fs::rename(&tmp, path)?;
     // Make the rename durable: fsync the containing directory.
