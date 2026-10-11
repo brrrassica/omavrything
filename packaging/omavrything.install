@@ -14,7 +14,7 @@ post_install() {
 To use the search UI, install the omarchy-shell plugin for your user:
 
     omavrything-install-plugin
-    omarchy plugin enable omavrything --section center
+    omarchy plugin enable tech.alatcerdas.omavrything --section center
 
 To run the daemon as a hardened system service:
 

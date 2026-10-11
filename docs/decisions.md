@@ -148,7 +148,7 @@ infeasible: the built-in bar's `PanelWindow` does not set
 
 **Consequences:** The persistent search bar in the bar is a visual mirror; the
 interactive input lives in the overlay, which appears under the bar widget when
-summoned. A persistent `omavrything` IPC target (a `service` plugin) provides
+summoned. A persistent `tech.alatcerdas.omavrything` IPC target (a `service` plugin) provides
 `focus`, which summons the overlay and focuses the input.
 
 **Alternatives considered:** Bar widget hosting the input directly (ruled out by

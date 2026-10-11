@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # Install the omavrything omarchy-shell plugin for the current user.
 #
-# Copies shell/omavrything/ into ~/.config/omarchy/plugins/omavrything/, links
-# the `omavry` CLI onto PATH (the settings menu shells out to it), and restarts
-# the shell.
+# Copies the plugin (root manifest.json plus shell/omavrything/) into
+# ~/.config/omarchy/plugins/tech.alatcerdas.omavrything/, links the `omavry` CLI
+# onto PATH (the settings menu shells out to it), and restarts the shell.
+#
+# The destination mirrors this repository's layout exactly, so a local install
+# is byte-for-byte the same shape as `omarchy plugin add` produces from the git
+# URL. That keeps a single manifest.json authoritative for both paths.
 #
 # A full shell restart is required, not just a plugin rescan: `omarchy-shell
 # shell rescanPlugins` reloads the plugin but the QML engine keeps the
@@ -12,21 +16,22 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-src="$here/shell/omavrything"
+src="$here"
 # A packaged install places this helper in /usr/bin and the plugin in
-# /usr/share/omavrything/shell/omavrything, so fall back to that layout.
-if [[ ! -f "$src/manifest.json" && -f /usr/share/omavrything/shell/omavrything/manifest.json ]]; then
-  src=/usr/share/omavrything/shell/omavrything
+# /usr/share/omavrything, so fall back to that layout.
+if [[ ! -f "$src/manifest.json" && -f /usr/share/omavrything/manifest.json ]]; then
+  src=/usr/share/omavrything
 fi
-dest="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/omavrything"
+dest="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/tech.alatcerdas.omavrything"
 
 if [[ ! -f "$src/manifest.json" ]]; then
-  echo "error: plugin source not found at $src" >&2
+  echo "error: plugin manifest not found at $src/manifest.json" >&2
   exit 1
 fi
 
-mkdir -p "$dest"
-cp -f "$src"/*.qml "$src"/manifest.json "$dest"/
+mkdir -p "$dest/shell/omavrything"
+install -m644 "$src/manifest.json" "$dest/manifest.json"
+install -m644 "$src"/shell/omavrything/*.qml "$dest/shell/omavrything/"
 echo "Installed plugin to $dest"
 
 # The settings menu reads and writes the daemon config through the `omavry` CLI,

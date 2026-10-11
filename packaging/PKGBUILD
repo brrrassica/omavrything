@@ -1,4 +1,4 @@
-# Maintainer: omavrything contributors <omavrything@example.com>
+# Maintainer: Sam Ralial <sam@alatcerdas.tech>
 #
 # AUR PKGBUILD for omavrything, the index-backed file search for Omarchy
 # Quattro (4.x). It installs:
@@ -14,11 +14,12 @@
 # post-install message). The daemon is not enabled automatically: the user
 # chooses whether to run it as a system service or as a user process.
 #
-# Before publishing, replace the placeholder checksum with the real one:
+# The source checksum is pinned to the v0.1.0 tag tarball. Note that GitHub's
+# auto-generated archive tarballs are not guaranteed to stay byte-identical
+# forever; if verification ever fails, refresh with `updpkgsums`, or switch the
+# source to an uploaded release asset, which is stable.
 #
-#   updpkgsums
-#
-# and regenerate the AUR metadata:
+# Regenerate the AUR metadata after any change:
 #
 #   makepkg --printsrcinfo > .SRCINFO
 
@@ -36,7 +37,7 @@ conflicts=('omavrything-git')
 options=('!lto')
 install="$pkgname.install"
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('62757fe2452bc1471188e206c78bdb465adb37d04c372ee297ce45000de89d73')
 
 build() {
   cd "$pkgname-$pkgver"
@@ -75,10 +76,10 @@ package() {
   install -Dm644 data/config/config.toml "$pkgdir/etc/omavrything/config.toml"
 
   # The omarchy-shell plugin, installed system-wide. The install helper copies
-  # it into ~/.config/omarchy/plugins/omavrything/.
+  # it into ~/.config/omarchy/plugins/tech.alatcerdas.omavrything/.
   install -d "$pkgdir/usr/share/omavrything/shell/omavrything"
-  install -m644 shell/omavrything/manifest.json \
-    shell/omavrything/SearchBar.qml \
+  install -m644 manifest.json "$pkgdir/usr/share/omavrything/manifest.json"
+  install -m644 shell/omavrything/SearchBar.qml \
     shell/omavrything/SearchOverlay.qml \
     shell/omavrything/Service.qml \
     "$pkgdir/usr/share/omavrything/shell/omavrything/"

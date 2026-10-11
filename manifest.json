@@ -1,19 +1,20 @@
 {
   "schemaVersion": 1,
-  "id": "omavrything",
-  "name": "omavrything",
+  "id": "tech.alatcerdas.omavrything",
+  "name": "Omavrything",
   "version": "0.1.0",
-  "author": "omavrything",
-  "description": "Instant, index-backed file search for Omarchy (Everything for Linux)",
+  "author": "Sam Ralial",
+  "license": "MIT",
+  "description": "Instant, index-backed file search for Omarchy — Everything for Linux.",
   "kinds": ["bar-widget", "overlay", "service"],
   "keepLoaded": true,
   "entryPoints": {
-    "barWidget": "SearchBar.qml",
-    "overlay": "SearchOverlay.qml",
-    "service": "Service.qml"
+    "barWidget": "shell/omavrything/SearchBar.qml",
+    "overlay": "shell/omavrything/SearchOverlay.qml",
+    "service": "shell/omavrything/Service.qml"
   },
   "barWidget": {
-    "displayName": "omavrything search",
+    "displayName": "Omavrything",
     "description": "Instant file search",
     "category": "Utilities",
     "allowMultiple": false,

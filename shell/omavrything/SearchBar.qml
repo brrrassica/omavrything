@@ -49,7 +49,7 @@ BarWidget {
     horizontalMargin: 10
     onPressed: function(button) {
       if (!root.bar) return
-      root.bar.run("omarchy-shell omavrything focus")
+      root.bar.run("omarchy-shell tech.alatcerdas.omavrything focus")
     }
   }
 }

@@ -90,13 +90,25 @@ is a brief CPU burst — raise `snapshot_interval` if that is undesirable.
 
 The daemon's memory is bounded by the systemd unit, not by an in-process cap:
 
-- `MemoryHigh=3G` — the kernel starts reclaiming and throttling above this.
-- `MemoryMax=4G` — a hard cap; exceeding it triggers the OOM killer for the
+- `MemoryHigh=1200M` — the kernel starts reclaiming and throttling above this.
+- `MemoryMax=1536M` — a hard cap; exceeding it triggers the OOM killer for the
   cgroup.
 
+Both values are set from measurement rather than headroom guesswork:
+
+| Phase | Resident memory |
+| --- | --- |
+| Idle, index loaded (~3M files) | under 300 MB |
+| Cold initial index, ~3M files | never above 900 MB peak |
+| NTFS MFT read (largest transient) | ~836 MB peak |
+
+`MemoryHigh` deliberately sits above the measured cold-index peak so ordinary
+indexing is never throttled, while `MemoryMax` is the hard ceiling.
+
 The index itself is ~70 B/file steady state (see
-[`memory-optimization.md`](memory-optimization.md)), so 4 GB accommodates roughly
-50 M files. On a larger index the daemon is killed and restarted by systemd
+[`memory-optimization.md`](memory-optimization.md)), so 1.5 GB accommodates
+roughly 20 M files at steady state, with the transient scan overhead on top. On a
+much larger index the daemon is killed and restarted by systemd
 (`Restart=on-failure`), which then warm-starts from the snapshot. To index more,
 raise `MemoryMax` or reduce the indexed roots/excludes. A user-run daemon has no
 such cap and is limited only by available RAM.

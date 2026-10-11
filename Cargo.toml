@@ -16,7 +16,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
-authors = ["omavrything contributors"]
+authors = ["Sam Ralial <sam@alatcerdas.tech>"]
 repository = "https://github.com/brrrassica/omavrything"
 description = "Instant, index-backed file search for Omarchy Quattro, inspired by Voidtools Everything"
 

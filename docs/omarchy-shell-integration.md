@@ -7,13 +7,13 @@ install and enable it.
 ## Plugin structure
 
 The plugin lives in `shell/omavrything/` and is installed to
-`~/.config/omarchy/plugins/omavrything/`. It declares three kinds:
+`~/.config/omarchy/plugins/tech.alatcerdas.omavrything/`. It declares three kinds:
 
 | Kind | Entry point | Role |
 | --- | --- | --- |
 | `bar-widget` | `SearchBar.qml` | Persistent search bar in the bar's center section. |
 | `overlay` | `SearchOverlay.qml` | Focusable input + floating results window. |
-| `service` | `Service.qml` | Owns the persistent `omavrything` IPC target. |
+| `service` | `Service.qml` | Owns the persistent `tech.alatcerdas.omavrything` IPC target. |
 
 ## The focus constraint (why the input is in the overlay)
 
@@ -40,8 +40,8 @@ spike.
 The `service` plugin registers a persistent IPC target:
 
 ```sh
-omarchy-shell omavrything focus   # summon the overlay and focus the input
-omarchy-shell omavrything ping    # health check
+omarchy-shell tech.alatcerdas.omavrything focus   # summon the overlay and focus the input
+omarchy-shell tech.alatcerdas.omavrything ping    # health check
 ```
 
 `focus` calls the shell's `summon` for the plugin, which loads the overlay and
@@ -53,7 +53,7 @@ The Hyprland binding lives in `~/.config/hypr/bindings.lua`:
 
 ```lua
 hl.unbind("SUPER + ALT + SPACE")
-o.bind("SUPER + ALT + SPACE", "Search files", "omarchy-shell omavrything focus")
+o.bind("SUPER + ALT + SPACE", "Search files", "omarchy-shell tech.alatcerdas.omavrything focus")
 ```
 
 `SUPER + ALT + SPACE` is reassigned from the Omarchy "Apps menu" binding.
@@ -67,29 +67,29 @@ bound it to; drop that line if the key is free.
 ```lua
 -- Default: reassign the Omarchy "Apps menu" binding.
 hl.unbind("SUPER + ALT + SPACE")
-o.bind("SUPER + ALT + SPACE", "Search files", "omarchy-shell omavrything focus")
+o.bind("SUPER + ALT + SPACE", "Search files", "omarchy-shell tech.alatcerdas.omavrything focus")
 
 -- Reassign the application launcher (SUPER + SPACE).
 hl.unbind("SUPER + SPACE")
-o.bind("SUPER + SPACE", "Search files", "omarchy-shell omavrything focus")
+o.bind("SUPER + SPACE", "Search files", "omarchy-shell tech.alatcerdas.omavrything focus")
 
 -- A free key: SUPER + F.
-o.bind("SUPER + F", "Search files", "omarchy-shell omavrything focus")
+o.bind("SUPER + F", "Search files", "omarchy-shell tech.alatcerdas.omavrything focus")
 
 -- A free key: SUPER + SHIFT + F.
-o.bind("SUPER + SHIFT + F", "Search files", "omarchy-shell omavrything focus")
+o.bind("SUPER + SHIFT + F", "Search files", "omarchy-shell tech.alatcerdas.omavrything focus")
 ```
 
-The command is the same for every binding: `omarchy-shell omavrything focus`
+The command is the same for every binding: `omarchy-shell tech.alatcerdas.omavrything focus`
 summons the overlay and focuses the input. To check that the IPC target is
 alive:
 
 ```sh
-omarchy-shell omavrything ping
+omarchy-shell tech.alatcerdas.omavrything ping
 ```
 
 If a binding does nothing, confirm the plugin is enabled
-(`omarchy plugin enable omavrything --section center`) and that the shell was
+(`omarchy plugin enable tech.alatcerdas.omavrything --section center`) and that the shell was
 restarted after installing it — a plugin rescan alone does not recompile the
 QML. See [`troubleshooting.md`](troubleshooting.md#the-search-bar-does-not-appear).
 
@@ -97,7 +97,7 @@ QML. See [`troubleshooting.md`](troubleshooting.md#the-search-bar-does-not-appea
 
 ```sh
 scripts/install-plugin.sh                          # copy into ~/.config/omarchy/plugins/
-omarchy plugin enable omavrything --section center # place the widget + enable the plugin
+omarchy plugin enable tech.alatcerdas.omavrything --section center # place the widget + enable the plugin
 ```
 
 The bar widget is placed in the center section, right of the `omarchy.clock`

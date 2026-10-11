@@ -215,7 +215,7 @@ shell:
 
 ```sh
 omavrything-install-plugin        # or scripts/install-plugin.sh from a checkout
-omarchy plugin enable omavrything --section center
+omarchy plugin enable tech.alatcerdas.omavrything --section center
 omarchy restart shell
 ```
 
@@ -228,13 +228,13 @@ If the hotkey does nothing, confirm the binding is present in
 
 ```lua
 hl.unbind("SUPER + ALT + SPACE")
-o.bind("SUPER + ALT + SPACE", "Search files", "omarchy-shell omavrything focus")
+o.bind("SUPER + ALT + SPACE", "Search files", "omarchy-shell tech.alatcerdas.omavrything focus")
 ```
 
 and that the IPC target responds:
 
 ```sh
-omarchy-shell omavrything ping
+omarchy-shell tech.alatcerdas.omavrything ping
 ```
 
 ## The daemon will not start

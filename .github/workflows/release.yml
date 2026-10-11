@@ -65,6 +65,6 @@ jobs:
 
                 sudo ./scripts/install.sh --system
                 ./scripts/install-plugin.sh
-                omarchy plugin enable omavrything --section center
+                omarchy plugin enable tech.alatcerdas.omavrything --section center
 
             See `docs/install.md` inside the archive for the full setup.

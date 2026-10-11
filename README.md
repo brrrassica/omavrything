@@ -29,7 +29,7 @@ unzip omavrything-*.zip
 cd omavrything-*
 sudo ./scripts/install.sh --system   # daemon, CLI, systemd unit, D-Bus, polkit
 ./scripts/install-plugin.sh          # shell plugin for the current user
-omarchy plugin enable omavrything --section center
+omarchy plugin enable tech.alatcerdas.omavrything --section center
 ```
 
 The archive contains the `omavrythingd` daemon and the `omavry` CLI under `bin/`,
@@ -42,7 +42,7 @@ On Arch/Omarchy you can also install from the AUR (see
 ```sh
 yay -S omavrything
 omavrything-install-plugin
-omarchy plugin enable omavrything --section center
+omarchy plugin enable tech.alatcerdas.omavrything --section center
 ```
 
 ## Quick start (from source)
@@ -51,14 +51,14 @@ omarchy plugin enable omavrything --section center
 cargo build --release
 scripts/run-daemon.sh
 scripts/install-plugin.sh
-omarchy plugin enable omavrything --section center
+omarchy plugin enable tech.alatcerdas.omavrything --section center
 ```
 
 Then bind a hotkey in `~/.config/hypr/bindings.lua`:
 
 ```lua
 hl.unbind("SUPER + ALT + SPACE")
-o.bind("SUPER + ALT + SPACE", "Search files", "omarchy-shell omavrything focus")
+o.bind("SUPER + ALT + SPACE", "Search files", "omarchy-shell tech.alatcerdas.omavrything focus")
 ```
 
 See [`docs/install.md`](docs/install.md) for the full setup, including the

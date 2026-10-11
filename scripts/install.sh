@@ -37,17 +37,20 @@ else
 fi
 
 install_user() {
-  local plugin_src="$here/shell/omavrything"
-  local dest="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/omavrything"
-  mkdir -p "$dest"
-  cp -f "$plugin_src"/*.qml "$plugin_src"/manifest.json "$dest"/
+  # The destination mirrors the repository layout (root manifest.json plus
+  # shell/omavrything/), which is exactly what `omarchy plugin add` produces.
+  local plugin_src="$here"
+  local dest="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/tech.alatcerdas.omavrything"
+  mkdir -p "$dest/shell/omavrything"
+  install -m644 "$plugin_src/manifest.json" "$dest/manifest.json"
+  install -m644 "$plugin_src"/shell/omavrything/*.qml "$dest/shell/omavrything/"
   echo "Installed shell plugin to $dest"
 
   local user_bin="${XDG_BIN_HOME:-$HOME/.local/bin}"
   mkdir -p "$user_bin"
   ln -sf "$bindir/omavry" "$user_bin/omavry"
   echo "Linked $user_bin/omavry -> $bindir/omavry"
-  echo "Enable the plugin with: omarchy plugin enable omavrything --section center"
+  echo "Enable the plugin with: omarchy plugin enable tech.alatcerdas.omavrything --section center"
 }
 
 install_system() {
@@ -77,8 +80,8 @@ install_system() {
 
   # The shell plugin, installed system-wide; the helper copies it per user.
   install -d /usr/share/omavrything/shell/omavrything
-  install -m644 "$here/shell/omavrything/manifest.json" \
-    "$here/shell/omavrything/SearchBar.qml" \
+  install -m644 "$here/manifest.json" /usr/share/omavrything/manifest.json
+  install -m644 "$here/shell/omavrything/SearchBar.qml" \
     "$here/shell/omavrything/SearchOverlay.qml" \
     "$here/shell/omavrything/Service.qml" \
     /usr/share/omavrything/shell/omavrything/

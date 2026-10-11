@@ -54,8 +54,10 @@ install -Dm644 data/dbus/org.omarchy.omavrything.conf "$stage/data/dbus/org.omar
 install -Dm644 data/polkit/org.omarchy.omavrything.policy "$stage/data/polkit/org.omarchy.omavrything.policy"
 install -Dm644 data/config/config.toml "$stage/data/config/config.toml"
 
-# The omarchy-shell plugin.
-install -Dm644 shell/omavrything/manifest.json "$stage/shell/omavrything/manifest.json"
+# The omarchy-shell plugin. The manifest sits at the archive root, exactly where
+# the marketplace and `omarchy plugin validate` expect it, so the extracted
+# archive is itself a valid plugin folder.
+install -Dm644 manifest.json "$stage/manifest.json"
 install -Dm644 shell/omavrything/SearchBar.qml "$stage/shell/omavrything/SearchBar.qml"
 install -Dm644 shell/omavrything/SearchOverlay.qml "$stage/shell/omavrything/SearchOverlay.qml"
 install -Dm644 shell/omavrything/Service.qml "$stage/shell/omavrything/Service.qml"
@@ -83,7 +85,7 @@ Quick start (system install, requires root):
 Then enable the shell plugin for your user:
 
     ./scripts/install-plugin.sh
-    omarchy plugin enable omavrything --section center
+    omarchy plugin enable tech.alatcerdas.omavrything --section center
 
 See docs/install.md for the full setup, including the optional D-Bus control
 interface and the hardened systemd service.

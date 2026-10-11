@@ -37,7 +37,7 @@ Record the result of each item as pass/fail with the date and the Omarchy versio
 ## 3. Shell UI
 
 - [ ] `scripts/install-plugin.sh` installs the plugin and restarts the shell.
-- [ ] `omarchy plugin enable omavrything --section center` shows the bar widget.
+- [ ] `omarchy plugin enable tech.alatcerdas.omavrything --section center` shows the bar widget.
 - [ ] `SUPER + ALT + SPACE` focuses the search input.
 - [ ] Typing shows the centered scratchpad with the results table
       (Name | Size | Modified | Path).
@@ -94,7 +94,9 @@ Record the result of each item as pass/fail with the date and the Omarchy versio
 ## 10. Resource use
 
 - [ ] `systemctl status omavrythingd` shows RSS within the documented cap
-      (`MemoryHigh=3G`, `MemoryMax=4G`).
+      (`MemoryHigh=1200M`, `MemoryMax=1536M`).
+- [ ] A cold start from an empty snapshot indexing ~3M files peaks below
+      900 MB RSS.
 - [ ] The daemon is idle (near-zero CPU) when the desktop is idle.
 - [ ] A rescan does not run while the system is under load.
 - [ ] `OMAVRYTHING_PROFILE=1` logs a per-query breakdown; `total` is in the

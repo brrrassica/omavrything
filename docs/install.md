@@ -1,6 +1,7 @@
 # Installation and setup
 
-`omavrything` is **pre-alpha** and currently installed from source. It targets
+`omavrything` is at **v0.1.0**: early, but released and used day to day. Install it
+from a release archive or from source (§1–2). It targets
 **Omarchy Quattro (4.x)** only — Hyprland, `omarchy-shell` (Quickshell), Arch
 Linux. There is no backwards compatibility with earlier Omarchy releases that
 used waybar.
@@ -40,7 +41,7 @@ it with:
 
 ```sh
 scripts/install-plugin.sh
-omarchy plugin enable omavrything --section center
+omarchy plugin enable tech.alatcerdas.omavrything --section center
 ```
 
 ## 4. Bind a hotkey
@@ -49,7 +50,7 @@ Add the binding to `~/.config/hypr/bindings.lua`:
 
 ```lua
 hl.unbind("SUPER + ALT + SPACE")
-o.bind("SUPER + ALT + SPACE", "Search files", "omarchy-shell omavrything focus")
+o.bind("SUPER + ALT + SPACE", "Search files", "omarchy-shell tech.alatcerdas.omavrything focus")
 ```
 
 `SUPER + ALT + SPACE` is reassigned from the Omarchy "Apps menu" binding.

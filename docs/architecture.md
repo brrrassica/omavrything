@@ -236,14 +236,14 @@ flowchart TD
 
 ## 10. UI (omarchy-shell plugin)
 
-- **Plugin location:** `~/.config/omarchy/plugins/omavrything/` (third-party).
+- **Plugin location:** `~/.config/omarchy/plugins/tech.alatcerdas.omavrything/` (third-party).
 - **Manifest:** `kinds: ["bar-widget", "overlay", "service"]`, entry points
   `barWidget: "SearchBar.qml"`, `overlay: "SearchOverlay.qml"`, and
   `service: "Service.qml"`.
 
 ```mermaid
 flowchart TD
-    HOTKEY[SUPER + hotkey] --> IPC[omarchy-shell shell call omavrything focus]
+    HOTKEY[SUPER + hotkey] --> IPC[omarchy-shell tech.alatcerdas.omavrything focus]
     IPC --> FOCUS[Focus the search input]
     FOCUS --> TYPE[User types]
     TYPE --> QUERY[Query daemon over unix socket]
@@ -266,14 +266,14 @@ flowchart TD
   (`Up`/`Down`/`PageUp`/`PageDown`/`Enter`), `Esc` dismisses. `Enter` opens the
   selected result, or the top result when no cursor is active.
 - **`Service.qml` (service):** a headless plugin that owns the persistent
-  `omavrything` IPC target (`focus`, `ping`), so the hotkey works before the
+  `tech.alatcerdas.omavrything` IPC target (`focus`, `ping`), so the hotkey works before the
   overlay has ever been loaded (ADR-008).
 - **Actions:** `Enter` opens the file; a modifier opens the containing folder;
   another copies the path.
 - **Focus:** the bar surface cannot grant keyboard focus to a widget's
   `TextInput`, so the input lives in the companion overlay (ADR-008).
 - **Hotkey:** a Hyprland binding (`SUPER, Space`) calls
-  `omarchy-shell shell call omavrything focus`. The plugin registers an IPC
+  `omarchy-shell tech.alatcerdas.omavrything focus`. The plugin registers an IPC
   target `omavrything` with a `focus` method.
 
 ## 11. CLI (`omavry`)
