@@ -4,7 +4,9 @@
 # plugin (the search widget) for the invoking user.
 #
 # This is the inverse of scripts/install.sh (--system and --user) and
-# scripts/install-plugin.sh. It needs root, so run it with sudo:
+# scripts/install-plugin.sh, and it also cleans up a development install made
+# by scripts/restart-all.sh (a user-run daemon plus a plugin copied into
+# ~/.config/omarchy/plugins/). It needs root, so run it with sudo:
 #
 #   sudo scripts/uninstall.sh
 #
@@ -18,11 +20,10 @@
 #                   invoked sudo (defaults to $SUDO_USER, then $USER).
 #   -h, --help      Show this help.
 #
-# Everything else is removed: /usr/bin/omavrythingd, /usr/bin/omavry,
-# /usr/bin/omavrything-install-plugin, the systemd unit, the sysusers drop-in,
-# the D-Bus and polkit policy, /usr/share/omavrything, the license and docs,
-# /run/omavrything, /var/lib/omavrything, the user's plugin directory and the
-# ~/.local/bin/omavry symlink, and any running daemon (user- or root-owned).
+# The plugin is removed through `omarchy plugin remove` (run as the target
+# user) so omarchy's registry and ~/.config/omarchy/shell.json are updated, not
+# just the plugin directory. The shell is restarted at the end so the widget
+# disappears, and the script refuses to exit while a daemon is still running.
 set -euo pipefail
 
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
@@ -76,14 +77,37 @@ if [[ -z "$target_user" || "$target_user" == "root" ]]; then
   target_user=""
 fi
 
-# 1. Stop and disable the system service, then kill any stray daemon. A daemon
-# started by hand (scripts/restart-all.sh) may be user- or root-owned, so try
-# both. SIGTERM lets it write a snapshot and exit cleanly.
+user_home=""
+user_uid=""
+if [[ -n "$target_user" ]]; then
+  user_home="$(getent passwd "$target_user" | cut -d: -f6 || true)"
+  user_uid="$(id -u "$target_user" 2>/dev/null || true)"
+fi
+
+# Run a command as the target user with a usable session environment. omarchy
+# talks to the running shell over the user's session bus and runtime dir, so
+# those must be set explicitly when we are root.
+as_user() {
+  [[ -n "$target_user" ]] || return 1
+  runuser -u "$target_user" -- env \
+    HOME="$user_home" \
+    USER="$target_user" \
+    LOGNAME="$target_user" \
+    XDG_RUNTIME_DIR="/run/user/$user_uid" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$user_uid/bus" \
+    PATH="/usr/share/omarchy/bin:/usr/local/bin:/usr/bin:/bin" \
+    "$@"
+}
+
+# 1. Stop and disable the system service, if one was installed.
 if systemctl list-unit-files omavrythingd.service >/dev/null 2>&1; then
   log "stopping and disabling omavrythingd.service"
   systemctl disable --now omavrythingd.service >/dev/null 2>&1 || true
 fi
 
+# 2. Kill any running daemon. A development daemon started by
+# scripts/restart-all.sh runs as the user; a packaged one runs as root. Try
+# both, then escalate to SIGKILL, and verify it is really gone.
 if pgrep -x omavrythingd >/dev/null 2>&1; then
   log "stopping running daemon"
   pkill -x omavrythingd 2>/dev/null || true
@@ -92,11 +116,16 @@ if pgrep -x omavrythingd >/dev/null 2>&1; then
     sleep 0.1
   done
   if pgrep -x omavrythingd >/dev/null 2>&1; then
+    log "daemon still alive; sending SIGKILL"
     pkill -9 -x omavrythingd 2>/dev/null || true
+    for _ in $(seq 1 50); do
+      pgrep -x omavrythingd >/dev/null 2>&1 || break
+      sleep 0.1
+    done
   fi
 fi
 
-# 2. Remove the system-wide files installed by install.sh --system.
+# 3. Remove the system-wide files installed by install.sh --system.
 log "removing system binaries and data"
 rm -f /usr/bin/omavrythingd
 rm -f /usr/bin/omavry
@@ -109,7 +138,7 @@ rm -rf /usr/share/omavrything
 rm -rf /usr/share/licenses/omavrything
 rm -rf /usr/share/doc/omavrything
 
-# 3. Remove the configuration unless asked to keep it.
+# 4. Remove the configuration unless asked to keep it.
 if [[ "$keep_config" == 1 ]]; then
   log "keeping /etc/omavrything/config.toml"
 else
@@ -117,36 +146,71 @@ else
   rm -rf /etc/omavrything
 fi
 
-# 4. Remove the per-user shell plugin and the CLI symlink. The plugin lives in
-# the user's config dir; the symlink in their bin dir. Resolve both from the
-# target user's home so this works when the script itself runs as root.
+# 5. Remove the shell plugin (the widget). Use omarchy's own command so its
+# registry and shell.json are updated; fall back to removing the directories
+# directly. Both the current id and the older `omavrything` id are handled.
 if [[ -n "$target_user" ]]; then
-  user_home="$(getent passwd "$target_user" | cut -d: -f6 || true)"
-  if [[ -n "$user_home" && -d "$user_home" ]]; then
-    log "removing shell plugin for $target_user"
-    rm -rf "$user_home/.config/omarchy/plugins/tech.alatcerdas.omavrything"
-    rm -f "$user_home/.local/bin/omavry"
-    # A stale socket/lock in the user's runtime dir would otherwise linger.
-    user_uid="$(id -u "$target_user" 2>/dev/null || true)"
-    if [[ -n "$user_uid" ]]; then
-      rm -f "/run/user/$user_uid/omavrything.sock" \
-        "/run/user/$user_uid/omavrything.sock.lock"
-    fi
-    # The daemon log written by scripts/restart-all.sh.
-    rm -rf "$user_home/.local/state/omavrything"
+  log "removing shell plugin for $target_user"
+  if as_user sh -c 'command -v omarchy >/dev/null 2>&1'; then
+    as_user omarchy plugin remove tech.alatcerdas.omavrything --yes >/dev/null 2>&1 ||
+      warn "omarchy plugin remove tech.alatcerdas.omavrything failed; removing files directly"
+    as_user omarchy plugin remove omavrything --yes >/dev/null 2>&1 || true
   else
-    warn "home directory for $target_user not found; skipping per-user cleanup"
+    warn "omarchy not found; removing plugin files directly"
   fi
+
+  # Direct removal as a fallback / for a stale directory omarchy no longer knows.
+  rm -rf "$user_home/.config/omarchy/plugins/tech.alatcerdas.omavrything"
+  rm -rf "$user_home/.config/omarchy/plugins/omavrything"
+
+  # Drop any leftover bar-layout entry and plugin registration from shell.json.
+  shell_json="$user_home/.config/omarchy/shell.json"
+  if [[ -f "$shell_json" ]] && command -v python3 >/dev/null 2>&1; then
+    as_user python3 - "$shell_json" <<'PY' || warn "could not clean shell.json"
+import json, sys
+path = sys.argv[1]
+ids = {"omavrything", "tech.alatcerdas.omavrything"}
+try:
+    with open(path) as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(0)
+changed = False
+layout = data.get("bar", {}).get("layout", {})
+for section, entries in list(layout.items()):
+    if isinstance(entries, list):
+        kept = [e for e in entries if not (isinstance(e, dict) and e.get("id") in ids)]
+        if len(kept) != len(entries):
+            layout[section] = kept
+            changed = True
+plugins = data.get("plugins")
+if isinstance(plugins, list):
+    kept = [p for p in plugins if not (isinstance(p, dict) and p.get("id") in ids) and p not in ids]
+    if len(kept) != len(plugins):
+        data["plugins"] = kept
+        changed = True
+if changed:
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+PY
+  fi
+
+  # The CLI symlink and the daemon's per-user socket/log.
+  rm -f "$user_home/.local/bin/omavry"
+  if [[ -n "$user_uid" ]]; then
+    rm -f "/run/user/$user_uid/omavrything.sock" \
+      "/run/user/$user_uid/omavrything.sock.lock"
+  fi
+  rm -rf "$user_home/.local/state/omavrything"
 fi
 
-# 5. Remove the runtime and state directories owned by the service.
+# 6. Remove the runtime and state directories owned by the service.
 log "removing runtime and state directories"
 rm -rf /run/omavrything
 rm -rf /var/lib/omavrything
 
-# 6. Remove the dedicated user and group created by the sysusers drop-in.
-# userdel removes the group of the same name when it is the user's primary
-# group; groupdel is a fallback for a group left behind.
+# 7. Remove the dedicated user and group created by the sysusers drop-in.
 if [[ "$keep_user" == 1 ]]; then
   log "keeping the omavrything user and group"
 else
@@ -159,14 +223,28 @@ else
   fi
 fi
 
-# 7. Reload systemd and D-Bus so the removed unit and policy take effect.
+# 8. Reload systemd and D-Bus so the removed unit and policy take effect.
 systemctl daemon-reload >/dev/null 2>&1 || true
 if command -v dbus-send >/dev/null 2>&1; then
   dbus-send --system --type=method_call --dest=org.freedesktop.DBus \
     /org/freedesktop/DBus org.freedesktop.DBus.ReloadConfig >/dev/null 2>&1 || true
 fi
 
-log "omavrything removed"
+# 9. Restart the shell so the widget is dropped from the running bar.
 if [[ -n "$target_user" ]]; then
-  echo "Restart the shell to drop the plugin: omarchy restart shell"
+  log "restarting the omarchy shell"
+  if as_user sh -c 'command -v omarchy >/dev/null 2>&1'; then
+    as_user omarchy restart shell >/dev/null 2>&1 ||
+      warn "could not restart the shell; run 'omarchy restart shell' as $target_user"
+  elif as_user sh -c 'command -v omarchy-shell >/dev/null 2>&1'; then
+    as_user omarchy-shell shell rescanPlugins >/dev/null 2>&1 ||
+      warn "could not rescan plugins; restart the shell manually"
+  fi
 fi
+
+# 10. Refuse to exit while a daemon is still running.
+if pgrep -x omavrythingd >/dev/null 2>&1; then
+  die "a daemon is still running (pids: $(pgrep -x omavrythingd | tr '\n' ' ')); remove it manually"
+fi
+
+log "omavrything removed; no daemon is running"
