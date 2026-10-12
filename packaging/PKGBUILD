@@ -7,12 +7,13 @@
 #   * the systemd unit and the dedicated `omavrything` sysuser,
 #   * the D-Bus system-bus policy and the polkit control action,
 #   * the default `/etc/omavrything/config.toml`,
-#   * the `omarchy-shell` plugin and its install helper.
+#   * the `omarchy-shell` plugin (installed system-wide under
+#     /usr/share/omavrything/shell).
 #
-# The shell plugin is installed system-wide under /usr/share/omavrything/shell
-# and copied into the user's config by `omavrything-install-plugin` (see the
-# post-install message). The daemon is not enabled automatically: the user
-# chooses whether to run it as a system service or as a user process.
+# The daemon is not enabled automatically: the user chooses whether to run it as
+# a system service or as a user process. The shell plugin is copied into the
+# user's config by hand (see the post-install message), or by
+# `sudo scripts/install.sh` from a source checkout.
 #
 # The source checksum is pinned to the v$pkgver tag tarball. Note that GitHub's
 # auto-generated archive tarballs are not guaranteed to stay byte-identical
@@ -87,18 +88,14 @@ package() {
   install -Dm644 data/man/omavrythingd.8 \
     "$pkgdir/usr/share/man/man8/omavrythingd.8"
 
-  # The omarchy-shell plugin, installed system-wide. The install helper copies
-  # it into ~/.config/omarchy/plugins/tech.alatcerdas.omavrything/.
+  # The omarchy-shell plugin, installed system-wide. The post-install message
+  # shows how to copy it into ~/.config/omarchy/plugins/tech.alatcerdas.omavrything/.
   install -d "$pkgdir/usr/share/omavrything/shell/omavrything"
   install -m644 manifest.json "$pkgdir/usr/share/omavrything/manifest.json"
   install -m644 shell/omavrything/SearchBar.qml \
     shell/omavrything/SearchOverlay.qml \
     shell/omavrything/Service.qml \
     "$pkgdir/usr/share/omavrything/shell/omavrything/"
-
-  # The plugin install helper, exposed on PATH as omavrything-install-plugin.
-  install -Dm755 scripts/install-plugin.sh \
-    "$pkgdir/usr/bin/omavrything-install-plugin"
 
   # License and documentation.
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"

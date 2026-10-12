@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end smoke test: build -> install -> enable -> use -> uninstall.
+# End-to-end smoke test: build -> install -> use -> uninstall.
 #
 # Every step is asserted: exit codes, expected output, and usage-failure
 # handling (--version, --help, unknown commands, missing arguments all have
@@ -10,6 +10,13 @@
 #
 # Needs root (the system install writes to /usr); this is what the CI smoke job
 # runs inside the Arch container.
+#
+# The installer is the unified, option-free scripts/install.sh: one command
+# installs the system integration, creates the omavrything user, adds the
+# invoking user to the group, reloads D-Bus, enables+starts the daemon, installs
+# and enables the per-user shell plugin, restarts the shell, and applies the ACL
+# bridge. There is no --system/--user/--no-start any more, and
+# scripts/install-plugin.sh is gone.
 #
 # Usage: sudo scripts/ci-smoke.sh [--keep]
 #
@@ -25,7 +32,7 @@ for arg in "$@"; do
   case "$arg" in
     --keep) keep=1 ;;
     -h | --help)
-      sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *)
@@ -138,18 +145,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# A fake `omarchy` so the plugin steps work without a running shell.
-fake_bin="$tmp/bin"
-mkdir -p "$fake_bin"
-cat > "$fake_bin/omarchy" <<'EOF'
-#!/usr/bin/env bash
-printf '%s\n' "$*" >> "${OMARCHY_LOG:-/dev/null}"
-exit 0
-EOF
-chmod +x "$fake_bin/omarchy"
-export PATH="$fake_bin:$PATH"
-export OMARCHY_LOG="$tmp/omarchy.log"
-
 # Build the release binaries. Under sudo, build as the invoking user so
 # target/ is not left with root-owned artifacts (and cargo does not create a
 # separate root-owned cache); in a root-only CI container this is a no-op
@@ -187,13 +182,13 @@ else
   printf 'skip - release archive checks (no dist/omavrything-*.zip)\n'
 fi
 
-# 1. System install (idempotent: run twice), then verify what landed.
-expect "install.sh --system succeeds" 0 --grep "Installed omavrything" -- scripts/install.sh --system
-expect "install.sh --system is idempotent" 0 -- scripts/install.sh --system
+# 1. System install (idempotent: run twice), then verify what landed. The
+# unified installer takes no options; it does the whole job in one command.
+expect "install.sh succeeds" 0 --grep "installed" -- scripts/install.sh
+expect "install.sh is idempotent" 0 -- scripts/install.sh
 for f in \
   /usr/bin/omavrythingd \
   /usr/bin/omavry \
-  /usr/bin/omavrything-install-plugin \
   /usr/lib/systemd/system/omavrythingd.service \
   /usr/lib/sysusers.d/omavrything.conf \
   /usr/share/dbus-1/system.d/tech.alatcerdas.omavrything.conf \
@@ -222,11 +217,14 @@ fi
 expect_grep "polkit set-config action installed" \
   /usr/share/polkit-1/actions/tech.alatcerdas.omavrything.policy \
   "tech.alatcerdas.omavrything.set-config"
-# Source-level guards for the install-path fix.
+# Source-level guards for the unified installer.
 expect_grep "install.sh adds the user to the group" scripts/install.sh \
   "usermod -aG omavrything"
 expect_grep "install.sh reloads D-Bus" scripts/install.sh "ReloadConfig"
-expect_grep "install.sh supports --no-start" scripts/install.sh "no_start"
+expect_grep "install.sh is option-free" scripts/install.sh "takes no options"
+expect_grep "install.sh applies the ACL bridge" scripts/install.sh "setfacl"
+expect_grep "install.sh installs the per-user plugin" scripts/install.sh \
+  "plugins/tech.alatcerdas.omavrything"
 
 # 2. The usage contract of the installed binaries. Every binary must support
 # --version, and every usage error must exit 2 with a diagnostic.
@@ -247,43 +245,44 @@ expect "omavry mount without a uuid exits 2" 2 -- /usr/bin/omavry mount
 expect "omavry config without a subcommand exits 2" 2 -- /usr/bin/omavry config
 expect "omavrythingd rejects an unknown argument with exit 2" 2 -- /usr/bin/omavrythingd --not-an-option
 
-# 3. User install (idempotent: run twice) into a throwaway HOME.
-user_home="$tmp/home"
-mkdir -p "$user_home"
-run_as_user() {
-  env HOME="$user_home" XDG_CONFIG_HOME="$user_home/.config" \
-    XDG_BIN_HOME="$user_home/.local/bin" "$@"
-}
-expect "install.sh --user succeeds" 0 --grep "Installed shell plugin" -- run_as_user scripts/install.sh --user
-expect "install.sh --user is idempotent" 0 -- run_as_user scripts/install.sh --user
-expect_path "plugin manifest installed" \
-  "$user_home/.config/omarchy/plugins/tech.alatcerdas.omavrything/manifest.json" present
-expect_path "plugin QML installed" \
-  "$user_home/.config/omarchy/plugins/tech.alatcerdas.omavrything/shell/omavrything/SearchOverlay.qml" present
-# Regression guard (2026-10-12): the widget used to hardcode
-# $XDG_RUNTIME_DIR/omavrything.sock, which the system daemon never creates, so
-# the overlay always showed "Search daemon unavailable". The QML must select
-# the system socket the same way the CLI's connect_default() does.
-overlay_qml="$user_home/.config/omarchy/plugins/tech.alatcerdas.omavrything/shell/omavrything/SearchOverlay.qml"
-expect_grep "overlay QML references the system socket" "$overlay_qml" \
-  "/run/omavrything/omavrything.sock"
-expect_grep "overlay QML probes the socket path before connecting" "$overlay_qml" \
-  "socketProbe"
-# The probe must fall back to the user socket and force a reconnect, so a system
-# socket the user cannot reach does not leave the overlay stuck on "unavailable".
-expect_grep "overlay QML falls back to the user socket" "$overlay_qml" "echo user"
-expect_grep "overlay QML reports no usable socket" "$overlay_qml" "echo none"
-expect_grep "overlay QML forces a reconnect on open" "$overlay_qml" \
-  "root.opened = false"
-expect_path "CLI symlink installed" "$user_home/.local/bin/omavry" present
-expect_grep "install.sh --user restarts the shell" "$tmp/omarchy.log" "restart shell"
+# 3. The per-user shell plugin, installed by the system install for the
+# invoking user. In a root-only CI container there is no $SUDO_USER, so the
+# installer skips the per-user steps and these checks are skipped too.
+if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+  target_home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+  plugin_dir="$target_home/.config/omarchy/plugins/tech.alatcerdas.omavrything"
+  expect_path "per-user plugin manifest installed" "$plugin_dir/manifest.json" present
+  expect_path "per-user plugin QML installed" \
+    "$plugin_dir/shell/omavrything/SearchOverlay.qml" present
+  # Regression guard (2026-10-12): the widget used to hardcode
+  # $XDG_RUNTIME_DIR/omavrything.sock, which the system daemon never creates, so
+  # the overlay always showed "Search daemon unavailable". The QML must select
+  # the system socket the same way the CLI's connect_default() does.
+  overlay_qml="$plugin_dir/shell/omavrything/SearchOverlay.qml"
+  expect_grep "overlay QML references the system socket" "$overlay_qml" \
+    "/run/omavrything/omavrything.sock"
+  expect_grep "overlay QML probes the socket path before connecting" "$overlay_qml" \
+    "socketProbe"
+  # The probe must fall back to the user socket and force a reconnect, so a
+  # system socket the user cannot reach does not leave the overlay stuck on
+  # "unavailable".
+  expect_grep "overlay QML falls back to the user socket" "$overlay_qml" "echo user"
+  expect_grep "overlay QML reports no usable socket" "$overlay_qml" "echo none"
+  expect_grep "overlay QML forces a reconnect on open" "$overlay_qml" \
+    "root.opened = false"
+  expect_path "CLI symlink installed" "$target_home/.local/bin/omavry" present
+else
+  printf 'skip - per-user plugin checks (no SUDO_USER)\n'
+fi
 
-# 4. Enable the plugin (recorded by the fake omarchy).
-omarchy plugin enable tech.alatcerdas.omavrything --section center
-expect_grep "plugin enable recorded" "$tmp/omarchy.log" \
-  "plugin enable tech.alatcerdas.omavrything"
-
-# 5. Use the daemon: search over the socket as an unprivileged user.
+# 4. Use the daemon: search over the socket as an unprivileged user. The system
+# daemon started by install.sh owns /run/omavrything/omavrything.sock; stop it
+# so the CLI's connect_default() falls back to the per-user socket under
+# $tmp/run and this section stays hermetic (it must not depend on the real
+# filesystem index).
+if [[ "$(ps -p 1 -o comm= 2>/dev/null || true)" == "systemd" ]]; then
+  systemctl stop omavrythingd >/dev/null 2>&1 || true
+fi
 run_dir="$tmp/run"
 root_dir="$tmp/root"
 mkdir -p "$run_dir" "$root_dir"
@@ -328,7 +327,11 @@ expect "search is refused outside the omavrything group" 1 \
   --grep "cannot connect" -- as_smoke /usr/bin/omavry search omavrything-smoke-marker
 
 # After group membership (the documented setup step) search must work.
-usermod -aG omavrything "$smoke_user"
+if usermod -aG omavrything "$smoke_user" 2>/dev/null; then
+  ok "added the smoke user to the omavrything group"
+else
+  fail "added the smoke user to the omavrything group"
+fi
 expect "search finds the marker file" 0 \
   --grep "omavrything-smoke-marker" -- as_smoke /usr/bin/omavry search omavrything-smoke-marker
 expect "a no-match search exits 0" 0 -- as_smoke /usr/bin/omavry search zzzz-no-such-file-zzzz
@@ -419,7 +422,7 @@ expect "a second daemon on the same socket refuses to start" 1 \
 kill "$daemon_pid" 2>/dev/null || true
 wait "$daemon_pid" 2>/dev/null || true
 
-# 6. D-Bus status, only where systemd is available (the CI container has none).
+# 5. D-Bus status, only where systemd is available (the CI container has none).
 if [[ "$(ps -p 1 -o comm= 2>/dev/null || true)" == "systemd" ]]; then
   expect "systemctl start omavrythingd" 0 -- systemctl start omavrythingd
   # install.sh must have enabled the unit at boot, not just installed it.
@@ -485,23 +488,18 @@ fi
 # below can assert it is really gone (cleanup only runs on EXIT).
 remove_smoke_user
 
-# 7. Uninstall (idempotent: run twice), then verify nothing is left behind.
+# 6. Uninstall (idempotent: run twice), then verify nothing is left behind.
+# The unified installer is system-only, so the system uninstall is the inverse
+# and also removes the per-user plugin for the invoking user.
 if [[ "$keep" == 1 ]]; then
   echo "skipping uninstall (--keep)"
 else
-  expect "uninstall.sh --user succeeds" 0 --grep "shell plugin removed" -- run_as_user scripts/uninstall.sh --user
-  expect "uninstall.sh --user is idempotent" 0 -- run_as_user scripts/uninstall.sh --user
-  expect_path "user uninstall removed the plugin" \
-    "$user_home/.config/omarchy/plugins/tech.alatcerdas.omavrything" absent
-  expect_path "user uninstall removed the CLI symlink" "$user_home/.local/bin/omavry" absent
-
-  expect "uninstall.sh (system) succeeds" 0 --grep "omavrything removed" -- scripts/uninstall.sh
-  expect "uninstall.sh (system) is idempotent" 0 -- scripts/uninstall.sh
+  expect "uninstall.sh succeeds" 0 --grep "omavrything removed" -- scripts/uninstall.sh
+  expect "uninstall.sh is idempotent" 0 -- scripts/uninstall.sh
 
   for f in \
     /usr/bin/omavrythingd \
     /usr/bin/omavry \
-    /usr/bin/omavrything-install-plugin \
     /usr/lib/systemd/system/omavrythingd.service \
     /usr/lib/sysusers.d/omavrything.conf \
     /usr/share/dbus-1/system.d/tech.alatcerdas.omavrything.conf \
@@ -529,6 +527,13 @@ else
     fail "the smoke-test user was removed"
   else
     ok "the smoke-test user was removed"
+  fi
+  # The per-user plugin and CLI symlink must be gone too.
+  if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+    target_home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+    expect_path "uninstall removed the per-user plugin" \
+      "$target_home/.config/omarchy/plugins/tech.alatcerdas.omavrything" absent
+    expect_path "uninstall removed the CLI symlink" "$target_home/.local/bin/omavry" absent
   fi
 fi
 

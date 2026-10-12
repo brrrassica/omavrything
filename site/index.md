@@ -3,7 +3,7 @@
 <p class="tagline">Instant, index-backed file search: "Everything" built for Omarchy.</p>
 <p class="lede">A search bar in your <code>omarchy-shell</code>. Start typing and a scratchpad pane of results drops over whatever you are doing, backed by a daemon that keeps every mounted filesystem indexed in memory.</p>
 <div class="badges">
-<span class="badge ok">v0.1.3</span>
+<span class="badge ok">v0.1.5</span>
 <span class="badge">Omarchy Quattro 4.x</span>
 <span class="badge">Quickshell / Qt</span>
 <span class="badge">MIT</span>
@@ -59,9 +59,7 @@ Grab the latest release archive.
 ```sh
 unzip omavrything-*.zip
 cd omavrything-*
-sudo ./scripts/install.sh --system   # daemon, CLI, systemd unit, D-Bus, polkit
-./scripts/install-plugin.sh          # shell plugin for the current user
-omarchy plugin enable tech.alatcerdas.omavrything --section center
+sudo ./scripts/install.sh   # daemon, CLI, systemd unit, D-Bus, polkit, shell plugin
 ```
 
 An AUR package is prepared under `packaging/` but is **not published yet**;

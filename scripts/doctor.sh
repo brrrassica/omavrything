@@ -36,11 +36,11 @@ if [[ -x /usr/bin/omavrythingd ]]; then
     ok "daemon: $version"
   else
     bad "daemon binary present but failed to run"
-    info "reinstall it with: sudo scripts/install.sh --system"
+    info "reinstall it with: sudo scripts/install.sh"
   fi
 else
   bad "daemon not installed at /usr/bin/omavrythingd"
-  info "install it with: sudo scripts/install.sh --system"
+  info "install it with: sudo scripts/install.sh"
 fi
 if [[ -x /usr/bin/omavry ]]; then
   ok "CLI: /usr/bin/omavry"
@@ -115,7 +115,7 @@ if [[ -n "$target_user" && "$target_user" != "root" ]]; then
   else
     warn "$target_user is not in the omavrything group"
     info "add it with: sudo usermod -aG omavrything $target_user"
-    info "then log out and back in (or run 'newgrp omavrything')"
+    info "then log out and back in (the installer's ACL covers the current session)"
   fi
 fi
 
@@ -174,7 +174,7 @@ if [[ -n "$target_user" && "$target_user" != "root" ]]; then
     ok "shell plugin installed for $target_user"
   else
     warn "shell plugin not installed for $target_user"
-    info "install it with: scripts/install-plugin.sh"
+    info "install it with: sudo scripts/install.sh"
   fi
   shell_json="$home/.config/omarchy/shell.json"
   if [[ -f "$shell_json" ]] && grep -q 'tech.alatcerdas.omavrything' "$shell_json" 2>/dev/null; then

@@ -76,7 +76,6 @@ install -Dm644 shell/omavrything/Service.qml "$stage/shell/omavrything/Service.q
 # Install and helper scripts.
 install -m755 scripts/install.sh "$stage/scripts/install.sh"
 install -m755 scripts/uninstall.sh "$stage/scripts/uninstall.sh"
-install -m755 scripts/install-plugin.sh "$stage/scripts/install-plugin.sh"
 install -m755 scripts/run-daemon.sh "$stage/scripts/run-daemon.sh"
 install -m755 scripts/restart-all.sh "$stage/scripts/restart-all.sh"
 install -m755 scripts/doctor.sh "$stage/scripts/doctor.sh"
@@ -91,24 +90,25 @@ cat > "$stage/INSTALL.txt" <<'EOF'
 omavrything release archive
 ===========================
 
-Quick start (system install, requires root):
+Quick start (one command, requires root):
 
-    sudo ./scripts/install.sh --system
+    sudo ./scripts/install.sh
 
-This creates the omavrything user, adds you to the omavrything group, reloads
-D-Bus, and enables and starts the daemon. Log out and back in (or run
-`newgrp omavrything`) so the group change takes effect. Pass --no-start to
-install without enabling or starting the daemon.
+This installs the daemon, CLI, systemd unit, D-Bus policy, polkit action, man
+page, default config, and the omarchy-shell plugin; creates the omavrything
+user; adds you to the omavrything group; reloads D-Bus; enables and starts the
+daemon; and installs, enables, and loads the shell plugin for your user.
 
-Then enable the shell plugin for your user:
+The widget works immediately: the installer grants your session access to the
+daemon socket with an ACL, so no re-login is needed now. The group change takes
+effect on your next login.
 
-    ./scripts/install-plugin.sh
-    omarchy plugin enable tech.alatcerdas.omavrything --section center
+To remove everything again (one command, requires root):
 
-To remove everything again:
+    sudo ./scripts/uninstall.sh
 
-    ./scripts/uninstall.sh --user     # the shell plugin and CLI symlink (no root)
-    sudo ./scripts/uninstall.sh       # the daemon and system integration
+This removes the daemon, CLI, systemd unit, D-Bus/polkit policy, dedicated
+user, and the per-user shell plugin for your user.
 
 See docs/install.md for the full setup, including the optional D-Bus control
 interface and the hardened systemd service.

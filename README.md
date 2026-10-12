@@ -30,15 +30,14 @@ and run the installer:
 ```sh
 unzip omavrything-*.zip
 cd omavrything-*
-sudo ./scripts/install.sh --system   # daemon, CLI, systemd unit, D-Bus, polkit
-./scripts/install-plugin.sh          # shell plugin for the current user
-omarchy plugin enable tech.alatcerdas.omavrything --section center
+sudo ./scripts/install.sh
 ```
 
-`install.sh --system` creates the `omavrything` user, adds you to the
-`omavrything` group, reloads D-Bus, and enables and starts the daemon. Log out
-and back in (or run `newgrp omavrything`) so the group change takes effect. Pass
-`--no-start` to install without enabling or starting the daemon.
+The single command installs the daemon, CLI, systemd unit, D-Bus policy, polkit
+action, man page, default config, and the shell plugin; creates the `omavrything`
+user; adds you to the `omavrything` group; reloads D-Bus; enables and starts the
+daemon; installs and enables the shell plugin; and applies a socket ACL so the
+widget works immediately. The group change takes effect on your next login.
 
 The archive contains the `omavrythingd` daemon and the `omavry` CLI under `bin/`,
 the system integration files under `data/`, the shell plugin under `shell/`, the
@@ -52,9 +51,7 @@ directory, or use the release archive / a source build as above.
 
 ```sh
 cargo build --release
-scripts/run-daemon.sh
-scripts/install-plugin.sh
-omarchy plugin enable tech.alatcerdas.omavrything --section center
+sudo scripts/install.sh
 ```
 
 Then bind a hotkey in `~/.config/hypr/bindings.lua`:
@@ -144,10 +141,10 @@ locally with `scripts/package-release.sh`.
 
 ## Removal
 
-`scripts/uninstall.sh` removes everything the installer added. It has two modes:
+`scripts/uninstall.sh` removes everything the installer added. It is
+system-only, matching the installer:
 
 ```sh
-scripts/uninstall.sh --user     # the shell plugin and CLI symlink (no root)
 sudo scripts/uninstall.sh       # the daemon, system integration, and plugin
 ```
 

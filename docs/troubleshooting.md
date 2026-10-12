@@ -56,8 +56,9 @@ allowed to connect.
    sudo usermod -aG omavrything "$USER"
    ```
 
-   Group membership only applies to **new** sessions: log out and back in, or
-   run `newgrp omavrything` in the current shell.
+   Group membership only applies to **new** sessions: log out and back in. The
+   installer also applies a socket ACL for the current session, so the widget
+   works immediately without a re-login.
 
 4. **A stale root-owned socket or lock.** If the daemon was once run as root, the
    socket and its `<socket>.lock` file are root-owned and a user-run daemon
@@ -88,7 +89,7 @@ is reloaded:
 sudo systemctl reload dbus
 ```
 
-`scripts/install.sh --system` installs the policy and reloads the bus for you.
+`scripts/install.sh` installs the policy and reloads the bus for you.
 To do it by hand:
 
 ```sh
@@ -234,18 +235,16 @@ likely a debug build or the index is much larger than expected. See
 
 ## The search bar does not appear
 
-The UI is an `omarchy-shell` plugin. Install and enable it, then restart the
-shell:
+The UI is an `omarchy-shell` plugin. The unified installer installs, validates,
+enables, and loads it, and restarts the shell:
 
 ```sh
-omavrything-install-plugin        # or scripts/install-plugin.sh from a checkout
-omarchy plugin enable tech.alatcerdas.omavrything --section center
-omarchy restart shell
+sudo scripts/install.sh
 ```
 
 A plugin **rescan** is not enough: the QML engine keeps the previously compiled
 component, so changed QML only takes effect after the shell process restarts.
-`scripts/install-plugin.sh` restarts the shell for you.
+`scripts/install.sh` restarts the shell for you.
 
 If the hotkey does nothing, confirm the binding is present in
 `~/.config/hypr/bindings.lua`:

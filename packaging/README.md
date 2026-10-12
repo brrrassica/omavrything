@@ -50,7 +50,6 @@ cargo build --release --workspace
 | --- | --- |
 | `/usr/bin/omavrythingd` | The index daemon. |
 | `/usr/bin/omavry` | The CLI client. |
-| `/usr/bin/omavrything-install-plugin` | Copies the shell plugin into the user's config. |
 | `/usr/lib/systemd/system/omavrythingd.service` | Hardened system service. |
 | `/usr/lib/sysusers.d/omavrything.conf` | The dedicated `omavrything` user/group. |
 | `/usr/share/dbus-1/system.d/tech.alatcerdas.omavrything.conf` | System-bus policy. |

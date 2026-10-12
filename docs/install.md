@@ -36,11 +36,16 @@ scripts/restart-all.sh --sudo
 
 ## 3. Install the shell plugin
 
-The search UI is an `omarchy-shell` plugin (Quickshell/QML). Install and enable
-it with:
+The search UI is an `omarchy-shell` plugin (Quickshell/QML). The unified
+installer (§6) installs, validates, enables, and loads it for the invoking user,
+so `sudo scripts/install.sh` is all you need. To do it by hand from a checkout:
 
 ```sh
-scripts/install-plugin.sh
+plugin=~/.config/omarchy/plugins/tech.alatcerdas.omavrything
+mkdir -p "$plugin/shell/omavrything"
+install -m644 manifest.json "$plugin/manifest.json"
+install -m644 shell/omavrything/*.qml "$plugin/shell/omavrything/"
+omarchy restart shell   # the shell must rescan before it knows the plugin
 omarchy plugin enable tech.alatcerdas.omavrything --section center
 ```
 
@@ -74,17 +79,17 @@ D-Bus methods and the polkit action.
 
 ## 6. Run as a system service (optional)
 
-For a persistent, hardened daemon that starts at boot, `install.sh --system`
-installs the systemd unit, the dedicated user, and the default configuration,
-then creates the user, adds you to the `omavrything` group, reloads D-Bus, and
-enables and starts the daemon:
+For a persistent, hardened daemon that starts at boot, `install.sh` installs the
+systemd unit, the dedicated user, and the default configuration, then creates the
+user, adds you to the `omavrything` group, reloads D-Bus, enables and starts the
+daemon, installs and enables the shell plugin, and applies a socket ACL so the
+widget works immediately:
 
 ```sh
-sudo scripts/install.sh --system
+sudo scripts/install.sh
 ```
 
-Log out and back in (or run `newgrp omavrything`) so the group change takes
-effect. Pass `--no-start` to install without enabling or starting the daemon.
+The group change takes effect on your next login.
 
 The equivalent manual steps are:
 
@@ -107,10 +112,10 @@ intervals, then `sudo systemctl restart omavrythingd`. See
 
 ## 7. Uninstall
 
-`scripts/uninstall.sh` reverses the install. It has two modes:
+`scripts/uninstall.sh` reverses the install. It is system-only, matching the
+installer:
 
 ```sh
-scripts/uninstall.sh --user     # the shell plugin and CLI symlink (no root)
 sudo scripts/uninstall.sh       # the daemon, system integration, and plugin
 ```
 

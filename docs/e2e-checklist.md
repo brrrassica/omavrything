@@ -36,8 +36,8 @@ Record the result of each item as pass/fail with the date and the Omarchy versio
 
 ## 3. Shell UI
 
-- [ ] `scripts/install-plugin.sh` installs the plugin and restarts the shell.
-- [ ] `omarchy plugin enable tech.alatcerdas.omavrything --section center` shows the bar widget.
+- [ ] `sudo scripts/install.sh` installs the plugin, restarts the shell, and enables it.
+- [ ] `omarchy plugin list` shows `tech.alatcerdas.omavrything` as `enabled`.
 - [ ] `SUPER + ALT + SPACE` focuses the search input.
 - [ ] Typing shows the centered scratchpad with the results table
       (Name | Size | Modified | Path).
@@ -111,9 +111,10 @@ Record the result of each item as pass/fail with the date and the Omarchy versio
 - [ ] `scripts/package-release.sh` produces `dist/omavrything-<version>-<arch>.zip`.
 - [ ] The zip contains `bin/`, `data/`, `shell/`, `scripts/`, `docs/`, `README.md`,
       and `LICENSE`.
-- [ ] Extracting the zip and running `sudo ./scripts/install.sh --system` installs
-      cleanly on a fresh system, creates the `omavrything` user, adds the invoking
-      user to the group, reloads D-Bus, and enables and starts the daemon.
-- [ ] `sudo ./scripts/install.sh --system --no-start` installs without starting
-      the daemon.
-- [ ] `./scripts/install-plugin.sh` installs the plugin from the extracted archive.
+- [ ] Extracting the zip and running `sudo ./scripts/install.sh` installs cleanly
+      on a fresh system, creates the `omavrything` user, adds the invoking user to
+      the group, reloads D-Bus, enables and starts the daemon, and installs,
+      enables, and loads the shell plugin.
+- [ ] The install summary says "enabled the plugin in the center section" and
+      "daemon is serving on D-Bus".
+- [ ] `sudo ./scripts/uninstall.sh` removes everything again.

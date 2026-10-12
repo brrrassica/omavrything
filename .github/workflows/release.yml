@@ -63,13 +63,14 @@ jobs:
 
             Download the zip below, extract it, and run:
 
-                sudo ./scripts/install.sh --system
-                ./scripts/install-plugin.sh
-                omarchy plugin enable tech.alatcerdas.omavrything --section center
+                sudo ./scripts/install.sh
 
-            `install.sh --system` creates the omavrything user, adds you to the
-            omavrything group, reloads D-Bus, and enables and starts the daemon.
-            Log out and back in (or run `newgrp omavrything`) so the group change
-            takes effect. Pass `--no-start` to install without starting the daemon.
+            The single command installs the daemon, CLI, systemd unit, D-Bus
+            policy, polkit action, man page, default config, and the shell
+            plugin; creates the omavrything user; adds you to the omavrything
+            group; reloads D-Bus; enables and starts the daemon; and installs,
+            enables, and loads the shell plugin. The installer grants your
+            session access to the daemon socket with an ACL, so the widget works
+            immediately; the group change takes effect on your next login.
 
             See `docs/install.md` inside the archive for the full setup.

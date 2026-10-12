@@ -162,10 +162,19 @@ if [[ "$sudo_daemon" == 1 ]]; then
 fi
 log "daemon running (pid $daemon_pid, log: $log_file)"
 
-# 4. Reinstall the shell plugin. install-plugin.sh restarts the shell, which is
-# required for changed QML to take effect: a plugin rescan keeps the previously
-# compiled component, so the shell process must restart.
+# 4. Reinstall the shell plugin and restart the shell. A plugin rescan keeps the
+# previously compiled component, so the shell process must restart for changed
+# QML to take effect.
 log "reinstalling shell plugin"
-scripts/install-plugin.sh
+plugin_dest="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/tech.alatcerdas.omavrything"
+mkdir -p "$plugin_dest/shell/omavrything"
+install -m644 manifest.json "$plugin_dest/manifest.json"
+install -m644 shell/omavrything/*.qml "$plugin_dest/shell/omavrything/"
+if command -v omarchy >/dev/null 2>&1; then
+  omarchy restart shell >/dev/null 2>&1 ||
+    log "could not restart the shell; run 'omarchy restart shell'"
+else
+  log "omarchy not found; restart the shell manually"
+fi
 
 log "done"

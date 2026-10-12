@@ -95,9 +95,12 @@ QML. See [`troubleshooting.md`](troubleshooting.md#the-search-bar-does-not-appea
 
 ## Install and enable
 
+The unified installer copies the plugin into
+`~/.config/omarchy/plugins/tech.alatcerdas.omavrything/`, validates it, restarts
+the shell, and enables it in the center section:
+
 ```sh
-scripts/install-plugin.sh                          # copy into ~/.config/omarchy/plugins/
-omarchy plugin enable tech.alatcerdas.omavrything --section center # place the widget + enable the plugin
+sudo scripts/install.sh
 ```
 
 The bar widget is placed in the center section, right of the `omarchy.clock`
