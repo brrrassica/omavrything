@@ -221,6 +221,18 @@ fi
 # 6. Remove the runtime and state directories owned by the service. The index
 # snapshot under /var/lib/omavrything is the only persistent state, so
 # --keep-state preserves it (and the runtime dir is always removed).
+#
+# Diagnostics: the daemon does not unmount the private NTFS mounts it created
+# (a known defect, see plans/risks.md R13). A live mount under
+# /run/omavrything/ntfs would be recursed into by the `rm -rf` below, so log
+# what is still mounted before removing the directory.
+if command -v findmnt >/dev/null 2>&1; then
+  live_ntfs="$(findmnt -rn -o TARGET,SOURCE,FSTYPE,OPTIONS | grep '^/run/omavrything/ntfs' || true)"
+  if [[ -n "$live_ntfs" ]]; then
+    warn "live NTFS mounts under /run/omavrything (the daemon does NOT unmount these):"
+    printf '%s\n' "$live_ntfs" | sed 's/^/       /'
+  fi
+fi
 if [[ "$keep_state" == 1 ]]; then
   log "keeping /var/lib/omavrything (index snapshot)"
   rm -rf /run/omavrything

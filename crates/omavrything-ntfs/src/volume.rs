@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom};
 
 use crate::boot::BootSector;
-use crate::mft::{self, FIRST_USER_RECORD, MftRecord, ROOT_RECORD};
+use crate::mft::{self, FIRST_USER_RECORD, MftRecord, ROOT_RECORD, VOLUME_RECORD};
 
 /// One file or directory discovered in the MFT.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +88,43 @@ impl<R: Read + Seek> NtfsVolume<R> {
     /// The number of MFT records.
     pub fn record_count(&self) -> u64 {
         self.record_count
+    }
+
+    /// Read MFT record `number` from the volume's MFT runs, or `None` if the
+    /// record lies beyond the MFT. The returned bytes have **not** had their
+    /// fixups applied.
+    fn read_mft_record(&mut self, number: u64) -> io::Result<Option<Vec<u8>>> {
+        let record_size = self.record_size;
+        let cluster = self.boot.cluster_size();
+        let mut target = number * record_size;
+        for &(lcn, len) in &self.mft_runs {
+            let run_bytes = len * cluster;
+            if target < run_bytes {
+                let mut rec = vec![0u8; record_size as usize];
+                self.reader.seek(SeekFrom::Start(lcn * cluster + target))?;
+                self.reader.read_exact(&mut rec)?;
+                return Ok(Some(rec));
+            }
+            target -= run_bytes;
+        }
+        Ok(None)
+    }
+
+    /// The `$VOLUME_INFORMATION` flags from the `$Volume` metadata file
+    /// (record 3), or `None` if the record or attribute is unavailable.
+    ///
+    /// Bit [`crate::mft::VOLUME_DIRTY`] means Windows did not unmount the
+    /// volume cleanly. This is a **read-only** probe used for diagnostics: it
+    /// reads one MFT record and never writes to the device.
+    pub fn volume_flags(&mut self) -> io::Result<Option<u16>> {
+        let sector = self.boot.bytes_per_sector as usize;
+        let Some(mut rec) = self.read_mft_record(VOLUME_RECORD)? else {
+            return Ok(None);
+        };
+        if !mft::apply_fixups(&mut rec, sector) {
+            return Ok(None);
+        }
+        Ok(mft::parse_volume_flags(&rec))
     }
 
     /// The maximum number of MFT bytes read into memory at once.
