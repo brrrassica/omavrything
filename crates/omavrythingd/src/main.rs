@@ -1198,7 +1198,7 @@ fn print_help() {
            --no-dbus             Disable the D-Bus control interface\n\
            --no-ntfs             Disable NTFS partition detection and indexing\n\
            --no-metadata         Skip per-file size/mtime stats (names-only; faster scan)\n\
-           --log-level <level>   Log level: error, warn, info, debug, trace (default: info)\n\
+           --log-level <level>   Log level: error, warn, info, debug, trace (default: error)\n\
            -V, --version         Show the version\n\
            -h, --help            Show this help"
     );

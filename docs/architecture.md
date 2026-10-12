@@ -202,7 +202,11 @@ flowchart TD
 | `ScanProgress` | signal | Emitted during scans. |
 
 - **polkit:** control methods (`Rescan`, `SetConfig`, `MountNtfs`) are gated by a
-  polkit action `tech.alatcerdas.omavrything.control` (`auth_admin_keep`).
+  polkit action `tech.alatcerdas.omavrything.control` (`auth_admin_keep`); the
+  cosmetic `background_opacity` key uses `tech.alatcerdas.omavrything.set-config`
+  (`allow_active=yes`). Both actions carry the
+  `org.freedesktop.policykit.owner` annotation for `unix-user:omavrything`, so
+  the unprivileged daemon may query polkit for the caller.
 
 ## 9. NTFS
 
@@ -261,7 +265,7 @@ flowchart TD
   a layer-shell `PanelWindow` with `keyboardFocus: Exclusive` while open,
   containing the input at the top and a results table below. It is **dynamically
   sized**: `widthFraction`/`heightFraction` and `maxWidth`/`maxHeight` are
-  configurable (via the `shell.json` entry settings), and the height grows with
+  hardcoded defaults, and the height grows with
   the result count up to the cap. Keyboard navigation
   (`Up`/`Down`/`PageUp`/`PageDown`/`Enter`), `Esc` dismisses. `Enter` opens the
   selected result, or the top result when no cursor is active.
@@ -305,7 +309,7 @@ watch = true                           # inotify live updates
 dbus = true                            # D-Bus control interface
 ntfs = true                            # detect and index NTFS partitions
 metadata = true                        # collect per-file size/mtime
-log_level = "info"                     # error | warn | info | debug | trace
+log_level = "error"                    # error | warn | info | debug | trace
 socket = "/run/omavrything/omavrything.sock"
 snapshot = "/var/lib/omavrything/index.snapshot"
 ```

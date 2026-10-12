@@ -32,8 +32,10 @@ ntfs = true
 # Collect per-file size and mtime (needed for the results table).
 metadata = true
 
-# Log level: error, warn, info, debug, or trace.
-log_level = "info"
+# Log level: error, warn, info, debug, or trace. The default is "error" so a
+# production daemon is quiet unless something is wrong; raise it to "info" or
+# "debug" when diagnosing.
+log_level = "error"
 
 # The system service fixes these paths on the command line; they are shown here
 # for reference and for a user-run daemon.

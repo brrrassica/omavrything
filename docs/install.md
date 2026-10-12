@@ -103,8 +103,8 @@ sudo systemctl enable --now omavrythingd
 sudo usermod -aG omavrything "$USER"   # so the shell plugin can reach the socket
 ```
 
-The service runs as the unprivileged `omavrything` user with only
-`CAP_DAC_READ_SEARCH` and `CAP_SYS_ADMIN`, and a hardened profile
+The service runs as the unprivileged `omavrything` user with only the minimal
+capability set it needs, and a hardened profile
 (`ProtectSystem=strict`, `NoNewPrivileges`, a syscall filter, and resource
 limits). Edit `/etc/omavrything/config.toml` to choose roots, excludes, and
 intervals, then `sudo systemctl restart omavrythingd`. See

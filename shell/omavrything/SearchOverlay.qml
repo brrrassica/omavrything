@@ -766,7 +766,7 @@ Item {
               }
             }
 
-            // Transparency.
+            // Opacity (0.3–1.0): dragging right makes the tile more opaque.
             Item {
               width: parent.width
               height: root.rowHeight
@@ -775,7 +775,7 @@ Item {
                 width: root.nameWidth
                 anchors.left: parent.left
                 anchors.verticalCenter: parent.verticalCenter
-                text: "Transparency"
+                text: "Opacity"
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body

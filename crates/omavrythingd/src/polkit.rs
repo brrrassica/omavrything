@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 
+use tracing::{debug, warn};
 use zbus::Connection;
 use zbus::zvariant::Value;
 
@@ -36,7 +37,9 @@ pub async fn is_authorized(connection: &Connection, uid: u32, sender: &str, acti
     if uid == 0 {
         return true;
     }
-    check_polkit(connection, sender, action).await.unwrap_or(false)
+    check_polkit(connection, sender, action)
+        .await
+        .unwrap_or(false)
 }
 
 /// Build the polkit subject for a D-Bus caller. The `system-bus-name` subject
@@ -61,9 +64,22 @@ async fn check_polkit(connection: &Connection, sender: &str, action: &str) -> zb
     // AllowUserInteraction.
     let flags: u32 = 1;
 
+    // polkit 127's `CheckAuthorization` signature is `(sa{sv})sa{ss}us`:
+    // subject, action_id, details, flags, cancellation_id. Older polkit used
+    // `s(sa{sv})a{ss}u` (action first, no cancellation_id); sending that order
+    // fails with `InvalidArgs`, which `is_authorized` would swallow as "not
+    // authorized" and every non-root `SetConfig` would be denied.
     let (authorized, _challenge, _details): (bool, bool, HashMap<String, String>) = proxy
-        .call("CheckAuthorization", &(action, subject, details, flags))
-        .await?;
+        .call("CheckAuthorization", &(subject, action, details, flags, ""))
+        .await
+        .map_err(|e| {
+            warn!(action, sender, error = %e, "polkit CheckAuthorization failed");
+            e
+        })?;
+    debug!(
+        action,
+        sender, authorized, "polkit CheckAuthorization result"
+    );
     Ok(authorized)
 }
 

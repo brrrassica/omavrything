@@ -118,8 +118,11 @@ column shows an arrow. Sorting is applied client-side to the ranked page the
 daemon returns; clearing the sort (a fresh query) restores the daemon's ranking.
 
 `SearchOverlay.qml` exposes `widthFraction`, `heightFraction`, `maxWidth`,
-`maxHeight`, `maxResults`, and `backgroundOpacity`. They are currently hardcoded
-defaults; wiring them to the plugin's `shell.json` entry settings is a follow-up.
+`maxHeight`, `maxResults`, and `backgroundOpacity`. The settings menu (gear
+button) reads the daemon's config with `omavry config get --json` and writes
+changes back through `omavry config set` (the polkit-gated D-Bus `SetConfig`),
+so the tile opacity, NTFS toggle, snapshot interval, and log level persist in
+the daemon's state config rather than the plugin's `shell.json` entry.
 
 ## Daemon socket
 

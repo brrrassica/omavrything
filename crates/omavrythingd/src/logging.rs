@@ -4,8 +4,9 @@
 //! `TIMESTAMP LEVEL target: message field=value` format that journald captures
 //! and `journalctl -o json` can parse. The level is taken from the
 //! `OMAVRYTHING_LOG` environment variable when set, otherwise from the
-//! `log_level` configuration key (default `info`). The level can be changed at
-//! runtime with [`set_level`] (used by the D-Bus `SetConfig` method).
+//! `log_level` configuration key (default `error`, so a production daemon is
+//! quiet unless something is wrong). The level can be changed at runtime with
+//! [`set_level`] (used by the D-Bus `SetConfig` method).
 
 use std::fmt;
 use std::str::FromStr;
@@ -17,11 +18,15 @@ use tracing_subscriber::reload;
 use tracing_subscriber::util::SubscriberInitExt;
 
 /// A log level, ordered from least to most verbose.
+///
+/// The default is `error`: a production daemon should be quiet unless
+/// something is actually wrong. `info` (the old default) is too verbose for
+/// end users and is now opt-in via `log_level` or `OMAVRYTHING_LOG`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LogLevel {
+    #[default]
     Error,
     Warn,
-    #[default]
     Info,
     Debug,
     Trace,
@@ -74,7 +79,7 @@ static RELOAD: OnceLock<reload::Handle<EnvFilter, tracing_subscriber::Registry>>
 
 pub fn init(level: LogLevel) {
     let spec = std::env::var("OMAVRYTHING_LOG").unwrap_or_else(|_| level.as_str().to_string());
-    let filter = EnvFilter::try_new(&spec).unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_new(&spec).unwrap_or_else(|_| EnvFilter::new("error"));
     let (filter, handle) = reload::Layer::new(filter);
     // `try_init` fails if a subscriber is already installed; that is fine.
     let _ = tracing_subscriber::registry()

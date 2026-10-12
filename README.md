@@ -16,12 +16,10 @@ system daemon (`omavrythingd`) keeps an in-memory index of all mounted
 filesystems — using directory traversal + inotify for Linux filesystems
 (btrfs/ext4/xfs/f2fs) and the MFT for NTFS partitions.
 
-> **Status:** v0.1.5 (hotfix release). See [`docs/`](docs/) and the
+> **Status:** v0.1.5. See [`docs/`](docs/) and the
 > [changelog](CHANGELOG.md).
 
 ## Install from a release
-
-> **Important: Use v0.1.5 or newer** See the [changelog](CHANGELOG.md).
 
 Download the latest `omavrything-<version>-<arch>.zip` from the
 [releases page](https://github.com/brrrassica/omavrything/releases), extract it,
@@ -91,11 +89,10 @@ There is no network client in the daemon and no telemetry: the UI and the daemon
 communicate over a local Unix socket.
 
 The daemon (`omavrythingd`) is a system service, but it does not run as full
-root. It runs as the dedicated `omavrything` user holding only two capabilities:
-`CAP_DAC_READ_SEARCH` (to read paths the indexer could not otherwise see) and
-`CAP_SYS_ADMIN` (to mount an NTFS volume read-only when the kernel driver cannot
-read the MFT directly). It indexes mounted filesystems by traversal + inotify,
-and reads NTFS partitions from the MFT on the block device.
+root. It runs as the dedicated `omavrything` user holding only the minimal
+capability set it needs (raw-device read, and a read-only NTFS mount when the
+kernel driver cannot read the MFT directly). It indexes mounted filesystems by
+traversal + inotify, and reads NTFS partitions from the MFT on the block device.
 
 **Nothing is sent anywhere.** The UI talks to the daemon over a local Unix socket
 (`/run/omavrything/omavrything.sock` for the system service, or
@@ -105,7 +102,10 @@ client in the daemon and no telemetry.
 Control operations on the optional D-Bus interface are gated by the polkit action
 `tech.alatcerdas.omavrything.control` (`auth_admin_keep`); the cosmetic
 `background_opacity` setting uses `tech.alatcerdas.omavrything.set-config`
-(`allow_active=yes`) so the settings panel can save without a prompt.
+(`allow_active=yes`) so the settings panel can save without a prompt. Both
+actions are owned by the `omavrything` user (the daemon's identity) via the
+`org.freedesktop.policykit.owner` annotation, so the unprivileged daemon can
+query polkit for the caller.
 
 **Degraded mode.** Without the daemon the search bar still appears and the
 overlay still opens; it reports that the daemon is unavailable rather than

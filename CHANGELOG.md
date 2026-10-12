@@ -8,18 +8,19 @@ Notable changes to `omavrything`. The format follows
 
 ## [0.1.5] — 2026-10-12
 
-A hotfix release for four defects that made a fresh 0.1.4 install unusable.
+A release that fixes four defects that made a fresh 0.1.4 install unusable, and
+replaces the multi-command install flow with a single, option-free installer.
 
 ### Fixed
 
-- **A fresh install never started the daemon.** `scripts/install.sh --system`
-  installed the systemd unit but did not enable or start it, did not add the
-  invoking user to the `omavrything` group, and swallowed `systemd-sysusers`
-  errors. After the documented three commands the unit was inactive and the user
-  was not in the socket group, so the widget reported "Search daemon unavailable"
-  and the CLI could not connect. The installer now creates the user (failing
-  loudly), adds `$SUDO_USER` to the group, and enables and starts the daemon;
-  `--no-start` opts out. The release instructions and `INSTALL.txt` were updated.
+- **A fresh install never started the daemon.** `scripts/install.sh` installed
+  the systemd unit but did not enable or start it, did not add the invoking user
+  to the `omavrything` group, and swallowed `systemd-sysusers` errors. After the
+  documented commands the unit was inactive and the user was not in the socket
+  group, so the widget reported "Search daemon unavailable" and the CLI could not
+  connect. The installer now creates the user (failing loudly), adds `$SUDO_USER`
+  to the group, and enables and starts the daemon. The release instructions and
+  `INSTALL.txt` were updated.
 - **The D-Bus policy was installed but never reloaded.** A bus that was already
   running before the install did not see the new policy, so the daemon could not
   own its name and every control command returned
@@ -37,13 +38,38 @@ A hotfix release for four defects that made a fresh 0.1.4 install unusable.
   `tech.alatcerdas.omavrything.set-config` action (`allow_active=yes`), so the
   settings panel saves without a prompt and without sharing the privileged
   `control` action with `MountNtfs`.
+- **polkit `CheckAuthorization` used the pre-0.126 argument order.** The daemon
+  sent `s(sa{sv})a{ss}u` (action first); polkit 127 expects `(sa{sv})sa{ss}us`
+  (subject first, plus a trailing `cancellation_id`), so the call failed with
+  `InvalidArgs` and every non-root `SetConfig` was denied. The daemon now sends
+  `(subject, action, details, flags, "")`. polkit 127 also only lets trusted
+  callers (uid 0 or an action owner) check another identity, so both actions
+  carry the `org.freedesktop.policykit.owner` annotation for
+  `unix-user:omavrything`; without it the unprivileged daemon is refused with
+  `NotAuthorized`.
 
 ### Changed
 
+- **The installer is now a single, option-free command.** `scripts/install.sh`
+  (system-only) replaces the old `--system`/`--user`/`--no-start` interface and
+  the `scripts/install-plugin.sh` helper; `scripts/uninstall.sh` is likewise
+  system-only. The installer removes any previous installation first (keeping the
+  config, the dedicated user, and the cached index), waits for the daemon socket
+  **and** the D-Bus name before returning, and applies the `setfacl` ACL bridge
+  so the widget works in the current session without a re-login.
+- **The daemon's default log level is now `error`.** A production daemon is
+  quiet unless something is wrong; `info` was too verbose for end users. Raise it
+  with `--log-level info`/`debug`, the `log_level` config key, or
+  `OMAVRYTHING_LOG`. The shipped `config.toml`, the man page, and the docs were
+  updated.
 - `scripts/doctor.sh` now checks group membership, daemon enablement, the
   `set-config` polkit action, and hints at reloading D-Bus.
 - `scripts/ci-smoke.sh` asserts the user/group, daemon enablement, the new polkit
-  action, and the overlay socket fallback.
+  action, and the overlay socket fallback. It now also **exercises the daemon's
+  polkit `CheckAuthorization` path** (a non-root `SetConfig` in an active session
+  must be authorized and persist) and asserts the fail-closed inverse (a non-root
+  caller cannot set a privileged key or rescan), so the polkit 127 argument-order
+  regression is caught by CI.
 
 ## [0.1.4] — 2026-10-12
 

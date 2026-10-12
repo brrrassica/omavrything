@@ -292,10 +292,12 @@ chmod 755 "$run_dir" # the client user must be able to traverse to the socket
 # closes the pipe while the CLI is still writing (broken-pipe regression).
 for i in $(seq 1 100); do : > "$root_dir/omavrything-pipe-$i.txt"; done
 # --no-config so the installed /etc/omavrything/config.toml (auto = true) does
-# not override the explicit --root.
+# not override the explicit --root. --log-level info because the default is now
+# `error` (a production daemon is quiet); the check below asserts the startup
+# `listening` line, which is logged at info.
 /usr/bin/omavrythingd \
   --no-config --root "$root_dir" --socket "$run_dir/omavrything.sock" \
-  --no-dbus --no-snapshot --no-ntfs --no-watch \
+  --no-dbus --no-snapshot --no-ntfs --no-watch --log-level info \
   >"$tmp/daemon.log" 2>&1 &
 daemon_pid=$!
 
@@ -319,6 +321,36 @@ as_smoke() {
   runuser -u "$smoke_user" -- env \
     HOME="$tmp/smoke-home" PATH="/usr/bin:/bin" \
     XDG_RUNTIME_DIR="$run_dir" "$@"
+}
+
+# Whether `user` has an active login session. polkit's `allow_active=yes` only
+# applies to a caller in an active session, so the polkit SetConfig guard below
+# can only run when one exists.
+user_has_active_session() {
+  local user="$1" sid
+  command -v loginctl >/dev/null 2>&1 || return 1
+  while read -r sid; do
+    if [[ "$(loginctl show-session "$sid" -p Active --value 2>/dev/null)" == "yes" ]]; then
+      return 0
+    fi
+  done < <(loginctl list-sessions --no-legend 2>/dev/null | awk -v u="$user" '$3 == u { print $1 }')
+  return 1
+}
+
+# Run a command in `user`'s active session. `runuser` alone runs the process in
+# root's session, which polkit treats as inactive, so a cosmetic SetConfig would
+# be denied by design and the check would be meaningless. `systemd-run --user`
+# places the process in the user's session cgroup, which polkit resolves to the
+# active session. Returns the command's exit status.
+as_user_session() {
+  local user="$1"; shift
+  local uid runtime
+  uid="$(id -u "$user")"
+  runtime="/run/user/$uid"
+  runuser -u "$user" -- env \
+    XDG_RUNTIME_DIR="$runtime" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime/bus" \
+    systemd-run --user --wait --pipe --collect --quiet "$@"
 }
 
 # Before the documented group-membership step the socket must refuse the
@@ -475,6 +507,40 @@ assert "version" in data, data
   fi
   expect "config get exposes the documented keys" 0 \
     --grep "scan_interval" -- as_smoke /usr/bin/omavry config get
+  # Regression guard (2026-10-12, §3.37): the daemon's polkit
+  # CheckAuthorization call used the pre-0.126 argument order, so every
+  # non-root SetConfig was denied and the settings menu did not persist. The
+  # cosmetic `set-config` action is allow_active=yes, so a caller in an active
+  # session must be able to set it without a prompt. `runuser` alone runs in
+  # root's session (inactive), so the check goes through `systemd-run --user`
+  # in the invoking user's session; it is skipped only when there is no active
+  # session to test from (e.g. a root-only CI container).
+  if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]] \
+    && command -v systemd-run >/dev/null 2>&1 \
+    && user_has_active_session "$SUDO_USER"; then
+    if as_user_session "$SUDO_USER" /usr/bin/omavry config set background_opacity 0.8; then
+      get_out="$(as_smoke /usr/bin/omavry config get 2>&1 || true)"
+      if grep -q "background_opacity: 0.8" <<<"$get_out"; then
+        ok "non-root SetConfig is authorized and persists (polkit argument order)"
+      else
+        fail "non-root SetConfig persisted (got: $(grep background_opacity <<<"$get_out" || echo none))"
+      fi
+    else
+      fail "non-root SetConfig is authorized in an active session (polkit argument order)"
+    fi
+    # Restore the default so the check is idempotent.
+    as_user_session "$SUDO_USER" /usr/bin/omavry config set background_opacity 0.75 >/dev/null 2>&1 || true
+  else
+    printf 'skip - non-root SetConfig check (no active session to test from)\n'
+  fi
+  # Fail-closed guard: the cosmetic `set-config` action must not be usable to
+  # change a privileged key. The smoke user has no session, so the `control`
+  # action (auth_admin_keep) denies it; the daemon must return AccessDenied,
+  # never silently apply the change.
+  expect "a non-root caller cannot set a privileged key" 1 \
+    --grep "not authorized" -- as_smoke /usr/bin/omavry config set excludes /tmp
+  expect "a non-root caller cannot rescan" 1 \
+    --grep "not authorized" -- as_smoke /usr/bin/omavry rescan
   # Stopping the daemon must remove the socket with it (RuntimeDirectory
   # cleanup): a stale socket would make clients hang or fail confusingly.
   systemctl stop omavrythingd >/dev/null 2>&1 || true

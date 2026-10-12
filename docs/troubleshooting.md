@@ -8,8 +8,9 @@ journalctl -u omavrythingd -f          # system service
 tail -f "${XDG_STATE_HOME:-$HOME/.local/state}/omavrything/daemon.log"  # user-run daemon
 ```
 
-Raise the verbosity with `--log-level debug` (or the `log_level` config key, or
-`OMAVRYTHING_LOG=omavrythingd=debug`).
+The default log level is `error`, so a healthy daemon is quiet. Raise the
+verbosity with `--log-level info` (or `debug`), the `log_level` config key, or
+`OMAVRYTHING_LOG=omavrythingd=debug`.
 
 For a one-shot diagnosis of every component, run:
 
@@ -110,7 +111,10 @@ control. Use the system service for `status`/`config`/`rescan`/`mount`.
 prompt for authentication. The cosmetic `background_opacity` key uses the
 separate `tech.alatcerdas.omavrything.set-config` action (`allow_active=yes`), so
 the settings panel can save the tile opacity without a prompt and without
-granting `MountNtfs`.
+granting `MountNtfs`. Both actions carry the
+`org.freedesktop.policykit.owner` annotation for `unix-user:omavrything`, so the
+daemon (which runs as that unprivileged user, not root) is allowed to query
+polkit for the caller's authorization.
 
 ## inotify watch limits
 
@@ -144,8 +148,8 @@ updates entirely with `--no-watch`.
 error reading the raw device.
 
 Indexing NTFS reads the **MFT directly from the raw block device**, which
-requires `CAP_DAC_READ_SEARCH` (or root). The system service has that capability;
-a user-run daemon does not.
+requires raw-device read access (or root). The system service has that
+capability; a user-run daemon does not.
 
 1. **Run with the right privileges.** For a user-run daemon:
 
@@ -182,7 +186,7 @@ a user-run daemon does not.
    offer and is indexed on demand via `MountNtfs`:
 
    ```sh
-   omavry mount <uuid>     # not yet implemented (M10); use the D-Bus method
+   omavry mount <uuid>     # mounts and indexes the partition (D-Bus, polkit)
    ```
 
 6. **A partition that is not mounted at startup** is validated by its mount

@@ -73,9 +73,9 @@ directly:
 - **`ntfs3` fallback** — a private read-only mount at
   `/run/omavrything/ntfs/<uuid>`.
 
-Both are spawned as subprocesses. The daemon's systemd unit grants only
-`CAP_DAC_READ_SEARCH` (read raw devices) and `CAP_SYS_ADMIN` (the fallback
-mount), and `ProtectSystem=strict` makes the rest of the filesystem read-only.
+Both are spawned as subprocesses. The daemon's systemd unit grants only the
+minimal capability set it needs (raw-device read and the fallback mount), and
+`ProtectSystem=strict` makes the rest of the filesystem read-only.
 
 ## 4. Privilege and input boundaries
 

@@ -12,6 +12,11 @@
       <allow_inactive>auth_admin</allow_inactive>
       <allow_active>auth_admin_keep</allow_active>
     </defaults>
+    <!-- The daemon runs as the unprivileged `omavrything` user, not root.
+         polkit 127 only lets trusted callers (uid 0 or an action owner) call
+         CheckAuthorization() for another identity, so the daemon must be an
+         owner of the action to check the caller's authorization. -->
+    <annotate key="org.freedesktop.policykit.owner">unix-user:omavrything</annotate>
   </action>
   <!-- Cosmetic settings (the scratchpad opacity) are allowed for the active
        local user without a prompt, so the settings panel can save. Privileged
@@ -25,5 +30,6 @@
       <allow_inactive>auth_admin</allow_inactive>
       <allow_active>yes</allow_active>
     </defaults>
+    <annotate key="org.freedesktop.policykit.owner">unix-user:omavrything</annotate>
   </action>
 </policyconfig>

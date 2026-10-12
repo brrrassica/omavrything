@@ -10,6 +10,11 @@ is 10–50× slower and will make the UI feel broken.
 
 Record the result of each item as pass/fail with the date and the Omarchy version.
 
+> **Log level.** The daemon's default log level is `error` (a production daemon
+> is quiet). The items below that refer to the startup/lifecycle log
+> (`listening`, `indexed`, `snapshot written`, `warm-started`, NTFS offers)
+> require raising it: pass `--log-level info` or set `log_level = "info"`.
+
 ## 0. Environment
 
 - [ ] Omarchy Quattro (4.x) on Hyprland, `omarchy-shell` running.
@@ -18,7 +23,8 @@ Record the result of each item as pass/fail with the date and the Omarchy versio
 
 ## 1. Daemon startup and indexing
 
-- [ ] `scripts/run-daemon.sh` starts and logs `listening` with the socket path.
+- [ ] `scripts/run-daemon.sh --log-level info` starts and logs `listening` with
+      the socket path.
 - [ ] The startup log reports the indexed entry count and each root with its
       filesystem kind.
 - [ ] `omavry status` reports a non-zero entry count and the same roots.
@@ -56,16 +62,18 @@ Record the result of each item as pass/fail with the date and the Omarchy versio
 ## 5. Settings menu
 
 - [ ] The gear button opens the settings menu.
-- [ ] Changing `backgroundOpacity` updates the tile live.
-- [ ] Releasing the transparency slider saves without a password prompt
-      (`set-config` action) and the value survives reopening the panel.
+- [ ] Changing the "Opacity" slider updates the tile live.
+- [ ] Releasing the opacity slider saves without a password prompt
+      (`set-config` action) and the value survives reopening the panel
+      (regression guard for the polkit 127 `CheckAuthorization` bug).
 - [ ] Toggling NTFS, changing the snapshot interval, and changing the log level
       apply to the daemon (these prompt for authentication).
 - [ ] The changes persist across a daemon restart (state config).
 
 ## 6. Persistence and warm start
 
-- [ ] Stop the daemon cleanly (`SIGTERM`); the log reports `snapshot written`.
+- [ ] Stop the daemon cleanly (`SIGTERM`); the log (at `--log-level info`)
+      reports `snapshot written`.
 - [ ] Restart; the log reports `warm-started from snapshot` and no full scan.
 - [ ] Corrupt the snapshot (`truncate -s 100 <snapshot>`); restart falls back to
       `<snapshot>.prev`, then to a cold scan if that is also bad.
@@ -83,7 +91,7 @@ Record the result of each item as pass/fail with the date and the Omarchy versio
 
 ## 8. NTFS (requires a real NTFS partition)
 
-- [ ] The partition is detected and logged as a new offer.
+- [ ] The partition is detected and logged as a new offer (at `--log-level info`).
 - [ ] `omavry mount <uuid>` mounts it read-only and indexes it via the MFT.
 - [ ] Results match the partition contents.
 - [ ] After a restart the partition is auto-mounted and indexed (remembered).
@@ -93,7 +101,8 @@ Record the result of each item as pass/fail with the date and the Omarchy versio
 - [ ] `sudo systemctl enable --now omavrythingd` starts the service.
 - [ ] The service survives `sudo systemctl restart omavrythingd`.
 - [ ] `systemd-analyze security omavrythingd` reports a hardened profile.
-- [ ] `journalctl -u omavrythingd` shows structured log lines.
+- [ ] `journalctl -u omavrythingd` shows structured log lines (raise
+      `log_level` to `info` first; the default is `error`).
 
 ## 10. Resource use
 
