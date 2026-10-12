@@ -10,8 +10,8 @@
 # to the omavrything group; reloads D-Bus; enables and starts the daemon; and
 # installs, enables, and loads the shell plugin for the invoking user.
 #
-# The script auto-detects the layout: a release archive has bin/ and data/ at the
-# top level, while a source checkout has target/release/ and the same data/ tree.
+# The binaries are read from bin/ at the top level, the same layout the release
+# archive ships. In a source checkout, run scripts/build.sh first to populate it.
 #
 # There are no options. The invoking user (the one who ran sudo) is the user the
 # shell plugin is installed for; run it with sudo, not as root directly.
@@ -37,13 +37,12 @@ die() {
   exit 1
 }
 
-# Locate the built binaries: release archive first, then a source checkout.
-if [[ -x "$here/bin/omavrythingd" ]]; then
-  bindir="$here/bin"
-elif [[ -x "$here/target/release/omavrythingd" ]]; then
-  bindir="$here/target/release"
-else
-  die "omavrythingd not found; build it with 'cargo build --release'"
+# Locate the release binaries. They live in bin/ at the top level, the same
+# layout the release archive ships; a source checkout populates it with
+# scripts/build.sh.
+bindir="$here/bin"
+if [[ ! -x "$bindir/omavrythingd" || ! -x "$bindir/omavry" ]]; then
+  die "omavrythingd/omavry not found in bin/; run scripts/build.sh first"
 fi
 
 # Remove any previous installation first so an upgrade leaves nothing stale

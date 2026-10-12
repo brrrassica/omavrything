@@ -5,7 +5,7 @@ and a hermetic daemon integration test. The items below require a real Omarchy
 Quattro desktop, a real filesystem, and (for NTFS) a real partition, so they are
 verified by hand before a release.
 
-Run the checklist on a **release build** (`cargo build --release`); a debug build
+Run the checklist on a **release build** (`scripts/build.sh`); a debug build
 is 10–50× slower and will make the UI feel broken.
 
 Record the result of each item as pass/fail with the date and the Omarchy version.
@@ -18,7 +18,7 @@ Record the result of each item as pass/fail with the date and the Omarchy versio
 ## 0. Environment
 
 - [ ] Omarchy Quattro (4.x) on Hyprland, `omarchy-shell` running.
-- [ ] `cargo build --release` succeeds.
+- [ ] `scripts/build.sh` succeeds.
 - [ ] `omavrythingd --help` and `omavry --help` print usage.
 
 ## 1. Daemon startup and indexing

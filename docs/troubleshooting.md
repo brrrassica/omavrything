@@ -202,11 +202,11 @@ The daemon must be built in **release** mode. A debug build is roughly 10x
 slower, which turns a sub-millisecond query into hundreds of milliseconds.
 
 ```sh
-cargo build --release -p omavrythingd
+scripts/build.sh
 ```
 
 `scripts/run-daemon.sh` and `scripts/restart-all.sh --rebuild` always build the
-release binary. To see where the time goes, set `OMAVRYTHING_PROFILE=1` and every
+release binary into `bin/`. To see where the time goes, set `OMAVRYTHING_PROFILE=1` and every
 search logs a stage-by-stage breakdown:
 
 ```sh

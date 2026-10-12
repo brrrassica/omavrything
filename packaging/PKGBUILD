@@ -51,7 +51,9 @@ sha256sums=('62757fe2452bc1471188e206c78bdb465adb37d04c372ee297ce45000de89d73')
 build() {
   cd "$pkgname-$pkgver"
   export CARGO_TARGET_DIR=target
-  cargo build --release --locked --workspace
+  # scripts/build.sh compiles the workspace and stages the daemon and CLI in
+  # bin/, the same layout the release archive ships and install.sh reads.
+  scripts/build.sh
 }
 
 check() {
@@ -65,9 +67,9 @@ check() {
 package() {
   cd "$pkgname-$pkgver"
 
-  # Binaries.
-  install -Dm755 target/release/omavrythingd "$pkgdir/usr/bin/omavrythingd"
-  install -Dm755 target/release/omavry "$pkgdir/usr/bin/omavry"
+  # Binaries (scripts/build.sh stages them in bin/).
+  install -Dm755 bin/omavrythingd "$pkgdir/usr/bin/omavrythingd"
+  install -Dm755 bin/omavry "$pkgdir/usr/bin/omavry"
 
   # systemd unit and the dedicated user/group.
   install -Dm644 data/systemd/omavrythingd.service \

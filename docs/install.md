@@ -9,10 +9,11 @@ used waybar.
 ## 1. Build the daemon and CLI
 
 ```sh
-cargo build --release
+scripts/build.sh
 ```
 
-This produces the `omavrythingd` daemon and the `omavry` CLI. See
+This compiles the workspace and writes the `omavrythingd` daemon and the
+`omavry` CLI into `bin/`, the same layout the release archive ships. See
 [`development.md`](development.md) for the full build, test, and lint workflow.
 
 ## 2. Run the daemon

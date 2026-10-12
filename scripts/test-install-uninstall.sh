@@ -144,7 +144,7 @@ else
 fi
 
 # --- C1/C6/C11: the release archive ships the expected files ----------------
-if [[ -x target/release/omavrythingd && -x target/release/omavry ]]; then
+if [[ -x bin/omavrythingd && -x bin/omavry ]]; then
   if scripts/package-release.sh --no-build >/dev/null 2>&1; then
     archive="$(ls -1 dist/omavrything-*.zip 2>/dev/null | tail -n1 || true)"
     # Capture the listing first: `unzip -l | grep -q` would SIGPIPE unzip when
@@ -168,7 +168,7 @@ if [[ -x target/release/omavrythingd && -x target/release/omavry ]]; then
     bad "scripts/package-release.sh --no-build failed"
   fi
 else
-  printf 'skip - archive check (build target/release first)\n'
+  printf 'skip - archive check (run scripts/build.sh first)\n'
 fi
 
 # --- C12: the overlay QML targets the system socket --------------------------

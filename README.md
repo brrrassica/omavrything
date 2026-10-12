@@ -48,7 +48,7 @@ directory, or use the release archive / a source build as above.
 ## Quick start (from source)
 
 ```sh
-cargo build --release
+scripts/build.sh
 sudo scripts/install.sh
 ```
 

@@ -13,7 +13,7 @@
 # The version defaults to the workspace version in Cargo.toml. The archive is
 # what the GitHub release workflow uploads; running it locally verifies the
 # release can be assembled before a tag is pushed. --no-build reuses the
-# existing target/release binaries instead of rebuilding.
+# existing bin/ binaries instead of rebuilding.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -43,18 +43,18 @@ archive="$dist/$name.zip"
 
 echo "Packaging $name"
 
-# Build the release binaries. --locked keeps the build reproducible against the
-# committed Cargo.lock. --no-build reuses the existing target/release binaries.
+# Build the release binaries into bin/. --no-build reuses the existing bin/
+# binaries instead of rebuilding.
 if [[ "$build" == 1 ]]; then
-  cargo build --release --locked --workspace
+  "$here/scripts/build.sh"
 fi
 
 rm -rf "$stage"
 mkdir -p "$stage"/{bin,data,shell,scripts,docs}
 
-# Executables.
-install -m755 target/release/omavrythingd "$stage/bin/omavrythingd"
-install -m755 target/release/omavry "$stage/bin/omavry"
+# Executables, read from bin/ (the canonical release binary path).
+install -m755 "$here/bin/omavrythingd" "$stage/bin/omavrythingd"
+install -m755 "$here/bin/omavry" "$stage/bin/omavry"
 
 # System integration data, preserving the source layout so the installer and the
 # PKGBUILD can share it.

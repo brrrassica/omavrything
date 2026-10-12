@@ -22,8 +22,9 @@ makepkg -si
 release the tag does not exist yet, so build from the working tree instead:
 
 ```sh
-# From the repository root, install into a staging root without a tarball:
-cargo build --release --workspace
+# From the repository root, build the release binaries into bin/ (the same
+# layout the release archive ships and install.sh reads):
+scripts/build.sh
 ```
 
 ## Publishing to the AUR

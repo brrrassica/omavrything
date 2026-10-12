@@ -145,24 +145,27 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Build the release binaries. Under sudo, build as the invoking user so
-# target/ is not left with root-owned artifacts (and cargo does not create a
+# Build the release binaries into bin/ via scripts/build.sh, the single build
+# step. install.sh reads the binaries from bin/, so building with a bare
+# `cargo build` (which only populates target/release) would leave the installer
+# with nothing to install. Under sudo, build as the invoking user so target/
+# and bin/ are not left with root-owned artifacts (and cargo does not create a
 # separate root-owned cache); in a root-only CI container this is a no-op
 # branch and the build runs as root.
 if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
-  runuser -u "$SUDO_USER" -- cargo build --release --locked --workspace
+  runuser -u "$SUDO_USER" -- "$here/scripts/build.sh"
 else
-  cargo build --release --locked --workspace
+  "$here/scripts/build.sh"
 fi
 
 # Guard against the sudo-build poisoning seen before: when the build ran as
-# $SUDO_USER, no file under target/ may be owned by root.
+# $SUDO_USER, no file under target/ or bin/ may be owned by root.
 if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
-  root_owned="$(find target -user root 2>/dev/null | wc -l)"
+  root_owned="$(find target bin -user root 2>/dev/null | wc -l)"
   if [[ "$root_owned" -eq 0 ]]; then
-    ok "no root-owned files in target/ after the sudo build"
+    ok "no root-owned files in target/ or bin/ after the sudo build"
   else
-    fail "no root-owned files in target/ after the sudo build ($root_owned found)"
+    fail "no root-owned files in target/ or bin/ after the sudo build ($root_owned found)"
   fi
 fi
 

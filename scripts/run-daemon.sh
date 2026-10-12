@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build and run the omavrythingd daemon for local development.
+# Run the omavrythingd daemon for local development.
 #
 # Usage: scripts/run-daemon.sh [--root <dir>] [--socket <path>]
 # Defaults: root=$HOME, socket=$XDG_RUNTIME_DIR/omavrything.sock
@@ -12,5 +12,9 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$here"
 
-cargo build --release -p omavrythingd
-exec ./target/release/omavrythingd "$@"
+# The daemon is read from bin/, the same layout the release archive ships. In a
+# source checkout, build it into bin/ first if it is not there yet.
+if [[ ! -x "$here/bin/omavrythingd" ]]; then
+  "$here/scripts/build.sh"
+fi
+exec "$here/bin/omavrythingd" "$@"

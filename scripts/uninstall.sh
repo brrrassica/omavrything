@@ -140,6 +140,10 @@ rm -f /usr/lib/systemd/system/omavrythingd.service
 rm -f /usr/lib/sysusers.d/omavrything.conf
 rm -f /usr/share/dbus-1/system.d/tech.alatcerdas.omavrything.conf
 rm -f /usr/share/polkit-1/actions/tech.alatcerdas.omavrything.policy
+# Pre-rename (<= 0.1.4) bus/polkit names, so an upgrade from an old install
+# leaves nothing behind (the CHANGELOG documents the rename).
+rm -f /usr/share/dbus-1/system.d/org.omarchy.omavrything.conf
+rm -f /usr/share/polkit-1/actions/org.omarchy.omavrything.policy
 rm -f /usr/share/man/man8/omavrythingd.8
 rm -rf /usr/share/omavrything
 rm -rf /usr/share/licenses/omavrything
@@ -203,11 +207,13 @@ if changed:
 PY
   fi
 
-  # The CLI symlink and the daemon's per-user socket/log.
+  # The CLI symlink, the daemon's per-user socket/log, and the overlay's
+  # query-mirror file (written by SearchOverlay.qml, watched by SearchBar.qml).
   rm -f "$user_home/.local/bin/omavry"
   if [[ -n "$user_uid" ]]; then
     rm -f "/run/user/$user_uid/omavrything.sock" \
-      "/run/user/$user_uid/omavrything.sock.lock"
+      "/run/user/$user_uid/omavrything.sock.lock" \
+      "/run/user/$user_uid/omavrything-query"
   fi
   rm -rf "$user_home/.local/state/omavrything"
 fi
