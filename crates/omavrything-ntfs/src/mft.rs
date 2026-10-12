@@ -415,7 +415,10 @@ mod tests {
             rec
         }
 
-        assert_eq!(parse_volume_flags(&volume_record(VOLUME_DIRTY)), Some(VOLUME_DIRTY));
+        assert_eq!(
+            parse_volume_flags(&volume_record(VOLUME_DIRTY)),
+            Some(VOLUME_DIRTY)
+        );
         assert_eq!(parse_volume_flags(&volume_record(0)), Some(0));
         // A record with no `$VOLUME_INFORMATION` attribute yields `None`.
         let mut empty = vec![0u8; 0x40];

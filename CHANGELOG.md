@@ -4,7 +4,11 @@ Notable changes to `omavrything`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.6] — 2026-10-12
+
+A diagnostics-and-hardening release. It adds read-only NTFS mount and volume
+diagnostics for the known mount-lifecycle defect, and closes a clipboard stall
+in the overlay.
 
 ### Security
 
@@ -17,6 +21,19 @@ Notable changes to `omavrything`. The format follows
   shell with no paste action and no field focus. The input is now created by a
   `Loader` gated on the overlay's open state and torn down on close, and
   `scripts/ci-smoke.sh` guards the lazy instantiation.
+
+### Added
+
+- **NTFS mount and volume diagnostics.** The daemon now logs, at `info`, every
+  NTFS mount attempt and result (udisks2 and the private `ntfs3` fallback),
+  whether a mount was reused or daemon-created, and the filesystem type and
+  options from `/proc/mounts`. It also reads the `$Volume` record's
+  `$VOLUME_INFORMATION` flags (a read-only probe) and logs the dirty bit before
+  the MFT read, so a volume Windows did not unmount cleanly is visible in the
+  logs. On shutdown the daemon warns with the list of daemon-created mounts it
+  does **not** unmount (the known defect, `plans/risks.md` R13), and
+  `scripts/uninstall.sh` warns about any live mounts under
+  `/run/omavrything/ntfs` before removing the runtime directory.
 
 ## [0.1.5] — 2026-10-12
 
@@ -244,6 +261,7 @@ Then install 0.1.1, run `omavrything-install-plugin`, and enable
 First release: the `omavrythingd` index daemon, the `omavry` CLI, and the
 `omarchy-shell` search plugin (bar widget, overlay, service).
 
+[0.1.6]: https://github.com/brrrassica/omavrything/releases/tag/v0.1.6
 [0.1.5]: https://github.com/brrrassica/omavrything/releases/tag/v0.1.5
 [0.1.3]: https://github.com/brrrassica/omavrything/releases/tag/v0.1.3
 [0.1.2]: https://github.com/brrrassica/omavrything/releases/tag/v0.1.2

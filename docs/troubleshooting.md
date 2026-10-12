@@ -194,6 +194,15 @@ capability; a user-run daemon does not.
    when it is mounted again. Mount it (or let the auto-mount policy do so) and
    rescan.
 
+7. **Diagnostics.** At `info` the daemon logs each NTFS mount attempt and result,
+   whether the mount was reused or daemon-created, and the `$Volume` dirty flag
+   (a volume Windows did not unmount cleanly is replayed by the kernel `ntfs3`
+   driver on mount). On shutdown it warns with the list of daemon-created mounts
+   it does not unmount (a known defect tracked for v0.2.0), and
+   `scripts/uninstall.sh` warns about any live mounts under
+   `/run/omavrything/ntfs` before removing the runtime directory. Run with
+   `--log-level info` (or `OMAVRYTHING_LOG=omavrythingd=info`) to see them.
+
 ## Search feels slow
 
 **Symptom:** typing lags, or a query takes hundreds of milliseconds.
