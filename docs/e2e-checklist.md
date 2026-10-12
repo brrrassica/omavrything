@@ -5,20 +5,26 @@ and a hermetic daemon integration test. The items below require a real Omarchy
 Quattro desktop, a real filesystem, and (for NTFS) a real partition, so they are
 verified by hand before a release.
 
-Run the checklist on a **release build** (`cargo build --release`); a debug build
+Run the checklist on a **release build** (`scripts/build.sh`); a debug build
 is 10–50× slower and will make the UI feel broken.
 
 Record the result of each item as pass/fail with the date and the Omarchy version.
 
+> **Log level.** The daemon's default log level is `error` (a production daemon
+> is quiet). The items below that refer to the startup/lifecycle log
+> (`listening`, `indexed`, `snapshot written`, `warm-started`, NTFS offers)
+> require raising it: pass `--log-level info` or set `log_level = "info"`.
+
 ## 0. Environment
 
 - [ ] Omarchy Quattro (4.x) on Hyprland, `omarchy-shell` running.
-- [ ] `cargo build --release` succeeds.
+- [ ] `scripts/build.sh` succeeds.
 - [ ] `omavrythingd --help` and `omavry --help` print usage.
 
 ## 1. Daemon startup and indexing
 
-- [ ] `scripts/run-daemon.sh` starts and logs `listening` with the socket path.
+- [ ] `scripts/run-daemon.sh --log-level info` starts and logs `listening` with
+      the socket path.
 - [ ] The startup log reports the indexed entry count and each root with its
       filesystem kind.
 - [ ] `omavry status` reports a non-zero entry count and the same roots.
@@ -36,8 +42,8 @@ Record the result of each item as pass/fail with the date and the Omarchy versio
 
 ## 3. Shell UI
 
-- [ ] `scripts/install-plugin.sh` installs the plugin and restarts the shell.
-- [ ] `omarchy plugin enable tech.alatcerdas.omavrything --section center` shows the bar widget.
+- [ ] `sudo scripts/install.sh` installs the plugin, restarts the shell, and enables it.
+- [ ] `omarchy plugin list` shows `tech.alatcerdas.omavrything` as `enabled`.
 - [ ] `SUPER + ALT + SPACE` focuses the search input.
 - [ ] Typing shows the centered scratchpad with the results table
       (Name | Size | Modified | Path).
@@ -56,30 +62,36 @@ Record the result of each item as pass/fail with the date and the Omarchy versio
 ## 5. Settings menu
 
 - [ ] The gear button opens the settings menu.
-- [ ] Changing `backgroundOpacity` updates the tile live.
+- [ ] Changing the "Opacity" slider updates the tile live.
+- [ ] Releasing the opacity slider saves without a password prompt
+      (`set-config` action) and the value survives reopening the panel
+      (regression guard for the polkit 127 `CheckAuthorization` bug).
 - [ ] Toggling NTFS, changing the snapshot interval, and changing the log level
-      apply to the daemon.
+      apply to the daemon (these prompt for authentication).
 - [ ] The changes persist across a daemon restart (state config).
 
 ## 6. Persistence and warm start
 
-- [ ] Stop the daemon cleanly (`SIGTERM`); the log reports `snapshot written`.
+- [ ] Stop the daemon cleanly (`SIGTERM`); the log (at `--log-level info`)
+      reports `snapshot written`.
 - [ ] Restart; the log reports `warm-started from snapshot` and no full scan.
 - [ ] Corrupt the snapshot (`truncate -s 100 <snapshot>`); restart falls back to
       `<snapshot>.prev`, then to a cold scan if that is also bad.
 
 ## 7. D-Bus control (optional)
 
-- [ ] With the policy installed, `omavry status` works over D-Bus.
+- [ ] With the policy installed and the bus reloaded, `omavry status` works over
+      D-Bus.
 - [ ] `omavry rescan` prompts for polkit authentication and rescans.
-- [ ] `omavry config set scan_interval 1800` persists and is reflected by
+- [ ] `omavry config set scan_interval 1800` prompts and persists, reflected by
       `omavry config get`.
+- [ ] `omavry config set background_opacity 0.6` saves without a prompt.
 - [ ] Without the policy, the daemon logs the refusal and the socket path still
       works.
 
 ## 8. NTFS (requires a real NTFS partition)
 
-- [ ] The partition is detected and logged as a new offer.
+- [ ] The partition is detected and logged as a new offer (at `--log-level info`).
 - [ ] `omavry mount <uuid>` mounts it read-only and indexes it via the MFT.
 - [ ] Results match the partition contents.
 - [ ] After a restart the partition is auto-mounted and indexed (remembered).
@@ -89,7 +101,8 @@ Record the result of each item as pass/fail with the date and the Omarchy versio
 - [ ] `sudo systemctl enable --now omavrythingd` starts the service.
 - [ ] The service survives `sudo systemctl restart omavrythingd`.
 - [ ] `systemd-analyze security omavrythingd` reports a hardened profile.
-- [ ] `journalctl -u omavrythingd` shows structured log lines.
+- [ ] `journalctl -u omavrythingd` shows structured log lines (raise
+      `log_level` to `info` first; the default is `error`).
 
 ## 10. Resource use
 
@@ -107,6 +120,10 @@ Record the result of each item as pass/fail with the date and the Omarchy versio
 - [ ] `scripts/package-release.sh` produces `dist/omavrything-<version>-<arch>.zip`.
 - [ ] The zip contains `bin/`, `data/`, `shell/`, `scripts/`, `docs/`, `README.md`,
       and `LICENSE`.
-- [ ] Extracting the zip and running `sudo ./scripts/install.sh --system` installs
-      cleanly on a fresh system.
-- [ ] `./scripts/install-plugin.sh` installs the plugin from the extracted archive.
+- [ ] Extracting the zip and running `sudo ./scripts/install.sh` installs cleanly
+      on a fresh system, creates the `omavrything` user, adds the invoking user to
+      the group, reloads D-Bus, enables and starts the daemon, and installs,
+      enables, and loads the shell plugin.
+- [ ] The install summary says "enabled the plugin in the center section" and
+      "daemon is serving on D-Bus".
+- [ ] `sudo ./scripts/uninstall.sh` removes everything again.

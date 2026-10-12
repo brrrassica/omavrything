@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Acceptance checks for M13 — install/uninstall completeness.
 #
-# Runs unprivileged: it exercises the user-mode paths in a throwaway HOME and
-# checks the release archive contents. The system-mode checks (root) are
-# documented in the milestone and exercised by the CI smoke job (M14/C10).
+# Runs unprivileged: it checks the unified installer's and uninstaller's
+# option-free/root-only contract, the uninstaller's source-level guards, and the
+# release archive contents. The system-mode checks (root) are documented in the
+# milestone and exercised by the CI smoke job (M14/C10).
 #
 # Usage: scripts/test-install-uninstall.sh
 set -euo pipefail
@@ -43,51 +44,59 @@ cp manifest.json "$pkg/manifest.json"
 cp shell/omavrything/*.qml "$pkg/shell/omavrything/"
 cp scripts/install.sh scripts/uninstall.sh "$pkg/scripts/"
 
-# --- C2: install.sh --user restarts the shell -------------------------------
-home="$tmp/home-c2"
-mkdir -p "$home"
-log="$tmp/omarchy-c2.log"
-: > "$log"
-if HOME="$home" XDG_CONFIG_HOME="$home/.config" XDG_BIN_HOME="$home/.local/bin" \
-  OMARCHY_LOG="$log" PATH="$fake_bin:$PATH" \
-  "$pkg/scripts/install.sh" --user >/dev/null 2>&1; then
-  if grep -q 'restart shell' "$log"; then
-    ok "install.sh --user restarts the shell"
-  else
-    bad "install.sh --user did not restart the shell"
-  fi
-  if [[ -f "$home/.config/omarchy/plugins/tech.alatcerdas.omavrything/manifest.json" ]]; then
-    ok "install.sh --user installs the plugin"
-  else
-    bad "install.sh --user did not install the plugin"
-  fi
+# --- C2: install.sh is the unified, option-free, root-only installer --------
+# The old `--user` mode is gone: the single command installs the system
+# integration and the per-user plugin for the invoking user. It must reject any
+# option and refuse to run as a non-root user.
+err="$tmp/install-opt.err"
+if "$pkg/scripts/install.sh" --user >/dev/null 2>"$err"; then
+  bad "install.sh --user unexpectedly succeeded (it must take no options)"
 else
-  bad "install.sh --user failed"
+  if grep -q 'takes no options' "$err"; then
+    ok "install.sh rejects options (unified, option-free installer)"
+  else
+    bad "install.sh did not reject --user: $(cat "$err")"
+  fi
+fi
+err="$tmp/install-root.err"
+if "$pkg/scripts/install.sh" >/dev/null 2>"$err"; then
+  bad "install.sh unexpectedly succeeded as a non-root user"
+else
+  if grep -q 'must be run as root' "$err"; then
+    ok "install.sh refuses to run as a non-root user"
+  else
+    bad "install.sh did not refuse a non-root user: $(cat "$err")"
+  fi
+fi
+if grep -q 'usermod -aG omavrything' "$pkg/scripts/install.sh" &&
+  grep -q 'setfacl' "$pkg/scripts/install.sh"; then
+  ok "install.sh adds the user to the group and applies the ACL bridge"
+else
+  bad "install.sh does not add the user to the group / apply the ACL bridge"
 fi
 
-# --- C3: uninstall.sh --user needs no root ----------------------------------
-home="$tmp/home-c3"
-plugin="$home/.config/omarchy/plugins/tech.alatcerdas.omavrything"
-mkdir -p "$plugin/shell/omavrything" "$home/.local/bin"
-cp manifest.json "$plugin/manifest.json"
-ln -sf /nonexistent "$home/.local/bin/omavry"
-log="$tmp/omarchy-c3.log"
-: > "$log"
-if HOME="$home" XDG_CONFIG_HOME="$home/.config" XDG_BIN_HOME="$home/.local/bin" \
-  OMARCHY_LOG="$log" PATH="$fake_bin:$PATH" \
-  "$pkg/scripts/uninstall.sh" --user >/dev/null 2>&1; then
-  if [[ ! -e "$plugin" ]]; then
-    ok "uninstall.sh --user removes the plugin without root"
-  else
-    bad "uninstall.sh --user left the plugin directory behind"
-  fi
-  if [[ ! -e "$home/.local/bin/omavry" ]]; then
-    ok "uninstall.sh --user removes the CLI symlink"
-  else
-    bad "uninstall.sh --user left the CLI symlink behind"
-  fi
+# --- C3: uninstall.sh is system-only (no --user mode) -----------------------
+# The unified installer is system-only, so the uninstaller is too: it must
+# reject the removed --user mode and refuse to run as a non-root user.
+err="$tmp/uninstall-user.err"
+if "$pkg/scripts/uninstall.sh" --user >/dev/null 2>"$err"; then
+  bad "uninstall.sh --user unexpectedly succeeded (the --user mode is gone)"
 else
-  bad "uninstall.sh --user failed (it must not require root)"
+  if grep -q 'unknown option' "$err"; then
+    ok "uninstall.sh rejects the removed --user mode"
+  else
+    bad "uninstall.sh did not reject --user: $(cat "$err")"
+  fi
+fi
+err="$tmp/uninstall-root.err"
+if "$pkg/scripts/uninstall.sh" >/dev/null 2>"$err"; then
+  bad "uninstall.sh unexpectedly succeeded as a non-root user"
+else
+  if grep -q 'must be run as root' "$err"; then
+    ok "uninstall.sh refuses to run as a non-root user"
+  else
+    bad "uninstall.sh did not refuse a non-root user: $(cat "$err")"
+  fi
 fi
 
 # --- C4: uninstall.sh --keep-state is recognised ----------------------------
@@ -110,24 +119,15 @@ else
   bad "uninstall.sh does not guard /var/lib/omavrything behind --keep-state"
 fi
 
-# --- C9: install/uninstall are idempotent -----------------------------------
-home="$tmp/home-c9"
-mkdir -p "$home"
-run_user() {
-  HOME="$home" XDG_CONFIG_HOME="$home/.config" XDG_BIN_HOME="$home/.local/bin" \
-    OMARCHY_LOG="$tmp/omarchy-c9.log" PATH="$fake_bin:$PATH" "$@"
-}
-if run_user "$pkg/scripts/install.sh" --user >/dev/null 2>&1 &&
-  run_user "$pkg/scripts/install.sh" --user >/dev/null 2>&1; then
-  ok "install.sh --user is idempotent"
+# --- C9: uninstall.sh removes the per-user plugin in system mode ------------
+# The system uninstall is the inverse of the system install: it must remove the
+# per-user plugin (through omarchy when available) and the CLI symlink.
+if grep -q 'plugins/tech.alatcerdas.omavrything' "$pkg/scripts/uninstall.sh" &&
+  grep -q 'omarchy plugin remove' "$pkg/scripts/uninstall.sh" &&
+  grep -q 'local/bin/omavry' "$pkg/scripts/uninstall.sh"; then
+  ok "uninstall.sh removes the per-user plugin and CLI symlink"
 else
-  bad "install.sh --user is not idempotent"
-fi
-if run_user "$pkg/scripts/uninstall.sh" --user >/dev/null 2>&1 &&
-  run_user "$pkg/scripts/uninstall.sh" --user >/dev/null 2>&1; then
-  ok "uninstall.sh --user is idempotent"
-else
-  bad "uninstall.sh --user is not idempotent"
+  bad "uninstall.sh does not remove the per-user plugin / CLI symlink"
 fi
 
 # --- C11: doctor.sh prints a report and flags a missing install -------------
@@ -144,24 +144,31 @@ else
 fi
 
 # --- C1/C6/C11: the release archive ships the expected files ----------------
-if [[ -x target/release/omavrythingd && -x target/release/omavry ]]; then
+if [[ -x bin/omavrythingd && -x bin/omavry ]]; then
   if scripts/package-release.sh --no-build >/dev/null 2>&1; then
     archive="$(ls -1 dist/omavrything-*.zip 2>/dev/null | tail -n1 || true)"
     # Capture the listing first: `unzip -l | grep -q` would SIGPIPE unzip when
     # grep exits on the first match, which `set -o pipefail` turns into a failure.
     listing="$(unzip -l "$archive" 2>/dev/null || true)"
-    for entry in scripts/uninstall.sh data/man/omavrythingd.8 scripts/doctor.sh; do
+    for entry in scripts/install.sh scripts/uninstall.sh data/man/omavrythingd.8 scripts/doctor.sh; do
       if [[ -n "$listing" ]] && grep -qF "$entry" <<<"$listing"; then
         ok "the release archive contains $entry"
       else
         bad "the release archive does not contain $entry"
       fi
     done
+    # install-plugin.sh was deleted with the unified installer; the archive
+    # must not ship it any more.
+    if [[ -n "$listing" ]] && ! grep -qF "install-plugin.sh" <<<"$listing"; then
+      ok "the release archive no longer ships install-plugin.sh"
+    else
+      bad "the release archive still ships install-plugin.sh"
+    fi
   else
     bad "scripts/package-release.sh --no-build failed"
   fi
 else
-  printf 'skip - archive check (build target/release first)\n'
+  printf 'skip - archive check (run scripts/build.sh first)\n'
 fi
 
 # --- C12: the overlay QML targets the system socket --------------------------

@@ -24,10 +24,7 @@ as the
 .B omavrythingd.service
 unit, running as the unprivileged
 .B omavrything
-user with only
-.B CAP_DAC_READ_SEARCH
-and
-.BR CAP_SYS_ADMIN .
+user with only the minimal capability set it needs.
 .SH OPTIONS
 .TP
 .B \-\-config \fIpath\fR
@@ -83,7 +80,7 @@ Disable NTFS partition detection and indexing.
 Skip per-file size and mtime stats (names only; faster scan).
 .TP
 .B \-\-log-level \fIlevel\fR
-Log level: error, warn, info, debug, or trace (default: info).
+Log level: error, warn, info, debug, or trace (default: error).
 .TP
 .BR \-V ", " \-\-version
 Show the version and exit.

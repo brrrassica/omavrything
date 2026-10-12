@@ -81,10 +81,17 @@ ensure_sudo() {
   sudo_ready=1
 }
 
-# 1. Build the release daemon (only with --rebuild/-r).
+# 1. Build the release daemon into bin/ (only with --rebuild/-r).
 if [[ "$build" == 1 ]]; then
   log "building release daemon"
-  cargo build --release -p omavrythingd
+  "$here/scripts/build.sh"
+fi
+
+# The daemon is read from bin/, the same layout the release archive ships. Build
+# it into bin/ if it is not there yet (e.g. a fresh source checkout).
+if [[ ! -x "$here/bin/omavrythingd" ]]; then
+  log "building release daemon into bin/"
+  "$here/scripts/build.sh"
 fi
 
 # 2. Stop any running daemon. SIGTERM lets it write a snapshot and exit cleanly.
@@ -131,10 +138,10 @@ if [[ "$sudo_daemon" == 1 ]]; then
   ensure_sudo
   log "starting daemon as root (sudo)"
   daemon_args=(--root "$HOME" --socket "$sock" "${daemon_args[@]}")
-  sudo nohup ./target/release/omavrythingd "${daemon_args[@]}" >"$log_file" 2>&1 &
+  sudo nohup "$here/bin/omavrythingd" "${daemon_args[@]}" >"$log_file" 2>&1 &
 else
   log "starting daemon"
-  nohup ./target/release/omavrythingd "${daemon_args[@]}" >"$log_file" 2>&1 &
+  nohup "$here/bin/omavrythingd" "${daemon_args[@]}" >"$log_file" 2>&1 &
 fi
 
 # Wait for the daemon to appear: sudo authentication and startup can take a
@@ -162,10 +169,19 @@ if [[ "$sudo_daemon" == 1 ]]; then
 fi
 log "daemon running (pid $daemon_pid, log: $log_file)"
 
-# 4. Reinstall the shell plugin. install-plugin.sh restarts the shell, which is
-# required for changed QML to take effect: a plugin rescan keeps the previously
-# compiled component, so the shell process must restart.
+# 4. Reinstall the shell plugin and restart the shell. A plugin rescan keeps the
+# previously compiled component, so the shell process must restart for changed
+# QML to take effect.
 log "reinstalling shell plugin"
-scripts/install-plugin.sh
+plugin_dest="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/tech.alatcerdas.omavrything"
+mkdir -p "$plugin_dest/shell/omavrything"
+install -m644 manifest.json "$plugin_dest/manifest.json"
+install -m644 shell/omavrything/*.qml "$plugin_dest/shell/omavrything/"
+if command -v omarchy >/dev/null 2>&1; then
+  omarchy restart shell >/dev/null 2>&1 ||
+    log "could not restart the shell; run 'omarchy restart shell'"
+else
+  log "omarchy not found; restart the shell manually"
+fi
 
 log "done"

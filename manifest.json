@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "tech.alatcerdas.omavrything",
   "name": "Omavrything",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "author": "Sam Ralial",
   "license": "MIT",
   "description": "Instant, index-backed file search for Omarchy — Everything for Linux.",
@@ -28,7 +28,7 @@
       "maxResults": 200
     },
     "schema": [
-      { "key": "backgroundOpacity", "type": "number", "label": "Tile transparency" },
+      { "key": "backgroundOpacity", "type": "number", "label": "Tile opacity" },
       { "key": "widthFraction", "type": "number", "label": "Width fraction" },
       { "key": "heightFraction", "type": "number", "label": "Height fraction" },
       { "key": "maxWidth", "type": "number", "label": "Max width" },

@@ -2,6 +2,9 @@
 /target
 **/*.rs.bk
 
+# Release binaries staged by scripts/build.sh (the release archive layout)
+/bin
+
 # Release archives
 /dist
 

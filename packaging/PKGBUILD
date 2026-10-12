@@ -7,12 +7,13 @@
 #   * the systemd unit and the dedicated `omavrything` sysuser,
 #   * the D-Bus system-bus policy and the polkit control action,
 #   * the default `/etc/omavrything/config.toml`,
-#   * the `omarchy-shell` plugin and its install helper.
+#   * the `omarchy-shell` plugin (installed system-wide under
+#     /usr/share/omavrything/shell).
 #
-# The shell plugin is installed system-wide under /usr/share/omavrything/shell
-# and copied into the user's config by `omavrything-install-plugin` (see the
-# post-install message). The daemon is not enabled automatically: the user
-# chooses whether to run it as a system service or as a user process.
+# The daemon is not enabled automatically: the user chooses whether to run it as
+# a system service or as a user process. The shell plugin is copied into the
+# user's config by hand (see the post-install message), or by
+# `sudo scripts/install.sh` from a source checkout.
 #
 # The source checksum is pinned to the v$pkgver tag tarball. Note that GitHub's
 # auto-generated archive tarballs are not guaranteed to stay byte-identical
@@ -28,7 +29,7 @@
 #   makepkg --printsrcinfo > .SRCINFO
 
 pkgname=omavrything
-pkgver=0.1.4
+pkgver=0.1.5
 pkgrel=1
 pkgdesc="Instant, index-backed file search for Omarchy Quattro, inspired by Voidtools Everything"
 arch=('x86_64' 'aarch64')
@@ -41,16 +42,18 @@ conflicts=('omavrything-git')
 options=('!lto')
 install="$pkgname.install"
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-# TODO(release): the hash below is still the v0.1.0 tarball. The v0.1.4 sources
+# TODO(release): the hash below is still the v0.1.0 tarball. The v0.1.5 sources
 # hash cannot be computed before the tag exists, so run `updpkgsums` after
-# pushing v0.1.4 and before the package is published to the AUR. It is not on
+# pushing v0.1.5 and before the package is published to the AUR. It is not on
 # the AUR yet.
 sha256sums=('62757fe2452bc1471188e206c78bdb465adb37d04c372ee297ce45000de89d73')
 
 build() {
   cd "$pkgname-$pkgver"
   export CARGO_TARGET_DIR=target
-  cargo build --release --locked --workspace
+  # scripts/build.sh compiles the workspace and stages the daemon and CLI in
+  # bin/, the same layout the release archive ships and install.sh reads.
+  scripts/build.sh
 }
 
 check() {
@@ -64,9 +67,9 @@ check() {
 package() {
   cd "$pkgname-$pkgver"
 
-  # Binaries.
-  install -Dm755 target/release/omavrythingd "$pkgdir/usr/bin/omavrythingd"
-  install -Dm755 target/release/omavry "$pkgdir/usr/bin/omavry"
+  # Binaries (scripts/build.sh stages them in bin/).
+  install -Dm755 bin/omavrythingd "$pkgdir/usr/bin/omavrythingd"
+  install -Dm755 bin/omavry "$pkgdir/usr/bin/omavry"
 
   # systemd unit and the dedicated user/group.
   install -Dm644 data/systemd/omavrythingd.service \
@@ -87,18 +90,14 @@ package() {
   install -Dm644 data/man/omavrythingd.8 \
     "$pkgdir/usr/share/man/man8/omavrythingd.8"
 
-  # The omarchy-shell plugin, installed system-wide. The install helper copies
-  # it into ~/.config/omarchy/plugins/tech.alatcerdas.omavrything/.
+  # The omarchy-shell plugin, installed system-wide. The post-install message
+  # shows how to copy it into ~/.config/omarchy/plugins/tech.alatcerdas.omavrything/.
   install -d "$pkgdir/usr/share/omavrything/shell/omavrything"
   install -m644 manifest.json "$pkgdir/usr/share/omavrything/manifest.json"
   install -m644 shell/omavrything/SearchBar.qml \
     shell/omavrything/SearchOverlay.qml \
     shell/omavrything/Service.qml \
     "$pkgdir/usr/share/omavrything/shell/omavrything/"
-
-  # The plugin install helper, exposed on PATH as omavrything-install-plugin.
-  install -Dm755 scripts/install-plugin.sh \
-    "$pkgdir/usr/bin/omavrything-install-plugin"
 
   # License and documentation.
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"

@@ -269,16 +269,17 @@ scratchpad (per-monitor query state); a daemon pub/sub channel.
 ## ADR-015 — Settings menu
 
 **Decision:** The scratchpad exposes a **settings menu** opened from a **gear
-button** in its top-right corner. Settings include the tile transparency, the
-size fractions, and the result cap, persisted to the plugin's `shell.json` entry.
+button** in its top-right corner. Settings include the tile opacity, the size
+fractions, and the result cap.
 
-**Rationale:** The tile's appearance (transparency, size) is user-tunable, and a
-gear button is the conventional affordance. Persisting to `shell.json` keeps the
-shell's single-config model.
+**Rationale:** The tile's appearance (opacity, size) is user-tunable, and a
+gear button is the conventional affordance.
 
-**Consequences:** The gear button is a placeholder until the menu is implemented.
-Settings are read from the plugin entry and written via the shell's
-`updateEntryInline`.
+**Consequences:** The menu is implemented. Settings are read from the daemon
+with `omavry config get --json` and written back through `omavry config set`
+(the polkit-gated D-Bus `SetConfig`), so they persist in the daemon's state
+config. The cosmetic `background_opacity` key uses the `set-config` action
+(`allow_active=yes`) and saves without a prompt; the privileged keys prompt.
 
 **Alternatives considered:** A separate config file; CLI-only settings.
 

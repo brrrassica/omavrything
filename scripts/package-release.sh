@@ -13,7 +13,7 @@
 # The version defaults to the workspace version in Cargo.toml. The archive is
 # what the GitHub release workflow uploads; running it locally verifies the
 # release can be assembled before a tag is pushed. --no-build reuses the
-# existing target/release binaries instead of rebuilding.
+# existing bin/ binaries instead of rebuilding.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -43,18 +43,18 @@ archive="$dist/$name.zip"
 
 echo "Packaging $name"
 
-# Build the release binaries. --locked keeps the build reproducible against the
-# committed Cargo.lock. --no-build reuses the existing target/release binaries.
+# Build the release binaries into bin/. --no-build reuses the existing bin/
+# binaries instead of rebuilding.
 if [[ "$build" == 1 ]]; then
-  cargo build --release --locked --workspace
+  "$here/scripts/build.sh"
 fi
 
 rm -rf "$stage"
 mkdir -p "$stage"/{bin,data,shell,scripts,docs}
 
-# Executables.
-install -m755 target/release/omavrythingd "$stage/bin/omavrythingd"
-install -m755 target/release/omavry "$stage/bin/omavry"
+# Executables, read from bin/ (the canonical release binary path).
+install -m755 "$here/bin/omavrythingd" "$stage/bin/omavrythingd"
+install -m755 "$here/bin/omavry" "$stage/bin/omavry"
 
 # System integration data, preserving the source layout so the installer and the
 # PKGBUILD can share it.
@@ -76,7 +76,6 @@ install -Dm644 shell/omavrything/Service.qml "$stage/shell/omavrything/Service.q
 # Install and helper scripts.
 install -m755 scripts/install.sh "$stage/scripts/install.sh"
 install -m755 scripts/uninstall.sh "$stage/scripts/uninstall.sh"
-install -m755 scripts/install-plugin.sh "$stage/scripts/install-plugin.sh"
 install -m755 scripts/run-daemon.sh "$stage/scripts/run-daemon.sh"
 install -m755 scripts/restart-all.sh "$stage/scripts/restart-all.sh"
 install -m755 scripts/doctor.sh "$stage/scripts/doctor.sh"
@@ -91,19 +90,25 @@ cat > "$stage/INSTALL.txt" <<'EOF'
 omavrything release archive
 ===========================
 
-Quick start (system install, requires root):
+Quick start (one command, requires root):
 
-    sudo ./scripts/install.sh --system
+    sudo ./scripts/install.sh
 
-Then enable the shell plugin for your user:
+This installs the daemon, CLI, systemd unit, D-Bus policy, polkit action, man
+page, default config, and the omarchy-shell plugin; creates the omavrything
+user; adds you to the omavrything group; reloads D-Bus; enables and starts the
+daemon; and installs, enables, and loads the shell plugin for your user.
 
-    ./scripts/install-plugin.sh
-    omarchy plugin enable tech.alatcerdas.omavrything --section center
+The widget works immediately: the installer grants your session access to the
+daemon socket with an ACL, so no re-login is needed now. The group change takes
+effect on your next login.
 
-To remove everything again:
+To remove everything again (one command, requires root):
 
-    ./scripts/uninstall.sh --user     # the shell plugin and CLI symlink (no root)
-    sudo ./scripts/uninstall.sh       # the daemon and system integration
+    sudo ./scripts/uninstall.sh
+
+This removes the daemon, CLI, systemd unit, D-Bus/polkit policy, dedicated
+user, and the per-user shell plugin for your user.
 
 See docs/install.md for the full setup, including the optional D-Bus control
 interface and the hardened systemd service.

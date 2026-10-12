@@ -22,8 +22,9 @@ makepkg -si
 release the tag does not exist yet, so build from the working tree instead:
 
 ```sh
-# From the repository root, install into a staging root without a tarball:
-cargo build --release --workspace
+# From the repository root, build the release binaries into bin/ (the same
+# layout the release archive ships and install.sh reads):
+scripts/build.sh
 ```
 
 ## Publishing to the AUR
@@ -50,7 +51,6 @@ cargo build --release --workspace
 | --- | --- |
 | `/usr/bin/omavrythingd` | The index daemon. |
 | `/usr/bin/omavry` | The CLI client. |
-| `/usr/bin/omavrything-install-plugin` | Copies the shell plugin into the user's config. |
 | `/usr/lib/systemd/system/omavrythingd.service` | Hardened system service. |
 | `/usr/lib/sysusers.d/omavrything.conf` | The dedicated `omavrything` user/group. |
 | `/usr/share/dbus-1/system.d/tech.alatcerdas.omavrything.conf` | System-bus policy. |

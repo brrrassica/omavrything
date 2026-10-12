@@ -8,8 +8,9 @@ journalctl -u omavrythingd -f          # system service
 tail -f "${XDG_STATE_HOME:-$HOME/.local/state}/omavrything/daemon.log"  # user-run daemon
 ```
 
-Raise the verbosity with `--log-level debug` (or the `log_level` config key, or
-`OMAVRYTHING_LOG=omavrythingd=debug`).
+The default log level is `error`, so a healthy daemon is quiet. Raise the
+verbosity with `--log-level info` (or `debug`), the `log_level` config key, or
+`OMAVRYTHING_LOG=omavrythingd=debug`.
 
 For a one-shot diagnosis of every component, run:
 
@@ -56,8 +57,9 @@ allowed to connect.
    sudo usermod -aG omavrything "$USER"
    ```
 
-   Group membership only applies to **new** sessions: log out and back in, or
-   run `newgrp omavrything` in the current shell.
+   Group membership only applies to **new** sessions: log out and back in. The
+   installer also applies a socket ACL for the current session, so the widget
+   works immediately without a re-login.
 
 4. **A stale root-owned socket or lock.** If the daemon was once run as root, the
    socket and its `<socket>.lock` file are root-owned and a user-run daemon
@@ -75,12 +77,21 @@ allowed to connect.
 
 ## D-Bus control is unavailable
 
-**Symptom:** `omavry status` or `omavry config` fails, and the log shows
+**Symptom:** `omavry status` or `omavry config` fails with
+`ServiceUnknown: The name is not activatable`, or the log shows
 `Request to own name refused by policy`.
 
 The daemon can only own the well-known name `tech.alatcerdas.omavrything` if the
-system-bus policy is installed. Install the policy and the polkit action, then
-reload D-Bus:
+system-bus policy is installed **and the running bus has reloaded it**. A bus
+that was already running before the install does not see a new policy until it
+is reloaded:
+
+```sh
+sudo systemctl reload dbus
+```
+
+`scripts/install.sh` installs the policy and reloads the bus for you.
+To do it by hand:
 
 ```sh
 sudo install -Dm644 data/dbus/tech.alatcerdas.omavrything.conf \
@@ -94,8 +105,16 @@ A **user-run** daemon cannot own the name at all (the policy only permits the
 `omavrything` user and root), so it serves the socket search path but not D-Bus
 control. Use the system service for `status`/`config`/`rescan`/`mount`.
 
-Control methods (`Rescan`, `SetConfig`, `MountNtfs`) are gated by the
-`tech.alatcerdas.omavrything.control` polkit action and prompt for authentication.
+`Rescan` and `MountNtfs`, and the privileged `SetConfig` keys (`excludes`,
+`ntfs`, `scan_interval`, `snapshot_interval`, `log_level`), are gated by the
+`tech.alatcerdas.omavrything.control` polkit action (`auth_admin_keep`) and
+prompt for authentication. The cosmetic `background_opacity` key uses the
+separate `tech.alatcerdas.omavrything.set-config` action (`allow_active=yes`), so
+the settings panel can save the tile opacity without a prompt and without
+granting `MountNtfs`. Both actions carry the
+`org.freedesktop.policykit.owner` annotation for `unix-user:omavrything`, so the
+daemon (which runs as that unprivileged user, not root) is allowed to query
+polkit for the caller's authorization.
 
 ## inotify watch limits
 
@@ -129,8 +148,8 @@ updates entirely with `--no-watch`.
 error reading the raw device.
 
 Indexing NTFS reads the **MFT directly from the raw block device**, which
-requires `CAP_DAC_READ_SEARCH` (or root). The system service has that capability;
-a user-run daemon does not.
+requires raw-device read access (or root). The system service has that
+capability; a user-run daemon does not.
 
 1. **Run with the right privileges.** For a user-run daemon:
 
@@ -167,7 +186,7 @@ a user-run daemon does not.
    offer and is indexed on demand via `MountNtfs`:
 
    ```sh
-   omavry mount <uuid>     # not yet implemented (M10); use the D-Bus method
+   omavry mount <uuid>     # mounts and indexes the partition (D-Bus, polkit)
    ```
 
 6. **A partition that is not mounted at startup** is validated by its mount
@@ -183,11 +202,11 @@ The daemon must be built in **release** mode. A debug build is roughly 10x
 slower, which turns a sub-millisecond query into hundreds of milliseconds.
 
 ```sh
-cargo build --release -p omavrythingd
+scripts/build.sh
 ```
 
 `scripts/run-daemon.sh` and `scripts/restart-all.sh --rebuild` always build the
-release binary. To see where the time goes, set `OMAVRYTHING_PROFILE=1` and every
+release binary into `bin/`. To see where the time goes, set `OMAVRYTHING_PROFILE=1` and every
 search logs a stage-by-stage breakdown:
 
 ```sh
@@ -220,18 +239,16 @@ likely a debug build or the index is much larger than expected. See
 
 ## The search bar does not appear
 
-The UI is an `omarchy-shell` plugin. Install and enable it, then restart the
-shell:
+The UI is an `omarchy-shell` plugin. The unified installer installs, validates,
+enables, and loads it, and restarts the shell:
 
 ```sh
-omavrything-install-plugin        # or scripts/install-plugin.sh from a checkout
-omarchy plugin enable tech.alatcerdas.omavrything --section center
-omarchy restart shell
+sudo scripts/install.sh
 ```
 
 A plugin **rescan** is not enough: the QML engine keeps the previously compiled
 component, so changed QML only takes effect after the shell process restarts.
-`scripts/install-plugin.sh` restarts the shell for you.
+`scripts/install.sh` restarts the shell for you.
 
 If the hotkey does nothing, confirm the binding is present in
 `~/.config/hypr/bindings.lua`:

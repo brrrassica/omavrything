@@ -65,9 +65,11 @@ Item {
   readonly property string runtimeDir: Quickshell.env("XDG_RUNTIME_DIR") || "/tmp"
   // Socket selection mirrors the CLI's connect_default(): prefer the system
   // daemon's socket (/run/omavrything/omavrything.sock), fall back to the
-  // per-user socket in $XDG_RUNTIME_DIR (user-mode daemon). Resolved by
-  // socketProbe at startup and re-probed on every open() so a daemon that
-  // started after the shell is still found.
+  // per-user socket in $XDG_RUNTIME_DIR (user-mode daemon). socketProbe resolves
+  // the path by checking that the socket exists *and* is writable (a Unix socket
+  // needs write permission to connect), so a system socket the user cannot reach
+  // falls through to the user socket instead of failing. Re-probed on every
+  // open() so a daemon that started after the shell is still found.
   property string socketPath: runtimeDir + "/omavrything.sock"
   // Set when open() is waiting for socketProbe to resolve the socket path
   // before the Socket is allowed to connect.
@@ -117,8 +119,10 @@ Item {
     } else {
       // Resolve the daemon socket path before the Socket connects: binding
       // `connected` to `opened` makes the Socket connect the moment opened
-      // flips, so the path must already be correct. socketProbe's
-      // onStreamFinished sets opened once the path is known.
+      // flips, so the path must already be correct. Force `opened` false first
+      // so a Socket that is holding a failed connection is torn down and
+      // reconnects to the freshly resolved path.
+      root.opened = false
       root.pendingOpen = true
       socketProbe.running = true
     }
@@ -334,18 +338,32 @@ Item {
   Process {
     id: socketProbe
     running: true
-    command: ["sh", "-c", "test -S /run/omavrything/omavrything.sock && echo system || echo user"]
+    // Prefer the system socket, then the per-user socket. A socket is only
+    // usable if it exists and is writable (connect(2) needs write permission),
+    // so an inaccessible system socket falls through to the user socket. The
+    // user socket path is passed as $1 to avoid quoting it into the script.
+    command: ["sh", "-c",
+      "sys=/run/omavrything/omavrything.sock; usr=$1; " +
+      "if [ -S \"$sys\" ] && [ -w \"$sys\" ]; then echo system; " +
+      "elif [ -S \"$usr\" ] && [ -w \"$usr\" ]; then echo user; " +
+      "else echo none; fi",
+      "probe", root.runtimeDir + "/omavrything.sock"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        root.socketPath = text.trim() === "system"
-          ? "/run/omavrything/omavrything.sock"
-          : root.runtimeDir + "/omavrything.sock"
+        var which = text.trim()
+        if (which === "system") root.socketPath = "/run/omavrything/omavrything.sock"
+        else if (which === "user") root.socketPath = root.runtimeDir + "/omavrything.sock"
+        else { root.socketPath = ""; root.daemonAvailable = false }
         if (root.pendingOpen) {
           root.pendingOpen = false
-          root.opened = true
-          root.rebuild()
-          Qt.callLater(function() { input.forceActiveFocus() })
+          if (which === "none") {
+            root.opened = false
+          } else {
+            root.opened = true
+            root.rebuild()
+            Qt.callLater(function() { input.forceActiveFocus() })
+          }
         }
       }
     }
@@ -748,7 +766,7 @@ Item {
               }
             }
 
-            // Transparency.
+            // Opacity (0.3–1.0): dragging right makes the tile more opaque.
             Item {
               width: parent.width
               height: root.rowHeight
@@ -757,7 +775,7 @@ Item {
                 width: root.nameWidth
                 anchors.left: parent.left
                 anchors.verticalCenter: parent.verticalCenter
-                text: "Transparency"
+                text: "Opacity"
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body

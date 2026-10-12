@@ -8,12 +8,23 @@
 post_install() {
   systemd-sysusers
   systemctl daemon-reload
+  # Reload the system bus so it picks up the new policy; a bus that was already
+  # running before the install does not see it otherwise, and the daemon cannot
+  # own its name (ServiceUnknown: The name is not activatable).
+  dbus-send --system --type=method_call --dest=org.freedesktop.DBus \
+    /org/freedesktop/DBus org.freedesktop.DBus.ReloadConfig >/dev/null 2>&1 ||
+    systemctl reload dbus >/dev/null 2>&1 || true
   cat <<'EOF'
 ==> omavrything installed.
 
 To use the search UI, install the omarchy-shell plugin for your user:
 
-    omavrything-install-plugin
+    plugin=~/.config/omarchy/plugins/tech.alatcerdas.omavrything
+    mkdir -p "$plugin/shell/omavrything"
+    install -m644 /usr/share/omavrything/manifest.json "$plugin/manifest.json"
+    install -m644 /usr/share/omavrything/shell/omavrything/*.qml \
+      "$plugin/shell/omavrything/"
+    omarchy restart shell   # the shell must rescan before it knows the plugin
     omarchy plugin enable tech.alatcerdas.omavrything --section center
 
 To run the daemon as a hardened system service:
@@ -21,14 +32,18 @@ To run the daemon as a hardened system service:
     sudo systemctl enable --now omavrythingd
     sudo usermod -aG omavrything "$USER"   # so the shell can reach the socket
 
-Log out and back in (or run `newgrp omavrything`) for the group change to
-take effect. See /usr/share/doc/omavrything/install.md for the full setup.
+Log out and back in for the group change to take effect. See
+/usr/share/doc/omavrything/install.md for the full setup.
 EOF
 }
 
 post_upgrade() {
   systemd-sysusers
   systemctl daemon-reload
+  # Reload the system bus so it picks up any policy change in the new version.
+  dbus-send --system --type=method_call --dest=org.freedesktop.DBus \
+    /org/freedesktop/DBus org.freedesktop.DBus.ReloadConfig >/dev/null 2>&1 ||
+    systemctl reload dbus >/dev/null 2>&1 || true
   cat <<'EOF'
 ==> omavrything upgraded.
 
@@ -37,8 +52,9 @@ binary:
 
     sudo systemctl restart omavrythingd
 
-Re-run `omavrything-install-plugin` to refresh the shell plugin, then restart
-the shell so the new QML is compiled.
+Re-copy the shell plugin into ~/.config/omarchy/plugins/tech.alatcerdas.omavrything/
+(see the post-install message), then restart the shell so the new QML is
+compiled.
 EOF
 }
 

@@ -63,7 +63,7 @@ watch = true                                   # inotify live updates
 dbus = true                                    # D-Bus control interface
 ntfs = true                                    # detect and index NTFS partitions
 metadata = true                                # collect per-file size/mtime
-log_level = "info"                             # error | warn | info | debug | trace
+log_level = "error"                            # error | warn | info | debug | trace
 background_opacity = 0.75                      # scratchpad tile opacity (UI setting)
 # socket = "/run/omavrything/omavrything.sock"
 # snapshot = "/var/lib/omavrything/index.snapshot"
@@ -96,14 +96,15 @@ The daemon logs structured events to stderr in a stable
 and `journalctl -o json` can parse. The level comes from `--log-level`, the
 `log_level` config key, or the `OMAVRYTHING_LOG` environment variable (which
 accepts `RUST_LOG` syntax, e.g. `omavrythingd=debug,zbus=warn`), in that order of
-precedence. The default is `info`.
+precedence. The default is `error`, so a production daemon is quiet unless
+something is wrong; raise it to `info` or `debug` when diagnosing.
 
 ## systemd service
 
 `data/systemd/omavrythingd.service` runs the daemon as a hardened system service
 under a dedicated `omavrything` user (created by
-`data/sysusers/omavrything.conf`). It keeps only `CAP_DAC_READ_SEARCH` (read raw
-block devices for the NTFS MFT) and `CAP_SYS_ADMIN` (the read-only `ntfs3`
+`data/sysusers/omavrything.conf`). It keeps only the minimal capability set it
+needs (raw block-device read for the NTFS MFT, and the read-only `ntfs3`
 fallback mount), and applies `ProtectSystem=strict`, `ProtectHome=read-only`,
 `NoNewPrivileges`, `MemoryDenyWriteExecute`, a `@system-service @mount` syscall
 filter, and memory, CPU, task, and file-descriptor limits. The socket and
@@ -171,7 +172,7 @@ Control and status are exposed on the system bus as
 | `GetStatus` | version, entries, roots, memory, scan state, uptime |
 | `Rescan(root)` | rescan all roots (empty `root`) or one configured root; returns entries added |
 | `GetConfig` | the current configuration |
-| `SetConfig(key, value)` | set `excludes`, `scan_interval`, or `snapshot_interval`; changing `excludes` triggers a rescan |
+| `SetConfig(key, value)` | set `excludes`, `scan_interval`, `snapshot_interval`, `ntfs`, `log_level`, or `background_opacity`; changing `excludes` triggers a rescan |
 | `ListRoots` | the indexed roots |
 | `MountNtfs(uuid)` | mount an NTFS partition and index it via the MFT; returns the mount point |
 
@@ -182,8 +183,16 @@ non-empty `root` must be one of the configured roots.
 
 Signals: `IndexChanged(entries)` and `ScanProgress(phase, entries)`.
 
-The read-only methods are open to all; `Rescan`, `SetConfig`, and `MountNtfs`
-are gated by the `tech.alatcerdas.omavrything.control` polkit action.
+The read-only methods are open to all. `Rescan` and `MountNtfs`, and the
+privileged `SetConfig` keys (`excludes`, `ntfs`, `scan_interval`,
+`snapshot_interval`, `log_level`), are gated by the
+`tech.alatcerdas.omavrything.control` polkit action. The cosmetic
+`background_opacity` key uses `tech.alatcerdas.omavrything.set-config`
+(`allow_active=yes`), so the settings panel can save without a prompt. Both
+actions carry the `org.freedesktop.policykit.owner` annotation for
+`unix-user:omavrything`: polkit only lets trusted callers (root or an action
+owner) check another identity, and the daemon runs as the unprivileged
+`omavrything` user.
 
 The daemon can only own the well-known name if the system-bus policy is
 installed. Without it the daemon logs `Request to own name refused by policy`
@@ -221,10 +230,11 @@ omavry config get [--json]         # the current configuration
 omavry config set <key> <value>    # set a value (D-Bus, polkit)
 ```
 
-`search` and `status` are read-only; `rescan`, `mount`, and `config set` are
-gated by the `tech.alatcerdas.omavrything.control` polkit action and prompt for
-authentication. Every subcommand exits non-zero on failure, so it composes with
-shell scripts.
+`search` and `status` are read-only; `rescan`, `mount`, and `config set` for a
+privileged key are gated by the `tech.alatcerdas.omavrything.control` polkit
+action and prompt for authentication. `config set background_opacity` uses the
+`tech.alatcerdas.omavrything.set-config` action and does not prompt. Every
+subcommand exits non-zero on failure, so it composes with shell scripts.
 
 ## Live updates
 

@@ -3,7 +3,7 @@
 <p class="tagline">Instant, index-backed file search: "Everything" built for Omarchy.</p>
 <p class="lede">A search bar in your <code>omarchy-shell</code>. Start typing and a scratchpad pane of results drops over whatever you are doing, backed by a daemon that keeps every mounted filesystem indexed in memory.</p>
 <div class="badges">
-<span class="badge ok">v0.1.3</span>
+<span class="badge ok">v0.1.5</span>
 <span class="badge">Omarchy Quattro 4.x</span>
 <span class="badge">Quickshell / Qt</span>
 <span class="badge">MIT</span>
@@ -43,7 +43,7 @@ The UX is openly inspired by [Voidtools Everything](https://www.voidtools.com/).
 <div class="card"><span class="ico">💽</span><h3>Whole-disk by default</h3><p>Every mounted filesystem is indexed. Linux filesystems are walked directly; NTFS partitions are read straight from the MFT on the block device.</p></div>
 <div class="card"><span class="ico">🔄</span><h3>Live index</h3><p><code>inotify</code> follows changes on Linux filesystems, so the index keeps up with files being created, moved and deleted under it.</p></div>
 <div class="card"><span class="ico">🪟</span><h3>Native to Omarchy</h3><p>A Quickshell bar widget plus a centred overlay, wired to your Hyprland hotkey. It is a plugin, not a separate app you alt-tab to.</p></div>
-<div class="card"><span class="ico">🔒</span><h3>Least privilege</h3><p>The daemon runs as a dedicated <code>omavrything</code> user holding only <code>CAP_DAC_READ_SEARCH</code> and <code>CAP_SYS_ADMIN</code> — not full root.</p></div>
+<div class="card"><span class="ico">🔒</span><h3>Least privilege</h3><p>The daemon runs as a dedicated <code>omavrything</code> user holding only the minimal capability set it needs — not full root.</p></div>
 <div class="card"><span class="ico">📴</span><h3>Local only</h3><p>There is no network client in the daemon and no telemetry. The UI talks to it over a local Unix socket.</p></div>
 <div class="card"><span class="ico">🪫</span><h3>Degraded, not silent</h3><p>Without the daemon the bar and overlay still open and say the index is unavailable, instead of quietly doing nothing.</p></div>
 <div class="card"><span class="ico">🧠</span><h3>Memory-capped</h3><p>The index is engineered to stay inside a fixed memory ceiling — roughly 1.5&nbsp;GB even across millions of files. See the <a href="docs/memory-optimization.html">memory notes</a>.</p></div>
@@ -59,9 +59,7 @@ Grab the latest release archive.
 ```sh
 unzip omavrything-*.zip
 cd omavrything-*
-sudo ./scripts/install.sh --system   # daemon, CLI, systemd unit, D-Bus, polkit
-./scripts/install-plugin.sh          # shell plugin for the current user
-omarchy plugin enable tech.alatcerdas.omavrything --section center
+sudo ./scripts/install.sh   # daemon, CLI, systemd unit, D-Bus, polkit, shell plugin
 ```
 
 An AUR package is prepared under `packaging/` but is **not published yet**;

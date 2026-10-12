@@ -93,9 +93,9 @@ summary to stderr, so it composes with other tools:
 omavry search "invoice 2024" | head -n 5
 ```
 
-> **Not yet implemented:** `omavry search --json` and the `rescan`/`mount`
-> subcommands are tracked in M10. The socket protocol already returns JSON, so a
-> script can speak it directly (see [`daemon.md`](daemon.md#protocol)).
+> `omavry search --json` prints the same response as JSON, and the `rescan` and
+> `mount` subcommands are available over D-Bus (see
+> [`daemon.md`](daemon.md#protocol)).
 
 ## What is not supported
 

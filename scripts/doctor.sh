@@ -36,11 +36,11 @@ if [[ -x /usr/bin/omavrythingd ]]; then
     ok "daemon: $version"
   else
     bad "daemon binary present but failed to run"
-    info "reinstall it with: sudo scripts/install.sh --system"
+    info "reinstall it with: sudo scripts/install.sh"
   fi
 else
   bad "daemon not installed at /usr/bin/omavrythingd"
-  info "install it with: sudo scripts/install.sh --system"
+  info "install it with: sudo scripts/install.sh"
 fi
 if [[ -x /usr/bin/omavry ]]; then
   ok "CLI: /usr/bin/omavry"
@@ -58,6 +58,12 @@ if [[ -f /usr/lib/systemd/system/omavrythingd.service ]]; then
     warn "systemd unit is ${state:-unknown} (enabled: ${enabled:-unknown})"
     info "start it with: sudo systemctl enable --now omavrythingd"
   fi
+  if [[ "$enabled" == "enabled" ]]; then
+    ok "systemd unit enabled at boot"
+  else
+    warn "systemd unit is not enabled at boot (enabled: ${enabled:-unknown})"
+    info "enable it with: sudo systemctl enable omavrythingd"
+  fi
 else
   warn "systemd unit not installed"
 fi
@@ -72,13 +78,20 @@ if command -v busctl >/dev/null 2>&1; then
   if busctl --system status tech.alatcerdas.omavrything >/dev/null 2>&1; then
     ok "D-Bus name owned: tech.alatcerdas.omavrything"
   else
-    warn "D-Bus name not owned (daemon not running, or policy missing)"
+    warn "D-Bus name not owned (daemon not running, or policy not loaded)"
+    info "reload the bus after installing the policy: sudo systemctl reload dbus"
   fi
 fi
 
 # --- polkit -----------------------------------------------------------------
-if [[ -f /usr/share/polkit-1/actions/tech.alatcerdas.omavrything.policy ]]; then
+policy=/usr/share/polkit-1/actions/tech.alatcerdas.omavrything.policy
+if [[ -f "$policy" ]]; then
   ok "polkit action installed"
+  if grep -q 'tech.alatcerdas.omavrything.set-config' "$policy" 2>/dev/null; then
+    ok "polkit set-config action installed"
+  else
+    warn "polkit set-config action missing (the settings panel cannot save)"
+  fi
 else
   warn "polkit action missing"
 fi
@@ -91,6 +104,19 @@ if [[ -S "$sock" ]]; then
 else
   warn "socket not present: $sock"
   info "the daemon creates it on start; is omavrythingd running?"
+fi
+
+# --- Socket group membership ------------------------------------------------
+# The invoking user must be in the omavrything group to reach the system socket.
+target_user="${SUDO_USER:-${USER:-}}"
+if [[ -n "$target_user" && "$target_user" != "root" ]]; then
+  if id -nG "$target_user" 2>/dev/null | tr ' ' '\n' | grep -qx omavrything; then
+    ok "$target_user is in the omavrything group"
+  else
+    warn "$target_user is not in the omavrything group"
+    info "add it with: sudo usermod -aG omavrything $target_user"
+    info "then log out and back in (the installer's ACL covers the current session)"
+  fi
 fi
 
 # --- Index snapshot and config ---------------------------------------------
@@ -141,7 +167,6 @@ else
 fi
 
 # --- Shell plugin for the invoking user -------------------------------------
-target_user="${SUDO_USER:-${USER:-}}"
 if [[ -n "$target_user" && "$target_user" != "root" ]]; then
   home="$(getent passwd "$target_user" | cut -d: -f6 || true)"
   plugin="$home/.config/omarchy/plugins/tech.alatcerdas.omavrything"
@@ -149,7 +174,7 @@ if [[ -n "$target_user" && "$target_user" != "root" ]]; then
     ok "shell plugin installed for $target_user"
   else
     warn "shell plugin not installed for $target_user"
-    info "install it with: scripts/install-plugin.sh"
+    info "install it with: sudo scripts/install.sh"
   fi
   shell_json="$home/.config/omarchy/shell.json"
   if [[ -f "$shell_json" ]] && grep -q 'tech.alatcerdas.omavrything' "$shell_json" 2>/dev/null; then

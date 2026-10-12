@@ -74,8 +74,9 @@ cargo fmt --check
 
 The daemon must be built in **release** mode for interactive use. A debug build
 is roughly 10x slower, which turns a sub-millisecond query into hundreds of
-milliseconds and makes typing feel unusable. `scripts/run-daemon.sh` builds and
-runs the release binary.
+milliseconds and makes typing feel unusable. `scripts/build.sh` compiles the
+release binaries into `bin/`, and `scripts/run-daemon.sh` runs the daemon from
+there.
 
 ## Workspace layout
 

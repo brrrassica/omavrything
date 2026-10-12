@@ -16,21 +16,10 @@ system daemon (`omavrythingd`) keeps an in-memory index of all mounted
 filesystems — using directory traversal + inotify for Linux filesystems
 (btrfs/ext4/xfs/f2fs) and the MFT for NTFS partitions.
 
-> **Status:** v0.1.3 (security release). See [`docs/`](docs/) and the
+> **Status:** v0.1.5. See [`docs/`](docs/) and the
 > [changelog](CHANGELOG.md).
 
 ## Install from a release
-
-> **Use v0.1.3 or newer.** v0.1.1 and earlier wrote the index snapshot and the
-> state configuration through a temporary file that was briefly group- and
-> world-readable, and a malformed NTFS record could stop the indexer; v0.1.2
-> fixed both. v0.1.2 in turn reopened a leftover temporary file instead of
-> replacing it, which left a comparable window on the first write after an
-> interrupted run, so use v0.1.3 or newer; see the [changelog](CHANGELOG.md).
-> v0.1.0 additionally shipped the plugin under the id `omavrything` and the
-> daemon under the `org.omarchy.*` D-Bus namespace, both renamed to
-> `tech.alatcerdas.omavrything` in v0.1.1, so 0.1.0 installs need the upgrade note
-> in [`CHANGELOG.md`](CHANGELOG.md#upgrade-from-010).
 
 Download the latest `omavrything-<version>-<arch>.zip` from the
 [releases page](https://github.com/brrrassica/omavrything/releases), extract it,
@@ -39,10 +28,14 @@ and run the installer:
 ```sh
 unzip omavrything-*.zip
 cd omavrything-*
-sudo ./scripts/install.sh --system   # daemon, CLI, systemd unit, D-Bus, polkit
-./scripts/install-plugin.sh          # shell plugin for the current user
-omarchy plugin enable tech.alatcerdas.omavrything --section center
+sudo ./scripts/install.sh
 ```
+
+The single command installs the daemon, CLI, systemd unit, D-Bus policy, polkit
+action, man page, default config, and the shell plugin; creates the `omavrything`
+user; adds you to the `omavrything` group; reloads D-Bus; enables and starts the
+daemon; installs and enables the shell plugin; and applies a socket ACL so the
+widget works immediately. The group change takes effect on your next login.
 
 The archive contains the `omavrythingd` daemon and the `omavry` CLI under `bin/`,
 the system integration files under `data/`, the shell plugin under `shell/`, the
@@ -55,10 +48,8 @@ directory, or use the release archive / a source build as above.
 ## Quick start (from source)
 
 ```sh
-cargo build --release
-scripts/run-daemon.sh
-scripts/install-plugin.sh
-omarchy plugin enable tech.alatcerdas.omavrything --section center
+scripts/build.sh
+sudo scripts/install.sh
 ```
 
 Then bind a hotkey in `~/.config/hypr/bindings.lua`:
@@ -98,11 +89,10 @@ There is no network client in the daemon and no telemetry: the UI and the daemon
 communicate over a local Unix socket.
 
 The daemon (`omavrythingd`) is a system service, but it does not run as full
-root. It runs as the dedicated `omavrything` user holding only two capabilities:
-`CAP_DAC_READ_SEARCH` (to read paths the indexer could not otherwise see) and
-`CAP_SYS_ADMIN` (to mount an NTFS volume read-only when the kernel driver cannot
-read the MFT directly). It indexes mounted filesystems by traversal + inotify,
-and reads NTFS partitions from the MFT on the block device.
+root. It runs as the dedicated `omavrything` user holding only the minimal
+capability set it needs (raw-device read, and a read-only NTFS mount when the
+kernel driver cannot read the MFT directly). It indexes mounted filesystems by
+traversal + inotify, and reads NTFS partitions from the MFT on the block device.
 
 **Nothing is sent anywhere.** The UI talks to the daemon over a local Unix socket
 (`/run/omavrything/omavrything.sock` for the system service, or
@@ -110,7 +100,12 @@ and reads NTFS partitions from the MFT on the block device.
 client in the daemon and no telemetry.
 
 Control operations on the optional D-Bus interface are gated by the polkit action
-`tech.alatcerdas.omavrything.control` (`auth_admin_keep`).
+`tech.alatcerdas.omavrything.control` (`auth_admin_keep`); the cosmetic
+`background_opacity` setting uses `tech.alatcerdas.omavrything.set-config`
+(`allow_active=yes`) so the settings panel can save without a prompt. Both
+actions are owned by the `omavrything` user (the daemon's identity) via the
+`org.freedesktop.policykit.owner` annotation, so the unprivileged daemon can
+query polkit for the caller.
 
 **Degraded mode.** Without the daemon the search bar still appears and the
 overlay still opens; it reports that the daemon is unavailable rather than
@@ -146,10 +141,10 @@ locally with `scripts/package-release.sh`.
 
 ## Removal
 
-`scripts/uninstall.sh` removes everything the installer added. It has two modes:
+`scripts/uninstall.sh` removes everything the installer added. It is
+system-only, matching the installer:
 
 ```sh
-scripts/uninstall.sh --user     # the shell plugin and CLI symlink (no root)
 sudo scripts/uninstall.sh       # the daemon, system integration, and plugin
 ```
 

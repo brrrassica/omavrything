@@ -1,6 +1,6 @@
 # Installation and setup
 
-`omavrything` is at **v0.1.3**: early, but released and used day to day. Install it
+`omavrything` is at **v0.1.5**:, but released and used day to day. Install it
 from a release archive or from source (§1–2). It targets
 **Omarchy Quattro (4.x)** only — Hyprland, `omarchy-shell` (Quickshell), Arch
 Linux. There is no backwards compatibility with earlier Omarchy releases that
@@ -9,10 +9,11 @@ used waybar.
 ## 1. Build the daemon and CLI
 
 ```sh
-cargo build --release
+scripts/build.sh
 ```
 
-This produces the `omavrythingd` daemon and the `omavry` CLI. See
+This compiles the workspace and writes the `omavrythingd` daemon and the
+`omavry` CLI into `bin/`, the same layout the release archive ships. See
 [`development.md`](development.md) for the full build, test, and lint workflow.
 
 ## 2. Run the daemon
@@ -36,11 +37,16 @@ scripts/restart-all.sh --sudo
 
 ## 3. Install the shell plugin
 
-The search UI is an `omarchy-shell` plugin (Quickshell/QML). Install and enable
-it with:
+The search UI is an `omarchy-shell` plugin (Quickshell/QML). The unified
+installer (§6) installs, validates, enables, and loads it for the invoking user,
+so `sudo scripts/install.sh` is all you need. To do it by hand from a checkout:
 
 ```sh
-scripts/install-plugin.sh
+plugin=~/.config/omarchy/plugins/tech.alatcerdas.omavrything
+mkdir -p "$plugin/shell/omavrything"
+install -m644 manifest.json "$plugin/manifest.json"
+install -m644 shell/omavrything/*.qml "$plugin/shell/omavrything/"
+omarchy restart shell   # the shell must rescan before it knows the plugin
 omarchy plugin enable tech.alatcerdas.omavrything --section center
 ```
 
@@ -74,8 +80,19 @@ D-Bus methods and the polkit action.
 
 ## 6. Run as a system service (optional)
 
-For a persistent, hardened daemon that starts at boot, install the systemd unit,
-the dedicated user, and the default configuration:
+For a persistent, hardened daemon that starts at boot, `install.sh` installs the
+systemd unit, the dedicated user, and the default configuration, then creates the
+user, adds you to the `omavrything` group, reloads D-Bus, enables and starts the
+daemon, installs and enables the shell plugin, and applies a socket ACL so the
+widget works immediately:
+
+```sh
+sudo scripts/install.sh
+```
+
+The group change takes effect on your next login.
+
+The equivalent manual steps are:
 
 ```sh
 sudo install -Dm644 data/systemd/omavrythingd.service /usr/lib/systemd/system/omavrythingd.service
@@ -87,8 +104,8 @@ sudo systemctl enable --now omavrythingd
 sudo usermod -aG omavrything "$USER"   # so the shell plugin can reach the socket
 ```
 
-The service runs as the unprivileged `omavrything` user with only
-`CAP_DAC_READ_SEARCH` and `CAP_SYS_ADMIN`, and a hardened profile
+The service runs as the unprivileged `omavrything` user with only the minimal
+capability set it needs, and a hardened profile
 (`ProtectSystem=strict`, `NoNewPrivileges`, a syscall filter, and resource
 limits). Edit `/etc/omavrything/config.toml` to choose roots, excludes, and
 intervals, then `sudo systemctl restart omavrythingd`. See
@@ -96,10 +113,10 @@ intervals, then `sudo systemctl restart omavrythingd`. See
 
 ## 7. Uninstall
 
-`scripts/uninstall.sh` reverses the install. It has two modes:
+`scripts/uninstall.sh` reverses the install. It is system-only, matching the
+installer:
 
 ```sh
-scripts/uninstall.sh --user     # the shell plugin and CLI symlink (no root)
 sudo scripts/uninstall.sh       # the daemon, system integration, and plugin
 ```
 

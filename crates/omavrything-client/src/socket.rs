@@ -22,7 +22,8 @@ impl SocketClient {
 
     /// Connect to the daemon, preferring the system socket and falling back to
     /// the per-user runtime socket when the system socket is absent or
-    /// inaccessible (e.g. the caller is not in the `omavrything` group).
+    /// inaccessible (e.g. the caller is not in the `omavrything` group). The
+    /// shell plugin's `SearchOverlay.qml` mirrors this order in its socket probe.
     pub fn connect_default() -> std::io::Result<Self> {
         let system = PathBuf::from("/run/omavrything/omavrything.sock");
         match Self::connect(&system) {

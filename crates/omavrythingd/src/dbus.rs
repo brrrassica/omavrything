@@ -93,7 +93,7 @@ impl Manager {
         #[zbus(header)] header: zbus::message::Header<'_>,
         #[zbus(connection)] connection: &zbus::Connection,
     ) -> zbus::fdo::Result<u64> {
-        authorize(&header, connection).await?;
+        authorize(&header, connection, polkit::ACTION).await?;
         run_rescan(
             Arc::clone(&self.index),
             Arc::clone(&self.config),
@@ -116,7 +116,15 @@ impl Manager {
         #[zbus(header)] header: zbus::message::Header<'_>,
         #[zbus(connection)] connection: &zbus::Connection,
     ) -> zbus::fdo::Result<()> {
-        authorize(&header, connection).await?;
+        // Cosmetic keys (the scratchpad opacity) use the ungated-for-active-users
+        // `set-config` action; every other key keeps the privileged `control`
+        // action, so changing the UI does not also grant MountNtfs.
+        let action = if polkit::is_cosmetic_key(&key) {
+            polkit::CONFIG_ACTION
+        } else {
+            polkit::ACTION
+        };
+        authorize(&header, connection, action).await?;
         self.config
             .set(&key, &value)
             .map_err(zbus::fdo::Error::InvalidArgs)?;
@@ -162,7 +170,7 @@ impl Manager {
         #[zbus(header)] header: zbus::message::Header<'_>,
         #[zbus(connection)] connection: &zbus::Connection,
     ) -> zbus::fdo::Result<String> {
-        authorize(&header, connection).await?;
+        authorize(&header, connection, polkit::ACTION).await?;
         let partition = omavrything_ntfs::list_ntfs_partitions()
             .into_iter()
             .find(|p| p.uuid.as_deref() == Some(uuid.as_str()))
@@ -268,21 +276,21 @@ async fn run_rescan(
     Ok(added)
 }
 
-/// Authorize a control call via polkit.
+/// Authorize a control call via polkit for `action`.
 async fn authorize(
     header: &zbus::message::Header<'_>,
     connection: &zbus::Connection,
+    action: &str,
 ) -> zbus::fdo::Result<()> {
     let sender = header.sender().map(|s| s.to_string()).unwrap_or_default();
     let uid = polkit::peer_uid(connection, &sender)
         .await
         .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-    if polkit::is_authorized(connection, uid).await {
+    if polkit::is_authorized(connection, uid, &sender, action).await {
         Ok(())
     } else {
         Err(zbus::fdo::Error::AccessDenied(format!(
-            "not authorized for {}",
-            polkit::ACTION
+            "not authorized for {action}"
         )))
     }
 }

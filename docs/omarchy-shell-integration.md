@@ -95,9 +95,12 @@ QML. See [`troubleshooting.md`](troubleshooting.md#the-search-bar-does-not-appea
 
 ## Install and enable
 
+The unified installer copies the plugin into
+`~/.config/omarchy/plugins/tech.alatcerdas.omavrything/`, validates it, restarts
+the shell, and enables it in the center section:
+
 ```sh
-scripts/install-plugin.sh                          # copy into ~/.config/omarchy/plugins/
-omarchy plugin enable tech.alatcerdas.omavrything --section center # place the widget + enable the plugin
+sudo scripts/install.sh
 ```
 
 The bar widget is placed in the center section, right of the `omarchy.clock`
@@ -115,8 +118,21 @@ column shows an arrow. Sorting is applied client-side to the ranked page the
 daemon returns; clearing the sort (a fresh query) restores the daemon's ranking.
 
 `SearchOverlay.qml` exposes `widthFraction`, `heightFraction`, `maxWidth`,
-`maxHeight`, `maxResults`, and `backgroundOpacity`. They are currently hardcoded
-defaults; wiring them to the plugin's `shell.json` entry settings is a follow-up.
+`maxHeight`, `maxResults`, and `backgroundOpacity`. The settings menu (gear
+button) reads the daemon's config with `omavry config get --json` and writes
+changes back through `omavry config set` (the polkit-gated D-Bus `SetConfig`),
+so the tile opacity, NTFS toggle, snapshot interval, and log level persist in
+the daemon's state config rather than the plugin's `shell.json` entry.
+
+## Daemon socket
+
+The overlay talks to the daemon over a Unix socket. It probes for the system
+socket (`/run/omavrything/omavrything.sock`) first and falls back to the per-user
+socket (`$XDG_RUNTIME_DIR/omavrything.sock`), mirroring the CLI's
+`connect_default()`. A socket is only used if it exists and is writable, so a
+system socket the user cannot reach (not in the `omavrything` group) falls
+through to the user socket. The probe re-runs on every open, so a daemon that
+started after the shell is still found.
 
 ## Bar query mirror
 
