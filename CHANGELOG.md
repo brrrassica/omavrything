@@ -6,6 +6,18 @@ Notable changes to `omavrything`. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- **The overlay's editable input is now created only while the overlay is
+  open.** The plugin is `keepLoaded`, so the `TextInput` in
+  `SearchOverlay.qml` was instantiated permanently, including while the window
+  was hidden. On Qt 6.12 a clipboard change makes a `TextInput` synchronously
+  read the foreign text over the Wayland transfer with no total byte limit or
+  deadline, so a streaming clipboard owner could stall or exhaust the shared
+  shell with no paste action and no field focus. The input is now created by a
+  `Loader` gated on the overlay's open state and torn down on close, and
+  `scripts/ci-smoke.sh` guards the lazy instantiation.
+
 ## [0.1.5] — 2026-10-12
 
 A release that fixes four defects that made a fresh 0.1.4 install unusable, and

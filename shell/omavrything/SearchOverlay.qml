@@ -115,7 +115,7 @@ Item {
     if (sock.connected) {
       root.opened = true
       root.rebuild()
-      Qt.callLater(function() { input.forceActiveFocus() })
+      Qt.callLater(root.focusInput)
     } else {
       // Resolve the daemon socket path before the Socket connects: binding
       // `connected` to `opened` makes the Socket connect the moment opened
@@ -130,6 +130,13 @@ Item {
 
   function close() {
     root.opened = false
+  }
+
+  // Focus the editable input. The input is created lazily by inputLoader while
+  // the overlay is open (see the Loader below), so this is a no-op if the item
+  // does not exist yet.
+  function focusInput() {
+    if (inputLoader.item) inputLoader.item.forceActiveFocus()
   }
 
   function dismiss() {
@@ -362,7 +369,7 @@ Item {
           } else {
             root.opened = true
             root.rebuild()
-            Qt.callLater(function() { input.forceActiveFocus() })
+            Qt.callLater(root.focusInput)
           }
         }
       }
@@ -480,47 +487,61 @@ Item {
             }
           }
 
-          TextInput {
-            id: input
+          // The editable input is created only while the overlay is open. The
+          // plugin is `keepLoaded`, so an unconditionally instantiated TextInput
+          // would stay alive — and connected to the clipboard — while the window
+          // is hidden. On Qt 6.12 a clipboard change makes a TextInput
+          // synchronously read the foreign text over the Wayland transfer with
+          // no total byte limit or deadline, so a streaming clipboard owner
+          // could stall or exhaust the shared shell with no paste action and no
+          // field focus. Gating the Loader on `opened` tears the input down on
+          // close, so it only exists while the user is actually searching.
+          Loader {
+            id: inputLoader
             anchors.left: searchGlyph.right
             anchors.leftMargin: Style.space(10)
             anchors.right: settingsButton.left
             anchors.rightMargin: Style.space(10)
             anchors.top: parent.top
             anchors.bottom: parent.bottom
-            focus: true
-            text: root.filterText
-            color: root.foreground
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.heading
-            verticalAlignment: TextInput.AlignVCenter
-            clip: true
-            selectByMouse: true
-            onTextChanged: {
-              if (root.filterText !== text) {
-                root.filterText = text
-                root.selectedIndex = 0
-                root.writeQuery(text)
-                root.rebuild()
-              }
-            }
-            Keys.onPressed: function(event) {
-              if (event.key === Qt.Key_Escape) { root.dismiss(); event.accepted = true }
-              else if (event.key === Qt.Key_Up) { root.select(-1); event.accepted = true }
-              else if (event.key === Qt.Key_Down) { root.select(1); event.accepted = true }
-              else if (event.key === Qt.Key_PageUp) { root.select(-10); event.accepted = true }
-              else if (event.key === Qt.Key_PageDown) { root.select(10); event.accepted = true }
-              else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) { root.activate(); event.accepted = true }
-            }
-
-            Text {
+            active: root.opened
+            sourceComponent: TextInput {
+              id: input
               anchors.fill: parent
-              text: "Search files…"
-              visible: input.text.length === 0
+              focus: true
+              text: root.filterText
               color: root.foreground
-              opacity: 0.45
-              font: input.font
-              verticalAlignment: Text.AlignVCenter
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.heading
+              verticalAlignment: TextInput.AlignVCenter
+              clip: true
+              selectByMouse: true
+              onTextChanged: {
+                if (root.filterText !== text) {
+                  root.filterText = text
+                  root.selectedIndex = 0
+                  root.writeQuery(text)
+                  root.rebuild()
+                }
+              }
+              Keys.onPressed: function(event) {
+                if (event.key === Qt.Key_Escape) { root.dismiss(); event.accepted = true }
+                else if (event.key === Qt.Key_Up) { root.select(-1); event.accepted = true }
+                else if (event.key === Qt.Key_Down) { root.select(1); event.accepted = true }
+                else if (event.key === Qt.Key_PageUp) { root.select(-10); event.accepted = true }
+                else if (event.key === Qt.Key_PageDown) { root.select(10); event.accepted = true }
+                else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) { root.activate(); event.accepted = true }
+              }
+
+              Text {
+                anchors.fill: parent
+                text: "Search files…"
+                visible: input.text.length === 0
+                color: root.foreground
+                opacity: 0.45
+                font: input.font
+                verticalAlignment: Text.AlignVCenter
+              }
             }
           }
         }
