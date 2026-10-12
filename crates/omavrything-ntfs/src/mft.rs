@@ -10,6 +10,8 @@
 pub const ATTR_STANDARD_INFORMATION: u32 = 0x10;
 /// `$FILE_NAME` attribute type.
 pub const ATTR_FILE_NAME: u32 = 0x30;
+/// `$VOLUME_INFORMATION` attribute type (in the `$Volume` metadata file).
+pub const ATTR_VOLUME_INFORMATION: u32 = 0x70;
 /// `$DATA` attribute type.
 pub const ATTR_DATA: u32 = 0x80;
 /// The end-of-attributes marker.
@@ -21,6 +23,13 @@ const ATTR_HEADER_LEN: usize = 0x10;
 
 /// The MFT record number of the root directory.
 pub const ROOT_RECORD: u64 = 5;
+
+/// The MFT record number of the `$Volume` metadata file, whose
+/// `$VOLUME_INFORMATION` attribute carries the volume dirty flag.
+pub const VOLUME_RECORD: u64 = 3;
+
+/// `$VOLUME_INFORMATION` flag: the volume was not cleanly unmounted.
+pub const VOLUME_DIRTY: u16 = 0x0001;
 
 /// The number of NTFS metadata records (0..=15) that are not user files.
 pub const FIRST_USER_RECORD: u64 = 16;
@@ -188,6 +197,44 @@ pub fn parse_record(bytes: &[u8], number: u64) -> Option<MftRecord> {
     })
 }
 
+/// Parse the `$VOLUME_INFORMATION` flags from a `$Volume` MFT record (record 3)
+/// whose fixups have already been applied.
+///
+/// The flags live in the resident attribute value at offset 8 (after the
+/// 8-byte reserved field and the major/minor version bytes). Bit
+/// [`VOLUME_DIRTY`] means Windows did not unmount the volume cleanly — the
+/// state in which the kernel `ntfs3` driver replays the journal on mount.
+pub fn parse_volume_flags(bytes: &[u8]) -> Option<u16> {
+    if bytes.len() < 0x30 || &bytes[0..4] != b"FILE" {
+        return None;
+    }
+    let attrs_off = u16::from_le_bytes([bytes[0x14], bytes[0x15]]) as usize;
+    let used = u32::from_le_bytes([bytes[0x18], bytes[0x19], bytes[0x1A], bytes[0x1B]]) as usize;
+    let end = used.min(bytes.len());
+
+    let mut off = attrs_off;
+    while off + 8 <= end {
+        let atype = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+        if atype == ATTR_END {
+            break;
+        }
+        let alen = u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap()) as usize;
+        if alen < ATTR_HEADER_LEN || off + alen > end {
+            break;
+        }
+        let non_resident = bytes[off + 8] != 0;
+        if atype == ATTR_VOLUME_INFORMATION && !non_resident {
+            if let Some(value) = resident_value(bytes, off, alen) {
+                if value.len() >= 10 {
+                    return Some(u16::from_le_bytes([value[8], value[9]]));
+                }
+            }
+        }
+        off += alen;
+    }
+    None
+}
+
 /// The resident attribute value at `off`, or `None` if the bounds are invalid.
 fn resident_value(bytes: &[u8], off: usize, alen: usize) -> Option<&[u8]> {
     if off + 0x18 > bytes.len() {
@@ -347,6 +394,39 @@ mod tests {
         rec[0x37..0x3B].copy_from_slice(&ATTR_DATA.to_le_bytes());
         rec[0x3B..0x3F].copy_from_slice(&9u32.to_le_bytes());
         assert!(parse_record(&rec, 1).is_some());
+    }
+
+    #[test]
+    fn parses_the_volume_dirty_flag() {
+        // A synthetic `$Volume` record with one resident `$VOLUME_INFORMATION`
+        // attribute. The flags live at value offset 8.
+        fn volume_record(flags: u16) -> Vec<u8> {
+            let mut rec = vec![0u8; 0x80];
+            rec[0..4].copy_from_slice(b"FILE");
+            rec[0x14..0x16].copy_from_slice(&0x38u16.to_le_bytes());
+            rec[0x18..0x1C].copy_from_slice(&0x64u32.to_le_bytes());
+            rec[0x38..0x3C].copy_from_slice(&ATTR_VOLUME_INFORMATION.to_le_bytes());
+            rec[0x3C..0x40].copy_from_slice(&0x28u32.to_le_bytes());
+            rec[0x40] = 0; // resident
+            rec[0x48..0x4C].copy_from_slice(&10u32.to_le_bytes()); // value length
+            rec[0x4C..0x4E].copy_from_slice(&0x18u16.to_le_bytes()); // value offset
+            rec[0x58..0x5A].copy_from_slice(&flags.to_le_bytes());
+            rec[0x60..0x64].copy_from_slice(&ATTR_END.to_le_bytes());
+            rec
+        }
+
+        assert_eq!(
+            parse_volume_flags(&volume_record(VOLUME_DIRTY)),
+            Some(VOLUME_DIRTY)
+        );
+        assert_eq!(parse_volume_flags(&volume_record(0)), Some(0));
+        // A record with no `$VOLUME_INFORMATION` attribute yields `None`.
+        let mut empty = vec![0u8; 0x40];
+        empty[0..4].copy_from_slice(b"FILE");
+        empty[0x14..0x16].copy_from_slice(&0x38u16.to_le_bytes());
+        empty[0x18..0x1C].copy_from_slice(&0x3Cu32.to_le_bytes());
+        empty[0x38..0x3C].copy_from_slice(&ATTR_END.to_le_bytes());
+        assert_eq!(parse_volume_flags(&empty), None);
     }
 
     #[test]

@@ -668,6 +668,16 @@ fn install_shutdown_handler(
                 Err(e) => error!(error = %e, "snapshot save failed"),
             }
         }
+        // Diagnostics: the daemon does not unmount the private NTFS mounts it
+        // created (a known defect, see plans/risks.md R13). Log what leaks so
+        // the mount-lifecycle question can be answered from logs.
+        let leaked = ntfs::private_mounts();
+        if !leaked.is_empty() {
+            warn!(
+                mounts = ?leaked,
+                "ntfs: daemon-created mounts are NOT unmounted on shutdown (known defect; plans/risks.md R13)"
+            );
+        }
         std::process::exit(0);
     });
 }

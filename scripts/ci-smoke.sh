@@ -273,6 +273,17 @@ if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
   expect_grep "overlay QML reports no usable socket" "$overlay_qml" "echo none"
   expect_grep "overlay QML forces a reconnect on open" "$overlay_qml" \
     "root.opened = false"
+  # Regression guard (2026-10-12): the plugin is `keepLoaded`, so an
+  # unconditionally instantiated TextInput stays alive — and connected to the
+  # clipboard — while the overlay is hidden. On Qt 6.12 a clipboard change makes
+  # a TextInput synchronously read the foreign text over the Wayland transfer
+  # with no total byte limit or deadline, so a streaming clipboard owner could
+  # stall or exhaust the shared shell with no paste action and no field focus.
+  # The input must be created lazily, only while the overlay is open.
+  expect_grep "overlay QML creates the input lazily" "$overlay_qml" \
+    "sourceComponent: TextInput"
+  expect_grep "overlay QML gates the input on the open state" "$overlay_qml" \
+    "active: root.opened"
   expect_path "CLI symlink installed" "$target_home/.local/bin/omavry" present
 else
   printf 'skip - per-user plugin checks (no SUDO_USER)\n'

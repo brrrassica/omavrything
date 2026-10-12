@@ -99,6 +99,14 @@ accepts `RUST_LOG` syntax, e.g. `omavrythingd=debug,zbus=warn`), in that order o
 precedence. The default is `error`, so a production daemon is quiet unless
 something is wrong; raise it to `info` or `debug` when diagnosing.
 
+At `info`, the daemon also logs NTFS mount activity: each mount attempt and
+result (udisks2 or the private `ntfs3` fallback), whether a mount was reused or
+daemon-created, the filesystem type and options from `/proc/mounts`, and the
+`$Volume` dirty flag read from the MFT before indexing (a volume Windows did not
+unmount cleanly is replayed by the kernel `ntfs3` driver on mount). On shutdown
+it warns with the list of daemon-created mounts it does **not** unmount (a known
+defect tracked for v0.2.0). Raise the level to `info` to see these.
+
 ## systemd service
 
 `data/systemd/omavrythingd.service` runs the daemon as a hardened system service

@@ -13,6 +13,7 @@ use std::sync::{Mutex, RwLock};
 
 use omavrything_core::index::{FsKind, Index};
 use omavrything_ntfs::{NtfsEntry, NtfsPartition, NtfsVolume};
+use tracing::{debug, info, warn};
 
 /// The private mount root used when udisks2 is unavailable.
 const PRIVATE_MOUNT_ROOT: &str = "/run/omavrything/ntfs";
@@ -24,12 +25,62 @@ const PRIVATE_MOUNT_ROOT: &str = "/run/omavrything/ntfs";
 /// existing mount point rather than attempting a second mount.
 pub fn mount_readonly(device: &Path, uuid: Option<&str>) -> Result<PathBuf, String> {
     if let Some(mount_point) = existing_mount_point(device) {
+        // Diagnostics: a pre-existing mount is *not* daemon-created, and its
+        // read-write state is whatever the desktop (udisks2) chose. Log it so
+        // the mount-ownership and ro/rw questions can be answered from logs.
+        let state = mount_state(device);
+        info!(
+            device = %device.display(),
+            mount_point = %mount_point.display(),
+            fs_type = state.as_ref().map(|s| s.0.as_str()).unwrap_or("?"),
+            options = state.as_ref().map(|s| s.1.as_str()).unwrap_or("?"),
+            "ntfs: reusing pre-existing mount (not daemon-created)"
+        );
         return Ok(mount_point);
     }
     if let Some(mount_point) = mount_via_udisks(device) {
         return Ok(mount_point);
     }
     mount_via_ntfs3(device, uuid)
+}
+
+/// The filesystem type and mount options for `device` from `/proc/mounts`, as
+/// `(fs_type, options)`. Used only for diagnostics.
+fn mount_state(device: &Path) -> Option<(String, String)> {
+    let mounts = std::fs::read_to_string("/proc/mounts").ok()?;
+    let dev = device.to_string_lossy();
+    for line in mounts.lines() {
+        let mut fields = line.split_whitespace();
+        let source = fields.next()?;
+        let _target = fields.next()?;
+        let fs_type = fields.next()?;
+        let options = fields.next().unwrap_or("");
+        if source == dev {
+            return Some((fs_type.to_string(), options.to_string()));
+        }
+    }
+    None
+}
+
+/// The mount points of daemon-created private NTFS mounts (under
+/// [`PRIVATE_MOUNT_ROOT`]) that are currently live, from `/proc/mounts`.
+///
+/// The daemon does not unmount these on shutdown (a known defect, see
+/// `plans/risks.md` R13), so this is used to log what leaks.
+pub fn private_mounts() -> Vec<PathBuf> {
+    let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else {
+        return Vec::new();
+    };
+    mounts
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let _source = fields.next()?;
+            let target = fields.next()?;
+            let target = PathBuf::from(unescape_mount(target));
+            target.starts_with(PRIVATE_MOUNT_ROOT).then_some(target)
+        })
+        .collect()
 }
 
 /// The mount point of `device` if it is already mounted, from `/proc/mounts`.
@@ -69,6 +120,11 @@ fn unescape_mount(s: &str) -> String {
 
 /// Mount via `udisksctl` (a udisks2 user mount), returning the mount point.
 fn mount_via_udisks(device: &Path) -> Option<PathBuf> {
+    info!(
+        device = %device.display(),
+        command = "udisksctl mount -b <device> -o ro",
+        "ntfs: attempting udisks2 mount"
+    );
     let output = Command::new("udisksctl")
         .arg("mount")
         .arg("-b")
@@ -78,9 +134,25 @@ fn mount_via_udisks(device: &Path) -> Option<PathBuf> {
         .output()
         .ok()?;
     if !output.status.success() {
+        warn!(
+            device = %device.display(),
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "ntfs: udisksctl mount failed"
+        );
         return None;
     }
-    parse_udisks_mount_point(&String::from_utf8_lossy(&output.stdout))
+    let mount_point = parse_udisks_mount_point(&String::from_utf8_lossy(&output.stdout));
+    if let Some(ref mp) = mount_point {
+        let state = mount_state(device);
+        info!(
+            device = %device.display(),
+            mount_point = %mp.display(),
+            fs_type = state.as_ref().map(|s| s.0.as_str()).unwrap_or("?"),
+            options = state.as_ref().map(|s| s.1.as_str()).unwrap_or("?"),
+            "ntfs: udisks2 mount result"
+        );
+    }
+    mount_point
 }
 
 /// Parse the mount point from `udisksctl mount` output, e.g.
@@ -102,6 +174,12 @@ fn mount_via_ntfs3(device: &Path, uuid: Option<&str>) -> Result<PathBuf, String>
     let name = uuid.unwrap_or("volume");
     let mount_point = PathBuf::from(PRIVATE_MOUNT_ROOT).join(name);
     std::fs::create_dir_all(&mount_point).map_err(|e| e.to_string())?;
+    info!(
+        device = %device.display(),
+        mount_point = %mount_point.display(),
+        command = "mount -t ntfs3 -o ro <device> <mount_point>",
+        "ntfs: attempting private ntfs3 mount (daemon-created)"
+    );
     let output = Command::new("mount")
         .arg("-t")
         .arg("ntfs3")
@@ -112,8 +190,23 @@ fn mount_via_ntfs3(device: &Path, uuid: Option<&str>) -> Result<PathBuf, String>
         .output()
         .map_err(|e| e.to_string())?;
     if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        warn!(
+            device = %device.display(),
+            mount_point = %mount_point.display(),
+            stderr = %stderr,
+            "ntfs: private ntfs3 mount failed"
+        );
+        return Err(stderr);
     }
+    let state = mount_state(device);
+    info!(
+        device = %device.display(),
+        mount_point = %mount_point.display(),
+        fs_type = state.as_ref().map(|s| s.0.as_str()).unwrap_or("?"),
+        options = state.as_ref().map(|s| s.1.as_str()).unwrap_or("?"),
+        "ntfs: private ntfs3 mount result (daemon-created; NOT unmounted on shutdown)"
+    );
     Ok(mount_point)
 }
 
@@ -127,6 +220,26 @@ fn mount_via_ntfs3(device: &Path, uuid: Option<&str>) -> Result<PathBuf, String>
 pub fn enumerate_device(device: &Path) -> Result<Vec<NtfsEntry>, String> {
     let file = std::fs::File::open(device).map_err(|e| e.to_string())?;
     let mut volume = NtfsVolume::open(file).map_err(|e| e.to_string())?;
+    // Diagnostics: the `$Volume` dirty flag is the state in which the kernel
+    // `ntfs3` driver replays the journal on mount. Log it before the MFT read
+    // so a dirty volume is visible in the logs. This is a read-only probe.
+    match volume.volume_flags() {
+        Ok(Some(flags)) => info!(
+            device = %device.display(),
+            flags = format!("0x{flags:04x}"),
+            dirty = flags & omavrything_ntfs::mft::VOLUME_DIRTY != 0,
+            "ntfs: volume flags before MFT read"
+        ),
+        Ok(None) => debug!(
+            device = %device.display(),
+            "ntfs: volume flags unavailable (no $Volume record)"
+        ),
+        Err(err) => warn!(
+            device = %device.display(),
+            error = %err,
+            "ntfs: could not read volume flags"
+        ),
+    }
     volume.enumerate().map_err(|e| e.to_string())
 }
 
@@ -156,6 +269,11 @@ pub fn mount_index_and_remember(
     partition: &NtfsPartition,
 ) -> Result<PathBuf, String> {
     let mount_point = mount_readonly(&partition.device, partition.uuid.as_deref())?;
+    info!(
+        device = %partition.device.display(),
+        mount_point = %mount_point.display(),
+        "ntfs: mount event (daemon will not unmount this on shutdown)"
+    );
     // Read and parse the MFT outside the index lock: on a multi-million-record
     // volume this takes seconds, and holding the write lock for it would stall
     // every search for the duration.
