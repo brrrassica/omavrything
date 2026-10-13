@@ -321,7 +321,23 @@ daemon as root with `scripts/restart-all.sh --sudo` to index NTFS.
 ## Profiling query performance
 
 Search is a linear scan over every record, so its cost is proportional to the
-index size. Two tools measure it:
+index size. Three tools measure it:
+
+- **End-to-end benchmark** — [`scripts/benchmark.sh`](../scripts/benchmark.sh)
+  drives a real daemon over the Unix socket and reports wall-clock latency
+  distributions (p50/p95/p99/max) for selective, broad, and no-match queries,
+  the cold-scan indexing throughput, and search latency *while the index is
+  being rebuilt* (a rescan) and *while it is being updated live* (an inotify
+  burst). It also benchmarks the live installed daemon when one is reachable:
+
+  ```sh
+  scripts/benchmark.sh                 # fast default (~10 s): hermetic + live
+  scripts/benchmark.sh --full          # larger sizes + the rescan measurement
+  scripts/benchmark.sh --all           # --full plus the Criterion bench + profiler
+  scripts/benchmark.sh --json          # machine-readable summary on stdout
+  ```
+
+  It needs `python3` and the `omavrythingd` binary (`bin/` or `/usr/bin`).
 
 - **Standalone profiler** — builds a synthetic index and times a query (or a
   simulated burst of typing) with a stage-by-stage breakdown:

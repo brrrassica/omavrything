@@ -58,6 +58,7 @@ scripts/build.sh
 | `/etc/omavrything/config.toml` | Default daemon configuration. |
 | `/usr/share/man/man8/omavrythingd.8` | Man page for the daemon. |
 | `/usr/share/omavrything/shell/omavrything/` | The `omarchy-shell` plugin. |
+| `/usr/share/omavrything/scripts/benchmark.sh` | Search-latency and indexing-throughput benchmark. |
 | `/usr/share/doc/omavrything/` | Documentation. |
 | `/usr/share/licenses/omavrything/LICENSE` | MIT license. |
 

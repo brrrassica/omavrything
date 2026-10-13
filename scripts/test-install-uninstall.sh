@@ -130,17 +130,32 @@ else
   bad "uninstall.sh does not remove the per-user plugin / CLI symlink"
 fi
 
-# --- C11: doctor.sh prints a report and flags a missing install -------------
-out="$("$here/scripts/doctor.sh" 2>&1 || true)"
+# --- C11: doctor.sh prints a report and reflects the install state ----------
+# doctor.sh emits [fail] only when the daemon binary is absent (or present but
+# broken); every other line is [ ok ] or [warn], and it exits non-zero iff it
+# printed a [fail]. The check is therefore conditional on the host: on a clean
+# host it must flag the missing install, and on a host with the daemon installed
+# it must report all-ok and exit 0. Asserting the missing-install case
+# unconditionally made the test non-hermetic — it failed on any host with
+# omavrything installed (e.g. running the battery out of order).
+out="$("$here/scripts/doctor.sh" 2>&1)" && rc=0 || rc=$?
 if printf '%s' "$out" | grep -q 'omavrything doctor'; then
   ok "doctor.sh prints a report"
 else
   bad "doctor.sh did not print a report"
 fi
-if printf '%s' "$out" | grep -q '\[fail\]'; then
-  ok "doctor.sh flags a missing install"
+if [[ -x /usr/bin/omavrythingd ]]; then
+  if [[ "$rc" -eq 0 ]] && ! printf '%s' "$out" | grep -q '\[fail\]'; then
+    ok "doctor.sh reports all-ok and exits 0 with the daemon installed"
+  else
+    bad "doctor.sh did not report all-ok with the daemon installed (rc=$rc)"
+  fi
 else
-  bad "doctor.sh did not flag the missing install"
+  if printf '%s' "$out" | grep -q '\[fail\]'; then
+    ok "doctor.sh flags a missing install"
+  else
+    bad "doctor.sh did not flag the missing install"
+  fi
 fi
 
 # --- C1/C6/C11: the release archive ships the expected files ----------------
@@ -150,7 +165,7 @@ if [[ -x bin/omavrythingd && -x bin/omavry ]]; then
     # Capture the listing first: `unzip -l | grep -q` would SIGPIPE unzip when
     # grep exits on the first match, which `set -o pipefail` turns into a failure.
     listing="$(unzip -l "$archive" 2>/dev/null || true)"
-    for entry in scripts/install.sh scripts/uninstall.sh data/man/omavrythingd.8 scripts/doctor.sh; do
+    for entry in scripts/install.sh scripts/uninstall.sh data/man/omavrythingd.8 scripts/doctor.sh scripts/benchmark.sh; do
       if [[ -n "$listing" ]] && grep -qF "$entry" <<<"$listing"; then
         ok "the release archive contains $entry"
       else
@@ -182,6 +197,24 @@ if grep -q '/run/omavrything/omavrything.sock' "$here/shell/omavrything/SearchOv
   ok "overlay QML targets the system socket via a startup probe"
 else
   bad "overlay QML does not target the system socket (widget shows 'Search daemon unavailable')"
+fi
+
+# --- C13: the overlay QML has no clipboard-connected text input --------------
+# Regression guard (2026-10-13): on Qt 6.12 a native editable TextInput connects
+# to QClipboard::dataChanged and synchronously reads the foreign text over the
+# Wayland transfer with no aggregate byte limit and no total deadline, so a
+# streaming clipboard owner could stall or exhaust the shared shell with no
+# paste action and no field focus. Gating the input on the open state only
+# removed it while the window was hidden; the class remained while the overlay
+# was open. The search field must be a custom Text + Keys input, not a
+# TextInput/TextEdit/TextField/TextArea. The regex matches a type instantiation
+# (`TextInput {`), not the explanatory comment that names the type.
+if ! grep -Eq '(TextInput|TextEdit|TextField|TextArea)[[:space:]]*\{' \
+  "$here/shell/omavrything/SearchOverlay.qml" &&
+  grep -q 'Keys.onPressed' "$here/shell/omavrything/SearchOverlay.qml"; then
+  ok "overlay QML has no clipboard-connected text input (custom Text + Keys field)"
+else
+  bad "overlay QML contains a clipboard-connected text input"
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

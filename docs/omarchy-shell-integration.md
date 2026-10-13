@@ -113,13 +113,17 @@ the input at the top and a results table below. The table shows **name**,
 **size**, **modified**, and **path** so duplicates are distinguishable.
 
 The plugin is `keepLoaded`, so the overlay stays resident in the shell. Its
-editable `TextInput` is therefore created lazily by a `Loader` gated on the
-overlay's open state, and torn down on close. A permanently instantiated
-`TextInput` would stay connected to the clipboard while the window is hidden;
-on Qt 6.12 a clipboard change makes a `TextInput` synchronously read the
-foreign text over the Wayland transfer with no total byte limit or deadline, so
-a streaming clipboard owner could stall or exhaust the shared shell with no
-paste action and no field focus.
+search field is a **custom, non-native input** — a focusable `Item` that renders
+the query with a `Text` element and edits it from `Keys.onPressed` — not a
+`TextInput`. On Qt 6.12 a native editable `TextInput` connects to
+`QClipboard::dataChanged` and synchronously reads the foreign text over the
+Wayland transfer with no aggregate byte limit and no total deadline, so a
+streaming clipboard owner could stall or exhaust the shared shell with no paste
+action and no field focus. Gating the input on the open state only removed it
+while the window was hidden; the class remained while the overlay was open. A
+custom input has no clipboard connection at all, so the class cannot recur. The
+field is still created lazily by a `Loader` gated on the overlay's open state,
+and torn down on close.
 
 The column headers are clickable: clicking a header sorts the current results by
 that column, and clicking it again toggles ascending/descending. The active

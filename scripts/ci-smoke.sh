@@ -132,6 +132,16 @@ expect_grep() {
   fi
 }
 
+# Assert a file does NOT match an extended regex. Used to prove a
+# clipboard-connected text input is absent from the overlay QML.
+expect_no_grep_re() {
+  if grep -Eq -- "$3" "$2" 2>/dev/null; then
+    fail "$1 ($2 matches '$3')"
+  else
+    ok "$1"
+  fi
+}
+
 cleanup() {
   # Best-effort teardown so a failure does not leave a daemon or install behind.
   pkill -x omavrythingd 2>/dev/null || true
@@ -174,7 +184,7 @@ fi
 if compgen -G 'dist/omavrything-*.zip' >/dev/null; then
   archive="$(ls dist/omavrything-*.zip | head -1)"
   archive_listing="$(unzip -l "$archive" 2>/dev/null || true)"
-  for entry in bin/omavry bin/omavrythingd manifest.json INSTALL.txt; do
+  for entry in bin/omavry bin/omavrythingd manifest.json INSTALL.txt scripts/benchmark.sh; do
     if grep -q "$entry" <<<"$archive_listing"; then
       ok "release archive contains $entry"
     else
@@ -273,15 +283,21 @@ if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
   expect_grep "overlay QML reports no usable socket" "$overlay_qml" "echo none"
   expect_grep "overlay QML forces a reconnect on open" "$overlay_qml" \
     "root.opened = false"
-  # Regression guard (2026-10-12): the plugin is `keepLoaded`, so an
-  # unconditionally instantiated TextInput stays alive — and connected to the
-  # clipboard — while the overlay is hidden. On Qt 6.12 a clipboard change makes
-  # a TextInput synchronously read the foreign text over the Wayland transfer
-  # with no total byte limit or deadline, so a streaming clipboard owner could
-  # stall or exhaust the shared shell with no paste action and no field focus.
-  # The input must be created lazily, only while the overlay is open.
-  expect_grep "overlay QML creates the input lazily" "$overlay_qml" \
-    "sourceComponent: TextInput"
+  # Regression guard (2026-10-13): the plugin is `keepLoaded`, and on Qt 6.12 a
+  # native editable TextInput connects to QClipboard::dataChanged and
+  # synchronously reads the foreign text over the Wayland transfer with no
+  # aggregate byte limit and no total deadline, so a streaming clipboard owner
+  # could stall or exhaust the shared shell with no paste action and no field
+  # focus. Gating the input on the open state (the 0.1.6 fix) only removed it
+  # while the window was hidden; the class remained while the overlay was open.
+  # The overlay must therefore contain no clipboard-connected text input at all
+  # — the search field is a custom Text + Keys input — and it must still be
+  # gated on the open state. The regex matches a type instantiation
+  # (`TextInput {`), not the explanatory comment that names the type.
+  expect_no_grep_re "overlay QML has no clipboard-connected text input" \
+    "$overlay_qml" '(TextInput|TextEdit|TextField|TextArea)[[:space:]]*\{'
+  expect_grep "overlay QML uses a custom non-clipboard input" "$overlay_qml" \
+    "Keys.onPressed"
   expect_grep "overlay QML gates the input on the open state" "$overlay_qml" \
     "active: root.opened"
   expect_path "CLI symlink installed" "$target_home/.local/bin/omavry" present

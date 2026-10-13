@@ -268,10 +268,16 @@ flowchart TD
   hardcoded defaults, and the height grows with
   the result count up to the cap. Keyboard navigation
   (`Up`/`Down`/`PageUp`/`PageDown`/`Enter`), `Esc` dismisses. `Enter` opens the
-  selected result, or the top result when no cursor is active. Because the
-  plugin is `keepLoaded`, the editable `TextInput` is created lazily by a
-  `Loader` gated on the open state and torn down on close, so it is never alive
-  (and never connected to the clipboard) while the window is hidden.
+  selected result, or the top result when no cursor is active. The search field
+  is a **custom, non-native input** — a focusable `Item` that renders the query
+  with a `Text` element and edits it from `Keys.onPressed` — not a `TextInput`.
+  On Qt 6.12 a native editable `TextInput` connects to `QClipboard::dataChanged`
+  and synchronously reads the foreign text over the Wayland transfer with no
+  aggregate byte limit and no total deadline, so a streaming clipboard owner
+  could stall or exhaust the shared shell with no paste action and no field
+  focus. A custom input has no clipboard connection at all, so the class cannot
+  recur. Because the plugin is `keepLoaded`, the field is still created lazily
+  by a `Loader` gated on the open state and torn down on close.
 - **`Service.qml` (service):** a headless plugin that owns the persistent
   `tech.alatcerdas.omavrything` IPC target (`focus`, `ping`), so the hotkey works before the
   overlay has ever been loaded (ADR-008).

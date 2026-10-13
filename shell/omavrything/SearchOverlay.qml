@@ -132,7 +132,7 @@ Item {
     root.opened = false
   }
 
-  // Focus the editable input. The input is created lazily by inputLoader while
+  // Focus the custom input. The input is created lazily by inputLoader while
   // the overlay is open (see the Loader below), so this is a no-op if the item
   // does not exist yet.
   function focusInput() {
@@ -487,15 +487,20 @@ Item {
             }
           }
 
-          // The editable input is created only while the overlay is open. The
-          // plugin is `keepLoaded`, so an unconditionally instantiated TextInput
-          // would stay alive — and connected to the clipboard — while the window
-          // is hidden. On Qt 6.12 a clipboard change makes a TextInput
-          // synchronously read the foreign text over the Wayland transfer with
-          // no total byte limit or deadline, so a streaming clipboard owner
-          // could stall or exhaust the shared shell with no paste action and no
-          // field focus. Gating the Loader on `opened` tears the input down on
-          // close, so it only exists while the user is actually searching.
+          // The search input is a custom, non-native field: a focusable Item
+          // that renders the query with a Text element and edits it from
+          // Keys.onPressed. It deliberately does NOT use a TextInput/TextEdit.
+          //
+          // On Qt 6.12 a native editable TextInput connects to
+          // QClipboard::dataChanged and synchronously reads the foreign text
+          // over the Wayland transfer with no aggregate byte limit and no total
+          // deadline, so a streaming clipboard owner could stall or exhaust the
+          // shared shell with no paste action and no field focus. Gating the
+          // Loader on `opened` only removed the input while the window was
+          // hidden; the class remained while the overlay was open. A custom
+          // input has no clipboard connection at all, so the class cannot
+          // recur. The Loader still gates creation on the open state so the
+          // field only exists while the user is actually searching.
           Loader {
             id: inputLoader
             anchors.left: searchGlyph.right
@@ -505,25 +510,76 @@ Item {
             anchors.top: parent.top
             anchors.bottom: parent.bottom
             active: root.opened
-            sourceComponent: TextInput {
+            sourceComponent: Item {
               id: input
               anchors.fill: parent
               focus: true
-              text: root.filterText
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.heading
-              verticalAlignment: TextInput.AlignVCenter
-              clip: true
-              selectByMouse: true
-              onTextChanged: {
-                if (root.filterText !== text) {
-                  root.filterText = text
-                  root.selectedIndex = 0
-                  root.writeQuery(text)
-                  root.rebuild()
-                }
+
+              // Blink the caret while the field has focus.
+              property bool caretOn: true
+              onActiveFocusChanged: if (activeFocus) caretOn = true
+              Timer {
+                interval: 500
+                repeat: true
+                running: input.activeFocus
+                onTriggered: input.caretOn = !input.caretOn
               }
+
+              // Append a printable character and mirror the query to the bar.
+              function appendText(ch) {
+                if (!ch) return
+                root.filterText += ch
+                root.selectedIndex = 0
+                root.writeQuery(root.filterText)
+                root.rebuild()
+              }
+
+              // Remove the last character and mirror the query to the bar.
+              function backspace() {
+                if (root.filterText.length === 0) return
+                root.filterText = root.filterText.substring(0, root.filterText.length - 1)
+                root.selectedIndex = 0
+                root.writeQuery(root.filterText)
+                root.rebuild()
+              }
+
+              Text {
+                id: inputText
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                width: Math.max(0, parent.width - cursor.width)
+                text: root.filterText
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.heading
+                elide: Text.ElideRight
+                clip: true
+              }
+
+              // Caret at the end of the query. The custom field has no in-text
+              // cursor movement; the query is edited at its end.
+              Rectangle {
+                id: cursor
+                x: Math.min(inputText.contentWidth, inputText.width)
+                anchors.verticalCenter: parent.verticalCenter
+                width: Math.max(1, Style.space(2))
+                height: inputText.height
+                color: root.foreground
+                visible: input.activeFocus
+                opacity: input.caretOn ? 1 : 0
+              }
+
+              Text {
+                anchors.fill: parent
+                text: "Search files…"
+                visible: root.filterText.length === 0
+                color: root.foreground
+                opacity: 0.45
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.heading
+                verticalAlignment: Text.AlignVCenter
+              }
+
               Keys.onPressed: function(event) {
                 if (event.key === Qt.Key_Escape) { root.dismiss(); event.accepted = true }
                 else if (event.key === Qt.Key_Up) { root.select(-1); event.accepted = true }
@@ -531,16 +587,8 @@ Item {
                 else if (event.key === Qt.Key_PageUp) { root.select(-10); event.accepted = true }
                 else if (event.key === Qt.Key_PageDown) { root.select(10); event.accepted = true }
                 else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) { root.activate(); event.accepted = true }
-              }
-
-              Text {
-                anchors.fill: parent
-                text: "Search files…"
-                visible: input.text.length === 0
-                color: root.foreground
-                opacity: 0.45
-                font: input.font
-                verticalAlignment: Text.AlignVCenter
+                else if (event.key === Qt.Key_Backspace || event.key === Qt.Key_Delete) { input.backspace(); event.accepted = true }
+                else if (event.text.length > 0 && event.text.charCodeAt(0) >= 0x20) { input.appendText(event.text); event.accepted = true }
               }
             }
           }

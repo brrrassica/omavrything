@@ -4,6 +4,40 @@ Notable changes to `omavrything`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.7] — 2026-10-13
+
+### Security
+
+- **The overlay's search input is no longer a native editable `TextInput`.** The
+  0.1.6 fix gated the input's `Loader` on the overlay's open state, which removed
+  it only while the window was hidden; while the overlay was open the field was
+  still an editable native `TextInput`. On Qt 6.12 a `TextInput` connects to
+  `QClipboard::dataChanged` and synchronously reads the foreign text over the
+  Wayland transfer with no aggregate byte limit and no total deadline, so a
+  streaming clipboard owner could stall or exhaust the shared shell with no
+  paste action and no field focus. The field is now a custom, non-native input
+  (a focusable `Item` that renders the query with a `Text` element and edits it
+  from `Keys.onPressed`), so it has no clipboard connection at all and the class
+  cannot recur. The `Loader` still gates creation on the open state, and
+  `scripts/ci-smoke.sh` and `scripts/test-install-uninstall.sh` guard the
+  absence of a clipboard-connected text input.
+
+### Added
+
+- **`scripts/benchmark.sh` — an end-to-end search and indexing benchmark.** It
+  drives a real daemon over the Unix socket and reports wall-clock latency
+  distributions (p50/p95/p99/max) for selective, broad, and no-match queries,
+  the cold-scan indexing throughput, and search latency *while the index is
+  being rebuilt* (a rescan) and *while it is being updated live* (an inotify
+  burst). It also benchmarks the live installed daemon when one is reachable,
+  and can optionally run the Criterion micro-benchmark and the standalone
+  profiler example. The script ships in the release archive under `scripts/`
+  and in the AUR package under `/usr/share/omavrything/scripts/`; the archive
+  checks in `scripts/ci-smoke.sh` and `scripts/test-install-uninstall.sh` guard
+  its presence. The default run is a fast (~10 s) profile; `--full`/`--all` run
+  the larger, more comprehensive sizes. The 0.1.6 baseline numbers are recorded
+  in [`docs/benchmarks.md`](docs/benchmarks.md).
+
 ## [0.1.6] — 2026-10-12
 
 A diagnostics-and-hardening release. It adds read-only NTFS mount and volume
@@ -261,6 +295,7 @@ Then install 0.1.1, run `omavrything-install-plugin`, and enable
 First release: the `omavrythingd` index daemon, the `omavry` CLI, and the
 `omarchy-shell` search plugin (bar widget, overlay, service).
 
+[0.1.7]: https://github.com/brrrassica/omavrything/releases/tag/v0.1.7
 [0.1.6]: https://github.com/brrrassica/omavrything/releases/tag/v0.1.6
 [0.1.5]: https://github.com/brrrassica/omavrything/releases/tag/v0.1.5
 [0.1.3]: https://github.com/brrrassica/omavrything/releases/tag/v0.1.3
