@@ -4,7 +4,7 @@ Notable changes to `omavrything`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.7] — 2026-10-13
 
 ### Security
 
@@ -295,6 +295,7 @@ Then install 0.1.1, run `omavrything-install-plugin`, and enable
 First release: the `omavrythingd` index daemon, the `omavry` CLI, and the
 `omarchy-shell` search plugin (bar widget, overlay, service).
 
+[0.1.7]: https://github.com/brrrassica/omavrything/releases/tag/v0.1.7
 [0.1.6]: https://github.com/brrrassica/omavrything/releases/tag/v0.1.6
 [0.1.5]: https://github.com/brrrassica/omavrything/releases/tag/v0.1.5
 [0.1.3]: https://github.com/brrrassica/omavrything/releases/tag/v0.1.3
