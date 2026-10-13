@@ -4,6 +4,31 @@ Notable changes to `omavrything`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — v0.2.0 roadmap
+
+The next release is a **performance-first** robustness release. The work below is
+planned, not yet shipped; this note records the direction.
+
+### Planned
+
+- **Indexing and search performance (highest priority).** The search path is
+  currently a linear scan. v0.2.0 adds a candidate-narrowing (n-gram) index, a
+  cache-friendly hot layout, a prefix/token index, incremental index maintenance,
+  faster snapshot load/save, query-result caching, and parallelism/SIMD tuning,
+  with p50/p95 performance budgets enforced in CI. This lands first so the rest
+  of the release has timing headroom.
+- **Toggleable menu-entry (app shortcut) indexing.** Freedesktop `.desktop`
+  entries and Omarchy's own menu config become searchable, launchable results
+  behind an `index_menu_entries` config toggle, with a distinct icon/type and
+  `Enter`-to-launch.
+- **NTFS mount/unmount safety on forced close.** Clean unmount on
+  `SIGTERM`/`SIGINT`, startup reconciliation after `SIGKILL` or a crash, a
+  systemd `ExecStopPost` sweep on stop/reboot/poweroff, a tmpfs mount root, and
+  read-only mounts so a forced close cannot leak a mount or dirty the volume.
+- **Robustness and setup.** Mount-boundary correctness, scan cancellation and
+  error reporting, non-btrfs snapshot staleness, mount ownership and hotplug,
+  install/uninstall hardening, and a single copyable setup command.
+
 ## [0.1.7] — 2026-10-13
 
 ### Security

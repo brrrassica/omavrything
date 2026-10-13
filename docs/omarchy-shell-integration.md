@@ -26,14 +26,12 @@ The design therefore splits the search bar in two:
 
 - **`SearchBar.qml`** is a *visual mirror*: it renders the search bar in the bar
   and summons the overlay on click. It does not host the input.
-- **`SearchOverlay.qml`** hosts the real `TextInput` and the results list. It is
+- **`SearchOverlay.qml`** hosts the real search input and the results list. It is
   a `PanelWindow` with `WlrLayershell.keyboardFocus: WlrKeyboardFocus.Exclusive`
   while open, rendered as a **centered scratchpad tile** (~70% x 70%, high
   transparency) rather than a dropdown under the bar.
 
-This is the fallback recorded in [ADR-008](decisions.md#adr-008); the primary
-design (a bar widget hosting the input) was ruled out by an early feasibility
-spike.
+
 
 ## IPC
 
@@ -41,7 +39,7 @@ The `service` plugin registers a persistent IPC target:
 
 ```sh
 omarchy-shell tech.alatcerdas.omavrything focus   # summon the overlay and focus the input
-omarchy-shell tech.alatcerdas.omavrything ping    # health check
+omarchy-shell tech.alatcerdas.omavrything ping  d  # health check
 ```
 
 `focus` calls the shell's `summon` for the plugin, which loads the overlay and
