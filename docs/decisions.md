@@ -224,7 +224,13 @@ columns that distinguish duplicates, and reads as an ephemeral scratchpad rather
 than a cramped dropdown. High transparency keeps the desktop visible behind it.
 
 **Consequences:** The tile is larger than the previous top-right card; the
-overlay geometry and the bar widget's role change.
+overlay geometry and the bar widget's role change. The input is a **custom,
+non-native field** (a focusable `Item` with a `Text` display and `Keys`
+handling), not a `TextInput`: on Qt 6.12 a native editable `TextInput` connects
+to `QClipboard::dataChanged` and synchronously reads the foreign text over the
+Wayland transfer with no aggregate byte limit and no total deadline, so a
+streaming clipboard owner could stall or exhaust the shared shell with no paste
+action and no field focus. A custom input has no clipboard connection at all.
 
 **Alternatives considered:** A wider top-anchored window; a narrow dropdown.
 

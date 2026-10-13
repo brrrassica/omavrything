@@ -6,6 +6,22 @@ Notable changes to `omavrything`. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- **The overlay's search input is no longer a native editable `TextInput`.** The
+  0.1.6 fix gated the input's `Loader` on the overlay's open state, which removed
+  it only while the window was hidden; while the overlay was open the field was
+  still an editable native `TextInput`. On Qt 6.12 a `TextInput` connects to
+  `QClipboard::dataChanged` and synchronously reads the foreign text over the
+  Wayland transfer with no aggregate byte limit and no total deadline, so a
+  streaming clipboard owner could stall or exhaust the shared shell with no
+  paste action and no field focus. The field is now a custom, non-native input
+  (a focusable `Item` that renders the query with a `Text` element and edits it
+  from `Keys.onPressed`), so it has no clipboard connection at all and the class
+  cannot recur. The `Loader` still gates creation on the open state, and
+  `scripts/ci-smoke.sh` and `scripts/test-install-uninstall.sh` guard the
+  absence of a clipboard-connected text input.
+
 ### Added
 
 - **`scripts/benchmark.sh` — an end-to-end search and indexing benchmark.** It
