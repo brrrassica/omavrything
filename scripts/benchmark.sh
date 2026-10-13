@@ -4,8 +4,9 @@
 # Measures, over the real Unix-socket protocol:
 #   * cold-scan indexing throughput (entries/second),
 #   * search latency on an idle index (selective, broad, no-match),
-#   * search latency while the index is being rebuilt (a rescan), and
+#   * search latency while the index is being rebuilt (a rescan),
 #   * search latency while the index is being updated live (an inotify burst),
+#   * the daemon's resident set size (RSS) and peak RSS (VmHWM), and
 # plus, against the live installed daemon when one is reachable.
 # Optionally runs the Criterion micro-benchmark and the standalone profiler
 # example (both need a source checkout).
@@ -18,6 +19,7 @@
 #   --rescan            Also measure search latency during a periodic rescan
 #                       (idle-gated; usually only fires in an idle session or CI)
 #   --no-live-update    Skip the inotify live-update measurement
+#   --no-memory         Skip the daemon RSS/peak-memory measurement
 #   --criterion         Also run the Criterion micro-benchmark (cargo bench)
 #   --profile           Also run the standalone profiler example
 #   --full              Larger sizes and the rescan measurement
@@ -49,6 +51,7 @@ run_live=auto
 run_hermetic=1
 do_indexing=0
 do_live_update=1
+do_memory=1
 do_criterion=0
 do_profile=0
 json=0
@@ -60,7 +63,7 @@ live_queries=3
 records=1000000
 socket_override=""
 
-usage() { sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -68,6 +71,7 @@ while [[ $# -gt 0 ]]; do
     --hermetic) run_live=no; run_hermetic=1 ;;
     --rescan) do_indexing=1 ;;
     --no-live-update) do_live_update=0 ;;
+    --no-memory) do_memory=0 ;;
     --criterion) do_criterion=1 ;;
     --profile) do_profile=1 ;;
     --full) files=50000; queries=100; duration=15; live_queries=20; do_indexing=1 ;;
@@ -121,6 +125,65 @@ cleanup() {
 trap cleanup EXIT
 
 add_result() { printf '%s\t%s\n' "$1" "$2" >> "$results"; }
+
+# ---- memory measurement ----------------------------------------------------
+# The kernel tracks both the current resident set size (VmRSS) and its peak
+# (VmHWM, the high-water mark) in /proc/<pid>/status. VmHWM captures the scan's
+# transient peak even after the daemon trims its heap, so it is the peak-memory
+# figure; VmRSS is the steady-state cost.
+read_mem_kb() {
+  awk -v f="$2:" '$1 == f {print $2}' "/proc/$1/status" 2>/dev/null
+}
+
+# Resolve the daemon PID bound to a socket by matching the socket path in each
+# process's command line (the daemon is started with --socket <path>).
+find_daemon_pid() {
+  local sock="$1" pid
+  for pid in /proc/[0-9]*; do
+    pid="${pid#/proc/}"
+    [[ -r "/proc/$pid/cmdline" ]] || continue
+    if tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -qF -- "$sock"; then
+      printf '%s\n' "$pid"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Record the current and peak RSS of a daemon PID under a result key. When the
+# entry count is known, also report the per-record memory cost: the end-to-end
+# RSS per record, and — when the daemon exposes its index accounting (the live
+# daemon, via D-Bus status) — the index's own bytes per record, i.e. how
+# memory-efficient the in-memory cache is.
+record_memory() {
+  local key="$1" pid="$2" title="${3:-daemon}" entries="${4:-}" index_bytes="${5:-}"
+  [[ "$do_memory" == 1 && -n "$pid" ]] || return 0
+  local rss hwm
+  rss="$(read_mem_kb "$pid" VmRSS)"
+  hwm="$(read_mem_kb "$pid" VmHWM)"
+  [[ -n "$rss" ]] || return 0
+  hwm="${hwm:-$rss}"
+  local msg="memory ($title): rss=$((rss / 1024)) MiB  peak=$((hwm / 1024)) MiB"
+  local jobj="{\"rss_kb\": $rss, \"peak_rss_kb\": $hwm"
+  if [[ -n "$entries" && "$entries" -gt 0 ]]; then
+    local rss_bpr peak_bpr
+    rss_bpr="$(awk -v r="$rss" -v n="$entries" 'BEGIN { printf "%.1f", r * 1024 / n }')"
+    peak_bpr="$(awk -v r="$hwm" -v n="$entries" 'BEGIN { printf "%.1f", r * 1024 / n }')"
+    msg+="  rss/record=${rss_bpr}B peak/record=${peak_bpr}B (n=$entries)"
+    jobj+=", \"entries\": $entries, \"rss_bytes_per_record\": $rss_bpr, \"peak_rss_bytes_per_record\": $peak_bpr"
+  fi
+  if [[ -n "$index_bytes" && "$index_bytes" -gt 0 && -n "$entries" && "$entries" -gt 0 ]]; then
+    local idx_bpr
+    idx_bpr="$(awk -v b="$index_bytes" -v n="$entries" 'BEGIN { printf "%.1f", b / n }')"
+    msg+="  index/record=${idx_bpr}B"
+    jobj+=", \"index_bytes\": $index_bytes, \"index_bytes_per_record\": $idx_bpr"
+  fi
+  jobj+="}"
+  say "$msg"
+  if [[ "$json" == 1 ]]; then
+    add_result "$key" "$jobj"
+  fi
+}
 
 # ---- locate the binaries ---------------------------------------------------
 daemon_bin=""
@@ -408,8 +471,11 @@ fi
 if [[ "$run_live" == "yes" ]]; then
   section "live daemon ($live_socket)"
   live_entries=""
+  live_index_bytes=""
   if [[ -n "$cli_bin" ]]; then
-    live_entries="$("$cli_bin" status 2>/dev/null | sed -n 's/^entries: //p' || true)"
+    live_status="$("$cli_bin" status 2>/dev/null || true)"
+    live_entries="$(sed -n 's/^entries: //p' <<<"$live_status")"
+    live_index_bytes="$(sed -n 's/^memory_bytes: //p' <<<"$live_status")"
   fi
   if [[ -n "$live_entries" ]]; then
     say "index entries: $live_entries"
@@ -422,6 +488,15 @@ if [[ "$run_live" == "yes" ]]; then
   for q in "a" "config" "zzz-no-such-file-zzzz"; do
     measure_latency "live \"$q\"" "$q" "$live_socket" "$live_queries"
   done
+  if [[ "$do_memory" == 1 ]]; then
+    live_pid="$(find_daemon_pid "$live_socket" || true)"
+    if [[ -n "$live_pid" ]]; then
+      say "daemon pid: $live_pid"
+      record_memory "memory:live" "$live_pid" "live" "$live_entries" "$live_index_bytes"
+    else
+      say "memory: could not resolve the live daemon pid for $live_socket"
+    fi
+  fi
 fi
 
 # ---- hermetic daemon -------------------------------------------------------
@@ -509,6 +584,7 @@ PY
         python3 "$py" report --samples "$tmp/samples.txt" --windows "$tmp/windows.txt" >&2
       fi
     fi
+    record_memory "memory:hermetic" "$daemon_pid" "hermetic" "$entries"
     stop_daemon
   else
     say "error: the hermetic daemon did not start; see $log" >&2
@@ -521,6 +597,10 @@ PY
       burst_files=$((files / 5))
       [[ "$burst_files" -lt 1000 ]] && burst_files=1000
       burst_duration=$duration
+      # The index holds the cold-scan entries plus the burst files once the
+      # watcher has applied them, so the per-record figure uses that total.
+      burst_entries="$(sed -n 's/.*entries=\([0-9]*\).*/\1/p' <<<"$(grep -m1 'indexed entries=' "$log" || true)")"
+      [[ -n "$burst_entries" ]] && burst_entries=$((burst_entries + burst_files))
       say "search latency during live index updates (inotify burst of $burst_files files), ${burst_duration}s:"
       python3 "$py" record --socket "$sock" --query "file-0001234" \
         --duration "$burst_duration" --out "$tmp/burst-samples.txt" &
@@ -550,6 +630,7 @@ PY
       else
         python3 "$py" report --samples "$tmp/burst-samples.txt" --windows "$tmp/burst-windows.txt" >&2
       fi
+      record_memory "memory:hermetic_live_update" "$daemon_pid" "hermetic live-update" "$burst_entries"
       stop_daemon
     else
       say "error: the hermetic daemon did not start for the live-update run" >&2
