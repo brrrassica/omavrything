@@ -4,6 +4,24 @@ Notable changes to `omavrything`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`scripts/benchmark.sh` — an end-to-end search and indexing benchmark.** It
+  drives a real daemon over the Unix socket and reports wall-clock latency
+  distributions (p50/p95/p99/max) for selective, broad, and no-match queries,
+  the cold-scan indexing throughput, and search latency *while the index is
+  being rebuilt* (a rescan) and *while it is being updated live* (an inotify
+  burst). It also benchmarks the live installed daemon when one is reachable,
+  and can optionally run the Criterion micro-benchmark and the standalone
+  profiler example. The script ships in the release archive under `scripts/`
+  and in the AUR package under `/usr/share/omavrything/scripts/`; the archive
+  checks in `scripts/ci-smoke.sh` and `scripts/test-install-uninstall.sh` guard
+  its presence. The default run is a fast (~10 s) profile; `--full`/`--all` run
+  the larger, more comprehensive sizes. The 0.1.6 baseline numbers are recorded
+  in [`docs/benchmarks.md`](docs/benchmarks.md).
+
 ## [0.1.6] — 2026-10-12
 
 A diagnostics-and-hardening release. It adds read-only NTFS mount and volume

@@ -79,6 +79,7 @@ install -m755 scripts/uninstall.sh "$stage/scripts/uninstall.sh"
 install -m755 scripts/run-daemon.sh "$stage/scripts/run-daemon.sh"
 install -m755 scripts/restart-all.sh "$stage/scripts/restart-all.sh"
 install -m755 scripts/doctor.sh "$stage/scripts/doctor.sh"
+install -m755 scripts/benchmark.sh "$stage/scripts/benchmark.sh"
 
 # Documentation and license.
 install -m644 README.md "$stage/README.md"

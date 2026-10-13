@@ -174,7 +174,7 @@ fi
 if compgen -G 'dist/omavrything-*.zip' >/dev/null; then
   archive="$(ls dist/omavrything-*.zip | head -1)"
   archive_listing="$(unzip -l "$archive" 2>/dev/null || true)"
-  for entry in bin/omavry bin/omavrythingd manifest.json INSTALL.txt; do
+  for entry in bin/omavry bin/omavrythingd manifest.json INSTALL.txt scripts/benchmark.sh; do
     if grep -q "$entry" <<<"$archive_listing"; then
       ok "release archive contains $entry"
     else

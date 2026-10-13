@@ -99,6 +99,10 @@ package() {
     shell/omavrything/Service.qml \
     "$pkgdir/usr/share/omavrything/shell/omavrything/"
 
+  # Benchmark script (the same one the release archive ships under scripts/).
+  install -Dm755 scripts/benchmark.sh \
+    "$pkgdir/usr/share/omavrything/scripts/benchmark.sh"
+
   # License and documentation.
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -d "$pkgdir/usr/share/doc/$pkgname"

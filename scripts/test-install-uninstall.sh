@@ -150,7 +150,7 @@ if [[ -x bin/omavrythingd && -x bin/omavry ]]; then
     # Capture the listing first: `unzip -l | grep -q` would SIGPIPE unzip when
     # grep exits on the first match, which `set -o pipefail` turns into a failure.
     listing="$(unzip -l "$archive" 2>/dev/null || true)"
-    for entry in scripts/install.sh scripts/uninstall.sh data/man/omavrythingd.8 scripts/doctor.sh; do
+    for entry in scripts/install.sh scripts/uninstall.sh data/man/omavrythingd.8 scripts/doctor.sh scripts/benchmark.sh; do
       if [[ -n "$listing" ]] && grep -qF "$entry" <<<"$listing"; then
         ok "the release archive contains $entry"
       else
