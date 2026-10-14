@@ -80,6 +80,66 @@ Two measurements cover "search while the index is being updated":
   measurement reports zero windows. It runs in an idle session or in CI; use
   `--rescan` (or `--full`) to include it.
 
+## 0.2.0 baseline — 2026-10-14
+
+**Environment:** 16 logical cores, Linux 7.2, release build. The live daemon is
+the 0.2.0-rc1 build on the real index (**735,133 entries, 8 roots**). This is the
+first baseline with the M23 candidate-narrowing index (F1–F4) and the F12
+stop-list.
+
+### Live daemon (735 k entries)
+
+| Query | p50 | p95 | p99 | max |
+| --- | --- | --- | --- | --- |
+| `a` (broad, ~735 k matches) | 82.5 ms | 85.6 ms | 95.7 ms | 95.7 ms |
+| `config` (selective) | 2.2 ms | 3.6 ms | 51.1 ms | 51.1 ms |
+| `zzz-no-such-file-zzzz` (no match) | 0.02 ms | 0.025 ms | 0.031 ms | 0.031 ms |
+
+Selective and no-match queries are 1–2 orders of magnitude faster than the 0.1.7
+baseline (113.4 ms and 116.2 ms p50). The broad 1-character query is a full scan
+by design: a term shorter than three bytes cannot be narrowed by the trigram
+index.
+
+### Memory
+
+| Mode | Entries | RSS | Peak RSS | RSS/record | Index/record |
+| --- | --- | --- | --- | --- | --- |
+| Live daemon | 735,133 | 469 MiB | 514 MiB | 670.3 B | 500.8 B |
+
+The index cost rose from 57.5 B/record (0.1.7) to 500.8 B/record because of the
+candidate index. Its per-component breakdown (F11) is reported by
+`omavry status` and `scripts/benchmark.sh`:
+
+| Component | Bytes | B/record |
+| --- | --- | --- |
+| Trigram postings | ~147 MB | ~200 |
+| Lowercased path arena | ~44 MB | ~60 |
+| Token table | ~44 MB | ~60 |
+| Posting map overhead | ~9 MB | ~12 |
+| Per-record offsets | ~4 MB | ~6 |
+
+These figures predate the F12 stop-list, which drops the posting lists of the most
+frequent trigrams and so bounds the postings (the dominant component). The F10
+config key (planned) can cap or disable the index on very large indexes.
+
+### Hermetic daemon (synthetic tree, 52,000 entries)
+
+| Metric | 0.2.0-rc1 | 0.1.6 baseline |
+| --- | --- | --- |
+| Cold scan | 205 ms (253,658 entries/s) | 72 ms (722 k entries/s) |
+| Selective `file-0001234` p50 | 0.07 ms | 3.07 ms |
+| Broad `dir0001` p50 | 0.111 ms | 3.17 ms |
+| No-match `zzz…` p50 | 0.019 ms | 2.96 ms |
+
+### Performance budgets (F9)
+
+`scripts/benchmark.sh --budgets` checks the hermetic p50/p95 and the cold-scan
+throughput against per-size budgets and exits non-zero on a regression. The
+budgets scale with the entry count (`p50 <= 2 ms + entries * per_record`, with
+`per_record` 0.05 µs for selective/no-match and 0.1 µs for broad; the p95 budget
+is 2x the p50 one) and the cold scan must stay above 50,000 entries/s. CI runs
+`scripts/benchmark.sh --quick --hermetic --budgets` in the `bench` job.
+
 ## Interpreting the numbers
 
 - **Cold scan** is the indexing throughput: entries walked and inserted per

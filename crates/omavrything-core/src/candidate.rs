@@ -34,7 +34,7 @@
 //! reclaims the stale entries.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::query::{Query, Term};
 
@@ -70,10 +70,44 @@ pub struct CandidateIndex {
     tokens: Vec<TokenEntry>,
     /// Unsorted token additions, merged into `tokens` once they grow.
     pending: Vec<TokenEntry>,
+    /// Stop-listed trigrams (F12): too common to be worth a posting list, so
+    /// their list is dropped and they contribute no constraint. A query term
+    /// whose trigrams are all stop-listed cannot narrow the scan.
+    stop: HashSet<u32>,
+}
+
+/// A per-component breakdown of the candidate index's heap memory, for
+/// diagnostics (F11).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CandidateMemory {
+    /// Lowercased path arena bytes used.
+    pub lower: u64,
+    /// Per-record offset array bytes.
+    pub off: u64,
+    /// Per-record length array bytes.
+    pub len: u64,
+    /// Trigram posting-list bytes (record indices).
+    pub postings: u64,
+    /// Trigram map overhead (keys, `Vec` headers, control bytes).
+    pub map: u64,
+    /// Token table bytes (sorted plus pending).
+    pub tokens: u64,
+    /// Stop-list set bytes.
+    pub stop: u64,
 }
 
 /// The number of pending tokens below which a merge is not worth it.
 const PENDING_MIN: usize = 4096;
+
+/// A trigram whose posting list covers more than `1 / STOP_LIST_DIVISOR` of the
+/// records is stop-listed (F12): its list is dropped and it contributes no
+/// constraint, so the candidate set stays a superset. This bounds the postings,
+/// which dominate the candidate index's memory.
+const STOP_LIST_DIVISOR: usize = 20;
+
+/// Stop-listing is only applied once the index is at least this large, so a
+/// small index keeps every posting list.
+const STOP_LIST_MIN_RECORDS: usize = 1000;
 
 impl CandidateIndex {
     pub fn new() -> Self {
@@ -119,6 +153,11 @@ impl CandidateIndex {
             }
             for w in comp.windows(3) {
                 let tg = pack_trigram(w[0], w[1], w[2]);
+                // A stop-listed trigram has no posting list; skip it so a live
+                // insert does not rebuild a list the bulk build dropped (F12).
+                if self.stop.contains(&tg) {
+                    continue;
+                }
                 let list = self.ngrams.entry(tg).or_default();
                 if append {
                     // `idx` is the largest so far, so a push keeps the list
@@ -193,9 +232,39 @@ impl CandidateIndex {
         self.pending.clear();
     }
 
-    /// Finalize a bulk build: merge any pending tokens into the sorted table.
+    /// Finalize a bulk build: merge any pending tokens into the sorted table and
+    /// compute the stop-list (F12).
     pub fn finish_bulk(&mut self) {
         self.merge_pending();
+        self.compute_stop_list();
+    }
+
+    /// Drop the posting lists of the most frequent trigrams (F12). A dropped
+    /// trigram contributes no constraint, so the candidate set stays a superset
+    /// and results are unchanged; the matcher still verifies every candidate.
+    ///
+    /// Idempotent: once a stop-list has been computed it is not recomputed, so a
+    /// later `finish_bulk` (e.g. from `shrink`) cannot clear it and turn the
+    /// dropped trigrams into false "absent" lookups.
+    fn compute_stop_list(&mut self) {
+        if !self.stop.is_empty() {
+            return;
+        }
+        let records = self.off.len();
+        if records < STOP_LIST_MIN_RECORDS {
+            return;
+        }
+        let threshold = records / STOP_LIST_DIVISOR;
+        let mut stop = HashSet::new();
+        self.ngrams.retain(|&tg, list| {
+            if list.len() > threshold {
+                stop.insert(tg);
+                false
+            } else {
+                true
+            }
+        });
+        self.stop = stop;
     }
 
     /// The ASCII-lowercased full path of a record, or an empty slice when the
@@ -249,12 +318,22 @@ impl CandidateIndex {
         let mut lists: Vec<&[u32]> = Vec::with_capacity(needle.len() - 2);
         for w in needle.windows(3) {
             let tg = pack_trigram(w[0], w[1], w[2]);
+            // A stop-listed trigram is too common to constrain the scan; skip it
+            // (F12). The remaining trigrams still yield a superset.
+            if self.stop.contains(&tg) {
+                continue;
+            }
             match self.ngrams.get(&tg) {
                 Some(list) => lists.push(list),
                 // A missing trigram means no record contains it, so no record
                 // contains the term.
                 None => return Some(Vec::new()),
             }
+        }
+
+        // Every trigram was stop-listed: the term cannot narrow the scan.
+        if lists.is_empty() {
+            return None;
         }
 
         // Intersect smallest-first to keep the working set small.
@@ -301,17 +380,34 @@ impl CandidateIndex {
         &self.lower[t.off as usize..t.off as usize + t.len as usize]
     }
 
-    /// An estimate of the heap bytes held by the candidate index.
-    pub fn memory_bytes(&self) -> u64 {
-        let lower = self.lower.len();
-        let off = self.off.len() * std::mem::size_of::<u32>();
-        let len = self.len.len() * std::mem::size_of::<u16>();
-        let postings: usize = self.ngrams.values().map(|v| v.len() * 4).sum();
+    /// A per-component breakdown of the candidate index's heap memory (F11).
+    pub fn memory_breakdown(&self) -> CandidateMemory {
+        let lower = self.lower.len() as u64;
+        let off = (self.off.len() * std::mem::size_of::<u32>()) as u64;
+        let len = (self.len.len() * std::mem::size_of::<u16>()) as u64;
+        let postings: u64 = self.ngrams.values().map(|v| (v.len() * 4) as u64).sum();
         // A rough per-entry cost for the hash map: key (4) + Vec header (24) +
         // one control byte.
-        let map = self.ngrams.len() * (4 + 24 + 1);
-        let tokens = (self.tokens.len() + self.pending.len()) * std::mem::size_of::<TokenEntry>();
-        (lower + off + len + postings + map + tokens) as u64
+        let map = (self.ngrams.len() * (4 + 24 + 1)) as u64;
+        let tokens =
+            ((self.tokens.len() + self.pending.len()) * std::mem::size_of::<TokenEntry>()) as u64;
+        // A stop-list entry is a `u32` key plus a control byte.
+        let stop = (self.stop.len() * (4 + 1)) as u64;
+        CandidateMemory {
+            lower,
+            off,
+            len,
+            postings,
+            map,
+            tokens,
+            stop,
+        }
+    }
+
+    /// An estimate of the heap bytes held by the candidate index.
+    pub fn memory_bytes(&self) -> u64 {
+        let b = self.memory_breakdown();
+        b.lower + b.off + b.len + b.postings + b.map + b.tokens + b.stop
     }
 
     /// Release excess capacity in the arenas, posting lists, and token table.
@@ -325,6 +421,7 @@ impl CandidateIndex {
             list.shrink_to_fit();
         }
         self.ngrams.shrink_to_fit();
+        self.stop.shrink_to_fit();
     }
 }
 
@@ -478,5 +575,57 @@ mod tests {
                 "candidates differ for {q:?}"
             );
         }
+    }
+
+    #[test]
+    fn stop_list_drops_frequent_trigrams_but_keeps_results() {
+        // F12: a trigram present in most records is stop-listed, and a query
+        // made only of stop-listed trigrams still returns every match (the scan
+        // falls back to every record for that term).
+        let mut c = CandidateIndex::new();
+        let n = STOP_LIST_MIN_RECORDS * 2;
+        for i in 0..n {
+            let p = format!("/data/common-{i:06}.txt");
+            c.insert_append(i as u32, p.as_bytes());
+        }
+        c.finish_bulk();
+        // "common" appears in every path, so its trigrams are stop-listed.
+        assert!(!c.stop.is_empty(), "expected a non-empty stop-list");
+        // A term made only of stop-listed trigrams cannot narrow.
+        assert!(c.candidates(&Query::parse("common")).is_none());
+        // A selective term still narrows to a superset that contains the match.
+        let cands = c.candidates(&Query::parse("common-000123")).unwrap();
+        assert!(cands.contains(&123));
+        assert!(cands.len() < n, "selective term must narrow");
+    }
+
+    #[test]
+    fn stop_list_is_idempotent_across_finish_bulk() {
+        // A second `finish_bulk` (as `Index::shrink` performs) must not clear the
+        // stop-list, which would turn dropped trigrams into false "absent"
+        // lookups and lose matches.
+        let mut c = CandidateIndex::new();
+        let n = STOP_LIST_MIN_RECORDS * 2;
+        for i in 0..n {
+            let p = format!("/data/common-{i:06}.txt");
+            c.insert_append(i as u32, p.as_bytes());
+        }
+        c.finish_bulk();
+        let stop_before = c.stop.clone();
+        c.finish_bulk();
+        assert_eq!(c.stop, stop_before);
+        assert!(c.candidates(&Query::parse("common")).is_none());
+    }
+
+    #[test]
+    fn memory_breakdown_sums_to_memory_bytes() {
+        // F11: the per-component breakdown must account for every byte the
+        // single-number estimate reports.
+        let c = build(&["/home/sam/report.pdf", "/etc/config.toml"]);
+        let b = c.memory_breakdown();
+        assert_eq!(
+            b.lower + b.off + b.len + b.postings + b.map + b.tokens + b.stop,
+            c.memory_bytes()
+        );
     }
 }

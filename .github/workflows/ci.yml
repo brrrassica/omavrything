@@ -108,6 +108,29 @@ jobs:
       - name: Run the install/uninstall smoke test
         run: scripts/ci-smoke.sh
 
+  bench:
+    name: performance budgets (Arch)
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    needs: build
+    steps:
+      - name: Install dependencies
+        run: pacman -Syu --noconfirm --needed --overwrite '*' git curl python
+
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build the daemon and CLI (release)
+        run: cargo build --release -p omavrythingd -p omavrything-cli
+
+      - name: Run the performance budgets
+        run: scripts/benchmark.sh --quick --hermetic --budgets
+
   package:
     name: package release archive (Arch)
     runs-on: ubuntu-latest

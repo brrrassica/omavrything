@@ -79,6 +79,17 @@ impl Manager {
         map.insert("map_len".into(), b.map_len.to_string());
         map.insert("map_cap_bytes".into(), b.map_cap_bytes.to_string());
         map.insert("candidate_bytes".into(), b.candidate_bytes.to_string());
+        // Per-component candidate-index breakdown (F11).
+        map.insert("candidate_lower".into(), b.candidate.lower.to_string());
+        map.insert("candidate_off".into(), b.candidate.off.to_string());
+        map.insert("candidate_len".into(), b.candidate.len.to_string());
+        map.insert(
+            "candidate_postings".into(),
+            b.candidate.postings.to_string(),
+        );
+        map.insert("candidate_map".into(), b.candidate.map.to_string());
+        map.insert("candidate_tokens".into(), b.candidate.tokens.to_string());
+        map.insert("candidate_stop".into(), b.candidate.stop.to_string());
         map.insert("scanning".into(), self.config.scanning().to_string());
         map.insert(
             "uptime_secs".into(),

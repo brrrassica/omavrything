@@ -21,7 +21,7 @@
 use std::path::Path;
 use std::time::Instant;
 
-use omavrything_core::index::{FsKind, Index};
+use omavrything_core::index::{FileRecord, FsKind, Index};
 
 /// Build a synthetic index of `n` files spread across 1000 directories, plus a
 /// directory record for each distinct directory (so the tree is realistic).
@@ -70,6 +70,83 @@ fn profile_query(index: &Index, query: &str, limit: usize) {
     );
 }
 
+/// Print the index's per-component memory breakdown, including the candidate
+/// index's components (F11). The final `MEMORY ...` line is machine-readable for
+/// the benchmark's budget check.
+fn report_memory(index: &Index, requested: usize) {
+    let b = index.memory_breakdown();
+    let c = b.candidate;
+    let live = index.len().max(1) as f64;
+    let records_bytes = (b.records_len * std::mem::size_of::<FileRecord>()) as u64;
+    let index_bytes = index.memory_bytes();
+    let per = |bytes: u64| bytes as f64 / live;
+    println!(
+        "memory breakdown ({} live records, requested {requested}):",
+        index.len()
+    );
+    println!(
+        "  {:<10} {:>12} B  {:>7.1} B/record",
+        "records",
+        records_bytes,
+        per(records_bytes)
+    );
+    println!(
+        "  {:<10} {:>12} B  {:>7.1} B/record",
+        "paths",
+        b.paths_len,
+        per(b.paths_len as u64)
+    );
+    println!(
+        "  {:<10} {:>12} B  {:>7.1} B/record",
+        "map",
+        b.map_cap_bytes,
+        per(b.map_cap_bytes as u64)
+    );
+    println!(
+        "  {:<10} {:>12} B  {:>7.1} B/record",
+        "candidate",
+        b.candidate_bytes,
+        per(b.candidate_bytes)
+    );
+    for (name, bytes) in [
+        ("lower", c.lower),
+        ("off", c.off),
+        ("len", c.len),
+        ("postings", c.postings),
+        ("map", c.map),
+        ("tokens", c.tokens),
+        ("stop", c.stop),
+    ] {
+        println!(
+            "    {:<8} {:>12} B  {:>7.1} B/record",
+            name,
+            bytes,
+            per(bytes)
+        );
+    }
+    println!(
+        "  {:<10} {:>12} B  {:>7.1} B/record",
+        "total",
+        index_bytes,
+        per(index_bytes)
+    );
+    println!(
+        "MEMORY index_bytes={index_bytes} index_bytes_per_record={:.1} \
+         candidate_bytes={} candidate_bytes_per_record={:.1} \
+         lower={} off={} len={} postings={} map={} tokens={} stop={}",
+        per(index_bytes),
+        b.candidate_bytes,
+        per(b.candidate_bytes),
+        c.lower,
+        c.off,
+        c.len,
+        c.postings,
+        c.map,
+        c.tokens,
+        c.stop,
+    );
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let n: usize = args
@@ -94,10 +171,11 @@ fn main() {
         build_started.elapsed().as_secs_f64()
     );
 
-    match query {
+    match query.as_deref() {
+        Some("memory") => report_memory(&index, n),
         Some(q) => {
             println!("query {q:?} (limit 100):");
-            profile_query(&index, &q, 100);
+            profile_query(&index, q, 100);
         }
         None => {
             // Simulate typing a query one character at a time, which is exactly

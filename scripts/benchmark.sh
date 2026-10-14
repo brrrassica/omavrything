@@ -33,6 +33,8 @@
 #   --socket PATH       Use a specific socket for the live daemon
 #   --json              Emit a single machine-readable JSON object on stdout
 #   --keep              Keep the temporary tree and logs
+#   --budgets           Check the hermetic p50/p95 and cold-scan throughput
+#                       against per-size budgets; exit non-zero on regression
 #   -h, --help          Show this help
 #
 # The default runs the hermetic benchmark and, if a daemon is reachable, the
@@ -56,6 +58,7 @@ do_criterion=0
 do_profile=0
 json=0
 keep=0
+do_budgets=0
 files=5000
 queries=30
 duration=4
@@ -85,6 +88,7 @@ while [[ $# -gt 0 ]]; do
     --socket) socket_override="$2"; shift ;;
     --json) json=1 ;;
     --keep) keep=1 ;;
+    --budgets) do_budgets=1 ;;
     -h | --help) usage; exit 0 ;;
     *)
       echo "error: unknown option: $1" >&2
@@ -180,21 +184,95 @@ record_memory() {
   fi
   jobj+="}"
   say "$msg"
-  if [[ "$json" == 1 ]]; then
-    add_result "$key" "$jobj"
-  fi
+  add_result "$key" "$jobj"
+}
+
+# ---- performance budgets (F9) ----------------------------------------------
+# Compare the hermetic p50/p95 and cold-scan throughput against per-size budgets.
+# The budgets scale with the entry count and are deliberately generous so a slow
+# shared CI runner does not flake, while still catching an order-of-magnitude
+# regression. Exit non-zero on any violation.
+check_budgets() {
+  python3 - "$results" <<'PY'
+import json
+import sys
+
+results_path = sys.argv[1]
+data = {}
+with open(results_path) as f:
+    for line in f:
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        key, _, val = line.partition("\t")
+        try:
+            data[key] = json.loads(val)
+        except Exception:
+            data[key] = val
+
+idx = data.get("indexing")
+entries = idx.get("entries") if isinstance(idx, dict) else None
+if not entries:
+    print("budgets: no hermetic entry count recorded; skipping")
+    sys.exit(0)
+
+
+def find(prefix):
+    for k, v in data.items():
+        if k.startswith(prefix) and isinstance(v, dict):
+            return v
+    return None
+
+
+# p50 budget in ms = base + entries * per_record; the p95 budget is 2x the p50.
+BASE = {"selective": 2.0, "broad": 2.0, "no-match": 2.0}
+PER = {"selective": 0.00005, "broad": 0.0001, "no-match": 0.00005}
+MIN_ENTRIES_PER_SEC = 50000
+
+failures = []
+for kind in ("selective", "broad", "no-match"):
+    s = find(f"latency:{kind}")
+    if not s:
+        continue
+    p50 = s["wall_ms"]["p50"]
+    p95 = s["wall_ms"]["p95"]
+    b50 = BASE[kind] + entries * PER[kind]
+    b95 = b50 * 2
+    ok = p50 <= b50 and p95 <= b95
+    print(
+        f"  budget {kind:9} p50={p50:8.3f}ms (<= {b50:7.2f})  "
+        f"p95={p95:8.3f}ms (<= {b95:7.2f})  {'ok' if ok else 'FAIL'}"
+    )
+    if not ok:
+        failures.append(kind)
+
+if isinstance(idx, dict):
+    eps = idx.get("entries_per_sec", 0)
+    ok = eps >= MIN_ENTRIES_PER_SEC
+    print(
+        f"  budget cold-scan {eps:,.0f} entries/s (>= {MIN_ENTRIES_PER_SEC:,})  "
+        f"{'ok' if ok else 'FAIL'}"
+    )
+    if not ok:
+        failures.append("cold-scan")
+
+if failures:
+    print(f"budget check FAILED: {', '.join(failures)}", file=sys.stderr)
+    sys.exit(1)
+print("budget check passed")
+PY
 }
 
 # ---- locate the binaries ---------------------------------------------------
 daemon_bin=""
-for cand in "$here/bin/omavrythingd" /usr/bin/omavrythingd; do
+for cand in "$here/bin/omavrythingd" "$here/target/release/omavrythingd" /usr/bin/omavrythingd; do
   if [[ -x "$cand" ]]; then
     daemon_bin="$cand"
     break
   fi
 done
 cli_bin=""
-for cand in "$here/bin/omavry" /usr/bin/omavry; do
+for cand in "$here/bin/omavry" "$here/target/release/omavry" /usr/bin/omavry; do
   if [[ -x "$cand" ]]; then
     cli_bin="$cand"
     break
@@ -219,6 +297,7 @@ import json
 import os
 import socket
 import statistics
+import sys
 import time
 
 
@@ -278,15 +357,17 @@ def summarize(wall_ms, took_ms):
 
 
 def emit_latency(title, s):
+    # Human-readable output goes to stderr so stdout stays clean for --json.
     if not s:
-        print(f"  {title}: no samples")
+        print(f"  {title}: no samples", file=sys.stderr)
         return
     w, t = s["wall_ms"], s["took_ms"]
     print(
         f"  {title}: n={s['count']}  "
         f"wall p50={w['p50']}ms p95={w['p95']}ms p99={w['p99']}ms "
         f"max={w['max']}ms mean={w['mean']}ms  |  "
-        f"daemon took_ms p50={t['p50']} p95={t['p95']} max={t['max']}"
+        f"daemon took_ms p50={t['p50']} p95={t['p95']} max={t['max']}",
+        file=sys.stderr,
     )
 
 
@@ -304,8 +385,8 @@ def cmd_latency(a):
     s = summarize(wall, took)
     if a.json:
         print(json.dumps(s))
-    else:
-        emit_latency(a.title or a.query, s)
+    if a.title:
+        emit_latency(a.title, s)
 
 
 def cmd_record(a):
@@ -371,17 +452,20 @@ def cmd_report(a):
     }
     if a.json:
         print(json.dumps(result))
-    else:
-        print(f"  windows observed: {result['windows']}  samples: {result['total']}")
-        if result["windows"] == 0:
-            print(
-                "  note: no indexing window was observed. The periodic rescan is "
-                "idle-gated (load, CPU idle, and the login1 idle hint), so an "
-                "active desktop session vetoes it; it runs in an idle session or "
-                "in CI. The live-update burst is not gated."
-            )
-        emit_latency("idle  ", result["idle"])
-        emit_latency("during", result["during"])
+    print(
+        f"  windows observed: {result['windows']}  samples: {result['total']}",
+        file=sys.stderr,
+    )
+    if result["windows"] == 0:
+        print(
+            "  note: no indexing window was observed. The periodic rescan is "
+            "idle-gated (load, CPU idle, and the login1 idle hint), so an "
+            "active desktop session vetoes it; it runs in an idle session or "
+            "in CI. The live-update burst is not gated.",
+            file=sys.stderr,
+        )
+    emit_latency("idle  ", result["idle"])
+    emit_latency("during", result["during"])
 
 
 def main():
@@ -430,9 +514,7 @@ say "version: $version"
 say "cpu:     $cpus cores"
 say "daemon:  $daemon_bin"
 say "cli:     ${cli_bin:-not found}"
-if [[ "$json" == 1 ]]; then
-  add_result "environment" "$(python3 -c 'import json,sys; print(json.dumps({"version": sys.argv[1], "cpus": sys.argv[2], "daemon": sys.argv[3]}))' "$version" "$cpus" "$daemon_bin")"
-fi
+add_result "environment" "$(python3 -c 'import json,sys; print(json.dumps({"version": sys.argv[1], "cpus": sys.argv[2], "daemon": sys.argv[3]}))' "$version" "$cpus" "$daemon_bin")"
 
 # ---- latency measurement helper -------------------------------------------
 measure_latency() {
@@ -441,13 +523,11 @@ measure_latency() {
   # index costs hundreds of milliseconds, so a fixed 20-query warmup would
   # dominate the run.
   local warmup=$((count < 20 ? count : 20))
-  if [[ "$json" == 1 ]]; then
-    local out
-    out="$(python3 "$py" latency --socket "$sock" --query "$query" --count "$count" --warmup "$warmup" --json)"
-    add_result "latency:$title" "$out"
-  else
-    python3 "$py" latency --socket "$sock" --query "$query" --count "$count" --warmup "$warmup" --title "$title" >&2
-  fi
+  # Always measure once and record the JSON result (the budget check reads it);
+  # the human-readable line is written to stderr by the Python helper.
+  local out
+  out="$(python3 "$py" latency --socket "$sock" --query "$query" --count "$count" --warmup "$warmup" --json --title "$title")"
+  add_result "latency:$title" "$out"
 }
 
 # ---- live daemon -----------------------------------------------------------
@@ -472,16 +552,30 @@ if [[ "$run_live" == "yes" ]]; then
   section "live daemon ($live_socket)"
   live_entries=""
   live_index_bytes=""
+  live_candidate=""
+  live_candidate_postings=""
+  live_candidate_lower=""
+  live_candidate_tokens=""
+  live_candidate_map=""
+  live_candidate_off=""
+  live_candidate_len=""
+  live_candidate_stop=""
   if [[ -n "$cli_bin" ]]; then
     live_status="$("$cli_bin" status 2>/dev/null || true)"
     live_entries="$(sed -n 's/^entries: //p' <<<"$live_status")"
     live_index_bytes="$(sed -n 's/^memory_bytes: //p' <<<"$live_status")"
+    live_candidate="$(sed -n 's/^candidate_bytes: //p' <<<"$live_status")"
+    live_candidate_postings="$(sed -n 's/^candidate_postings: //p' <<<"$live_status")"
+    live_candidate_lower="$(sed -n 's/^candidate_lower: //p' <<<"$live_status")"
+    live_candidate_tokens="$(sed -n 's/^candidate_tokens: //p' <<<"$live_status")"
+    live_candidate_map="$(sed -n 's/^candidate_map: //p' <<<"$live_status")"
+    live_candidate_off="$(sed -n 's/^candidate_off: //p' <<<"$live_status")"
+    live_candidate_len="$(sed -n 's/^candidate_len: //p' <<<"$live_status")"
+    live_candidate_stop="$(sed -n 's/^candidate_stop: //p' <<<"$live_status")"
   fi
   if [[ -n "$live_entries" ]]; then
     say "index entries: $live_entries"
-    if [[ "$json" == 1 ]]; then
-      add_result "live" "$(python3 -c 'import json,sys; print(json.dumps({"socket": sys.argv[1], "entries": int(sys.argv[2])}))' "$live_socket" "$live_entries")"
-    fi
+    add_result "live" "$(python3 -c 'import json,sys; print(json.dumps({"socket": sys.argv[1], "entries": int(sys.argv[2])}))' "$live_socket" "$live_entries")"
   fi
   # The live index is large (millions of entries) and a broad query scans all of
   # it, so the live phase uses a smaller sample count than the hermetic one.
@@ -496,6 +590,13 @@ if [[ "$run_live" == "yes" ]]; then
     else
       say "memory: could not resolve the live daemon pid for $live_socket"
     fi
+  fi
+  # Per-component candidate-index breakdown (F11), from the daemon's own
+  # accounting. This is the memory the n-gram index costs, split by component.
+  if [[ -n "$live_candidate" && "$live_candidate" -gt 0 && -n "$live_entries" && "$live_entries" -gt 0 ]]; then
+    cand_bpr="$(awk -v b="$live_candidate" -v n="$live_entries" 'BEGIN { printf "%.1f", b / n }')"
+    say "candidate index: ${live_candidate} B (${cand_bpr} B/record)  postings=${live_candidate_postings} lower=${live_candidate_lower} tokens=${live_candidate_tokens} map=${live_candidate_map} off=${live_candidate_off} len=${live_candidate_len} stop=${live_candidate_stop}"
+    add_result "candidate:live" "$(python3 -c 'import json,sys; print(json.dumps({"bytes": int(sys.argv[1]), "bytes_per_record": float(sys.argv[2]), "postings": int(sys.argv[3]), "lower": int(sys.argv[4]), "tokens": int(sys.argv[5]), "map": int(sys.argv[6]), "off": int(sys.argv[7]), "len": int(sys.argv[8]), "stop": int(sys.argv[9])}))' "$live_candidate" "$cand_bpr" "$live_candidate_postings" "$live_candidate_lower" "$live_candidate_tokens" "$live_candidate_map" "$live_candidate_off" "$live_candidate_len" "$live_candidate_stop")"
   fi
 fi
 
@@ -558,9 +659,7 @@ PY
     if [[ -n "$entries" && -n "$elapsed" && "$elapsed" -gt 0 ]]; then
       eps="$(python3 -c "print(round($entries / ($elapsed / 1000.0), 1))")"
       say "cold scan: $entries entries in ${elapsed} ms ($eps entries/s)"
-      if [[ "$json" == 1 ]]; then
-        add_result "indexing" "{\"entries\": $entries, \"elapsed_ms\": $elapsed, \"entries_per_sec\": $eps}"
-      fi
+      add_result "indexing" "{\"entries\": $entries, \"elapsed_ms\": $elapsed, \"entries_per_sec\": $eps}"
     else
       say "cold scan: could not parse the scan line"
     fi
@@ -577,12 +676,8 @@ PY
         --log "$log" --windows-out "$tmp/windows.txt" &
       rec_pid=$!
       wait "$rec_pid" || true
-      if [[ "$json" == 1 ]]; then
-        out="$(python3 "$py" report --samples "$tmp/samples.txt" --windows "$tmp/windows.txt" --json)"
-        add_result "during_rescan" "$out"
-      else
-        python3 "$py" report --samples "$tmp/samples.txt" --windows "$tmp/windows.txt" >&2
-      fi
+      out="$(python3 "$py" report --samples "$tmp/samples.txt" --windows "$tmp/windows.txt" --json)"
+      add_result "during_rescan" "$out"
     fi
     record_memory "memory:hermetic" "$daemon_pid" "hermetic" "$entries"
     stop_daemon
@@ -624,18 +719,20 @@ PY
       burst_end="$(python3 -c 'import time; print(time.time() * 1e3 + 1000)')"
       printf '%s %s\n' "$burst_start" "$burst_end" > "$tmp/burst-windows.txt"
       wait "$rec_pid" || true
-      if [[ "$json" == 1 ]]; then
-        out="$(python3 "$py" report --samples "$tmp/burst-samples.txt" --windows "$tmp/burst-windows.txt" --json)"
-        add_result "during_live_update" "$out"
-      else
-        python3 "$py" report --samples "$tmp/burst-samples.txt" --windows "$tmp/burst-windows.txt" >&2
-      fi
+      out="$(python3 "$py" report --samples "$tmp/burst-samples.txt" --windows "$tmp/burst-windows.txt" --json)"
+      add_result "during_live_update" "$out"
       record_memory "memory:hermetic_live_update" "$daemon_pid" "hermetic live-update" "$burst_entries"
       stop_daemon
     else
       say "error: the hermetic daemon did not start for the live-update run" >&2
     fi
   fi
+fi
+
+# ---- performance budgets (F9) ----------------------------------------------
+if [[ "$do_budgets" == 1 ]]; then
+  section "performance budgets"
+  check_budgets
 fi
 
 # ---- optional: Criterion micro-benchmark ----------------------------------

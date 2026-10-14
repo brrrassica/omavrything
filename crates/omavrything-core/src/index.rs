@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 
-use crate::candidate::CandidateIndex;
+use crate::candidate::{CandidateIndex, CandidateMemory};
 use crate::query::{Query, Rank};
 
 /// Above this many records, the scan is parallelized with rayon. Below it, the
@@ -489,6 +489,8 @@ pub struct MemoryBreakdown {
     /// Candidate-index estimated bytes (trigram postings, lowercased arena, and
     /// token table).
     pub candidate_bytes: u64,
+    /// Per-component breakdown of the candidate index (F11).
+    pub candidate: CandidateMemory,
 }
 
 impl Index {
@@ -545,6 +547,7 @@ impl Index {
             map_len: self.by_path.len(),
             map_cap_bytes: self.by_path.capacity_bytes(),
             candidate_bytes: self.candidate.memory_bytes(),
+            candidate: self.candidate.memory_breakdown(),
         }
     }
 
