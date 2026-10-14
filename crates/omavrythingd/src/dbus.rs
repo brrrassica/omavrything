@@ -160,6 +160,15 @@ impl Manager {
             let policy = Arc::clone(&self.policy);
             std::thread::spawn(move || crate::run_ntfs_startup(index, policy));
         }
+        // F10: apply the candidate-index preference to the running index so the
+        // change takes effect without a restart (disabling reclaims its memory).
+        if key == "candidate_index" {
+            let enabled = self.config.candidate_index();
+            self.index
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_candidate_enabled(enabled);
+        }
         Ok(())
     }
 
@@ -396,6 +405,7 @@ mod tests {
             ntfs: true,
             log_level: crate::logging::LogLevel::Info,
             background_opacity: 0.75,
+            candidate_index: true,
             state: crate::config_file::FileConfig::default(),
             state_path: None,
         }));

@@ -24,6 +24,8 @@ pub struct ConfigInit {
     pub ntfs: bool,
     pub log_level: LogLevel,
     pub background_opacity: f64,
+    /// Whether the n-gram candidate index is built (F10).
+    pub candidate_index: bool,
     /// The persisted runtime overrides, updated on every `set`.
     pub state: FileConfig,
     /// Where to persist `state`; `None` disables persistence.
@@ -43,6 +45,8 @@ pub struct SharedConfig {
     log_level: RwLock<LogLevel>,
     /// `f64` bits, so the value can live in an atomic.
     background_opacity: AtomicU64,
+    /// Whether the n-gram candidate index is built (F10).
+    candidate_index: AtomicBool,
     state: RwLock<FileConfig>,
     state_path: Option<PathBuf>,
 }
@@ -59,6 +63,7 @@ impl SharedConfig {
             ntfs: AtomicBool::new(init.ntfs),
             log_level: RwLock::new(init.log_level),
             background_opacity: AtomicU64::new(init.background_opacity.to_bits()),
+            candidate_index: AtomicBool::new(init.candidate_index),
             state: RwLock::new(init.state),
             state_path: init.state_path,
         }
@@ -106,6 +111,11 @@ impl SharedConfig {
         f64::from_bits(self.background_opacity.load(Ordering::Relaxed))
     }
 
+    /// Whether the n-gram candidate index is built (F10).
+    pub fn candidate_index(&self) -> bool {
+        self.candidate_index.load(Ordering::Relaxed)
+    }
+
     /// Apply a configuration change and persist it. Returns an error for
     /// unknown keys or invalid values.
     pub fn set(&self, key: &str, value: &str) -> Result<(), String> {
@@ -148,6 +158,10 @@ impl SharedConfig {
                 }
                 self.background_opacity
                     .store(v.to_bits(), Ordering::Relaxed);
+            }
+            "candidate_index" => {
+                let v = parse_bool(value)?;
+                self.candidate_index.store(v, Ordering::Relaxed);
             }
             other => return Err(format!("unknown config key: {other}")),
         }
@@ -196,6 +210,7 @@ impl SharedConfig {
             "background_opacity".into(),
             self.background_opacity().to_string(),
         );
+        map.insert("candidate_index".into(), self.candidate_index().to_string());
         map
     }
 }
@@ -215,6 +230,7 @@ mod tests {
             ntfs: true,
             log_level: LogLevel::Info,
             background_opacity: 0.75,
+            candidate_index: true,
             state: FileConfig::default(),
             state_path: None,
         })
@@ -267,6 +283,7 @@ mod tests {
             ntfs: true,
             log_level: LogLevel::Info,
             background_opacity: 0.75,
+            candidate_index: true,
             state: FileConfig::default(),
             state_path: Some(path.clone()),
         });
@@ -295,6 +312,7 @@ mod tests {
             "ntfs",
             "log_level",
             "background_opacity",
+            "candidate_index",
         ] {
             assert!(map.contains_key(key), "missing {key}");
         }

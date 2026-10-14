@@ -68,6 +68,10 @@ pub struct FileConfig {
     /// serves but does not otherwise use.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub background_opacity: Option<f64>,
+    /// Build and consult the n-gram candidate index (F10). Disabling it bounds
+    /// memory on very large indexes at the cost of a linear scan per query.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_index: Option<bool>,
 }
 
 impl FileConfig {
@@ -166,6 +170,9 @@ impl FileConfig {
                 }
                 self.background_opacity = Some(opacity);
             }
+            "candidate_index" => {
+                self.candidate_index = Some(parse_bool(value)?);
+            }
             other => return Err(format!("unknown config key: {other}")),
         }
         Ok(())
@@ -246,6 +253,7 @@ ntfs = true
 metadata = true
 log_level = "debug"
 background_opacity = 0.6
+candidate_index = false
 "#,
         );
         let config = FileConfig::load(&path).unwrap();
@@ -253,6 +261,7 @@ background_opacity = 0.6
         assert_eq!(config.scan_interval, Some(1800));
         assert_eq!(config.log_level(), Some(LogLevel::Debug));
         assert_eq!(config.background_opacity, Some(0.6));
+        assert_eq!(config.candidate_index, Some(false));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

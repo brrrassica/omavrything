@@ -434,7 +434,7 @@ impl QueryCache {
 }
 
 /// The in-memory index.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Index {
     records: Vec<FileRecord>,
     paths: Vec<u8>,
@@ -445,6 +445,13 @@ pub struct Index {
     /// arena, and token table). Rebuilt on compaction and snapshot load; kept
     /// current on insert and rename.
     candidate: CandidateIndex,
+    /// Whether the candidate index is built and consulted (F10). When false,
+    /// search falls back to a linear scan over the reconstructed paths and the
+    /// candidate index is not built, reclaiming its memory.
+    candidate_enabled: bool,
+    /// Whether repeated queries are served from the memoization cache (F7). The
+    /// benchmark disables it to measure the cold path.
+    query_cache: bool,
     /// Memoized query results (F7). Interior mutability so `search` can populate
     /// it through `&self`.
     cache: Mutex<QueryCache>,
@@ -452,6 +459,23 @@ pub struct Index {
     /// the generation it was computed at, so invalidation is a single atomic
     /// store rather than a lock-and-clear on the hot insert path.
     cache_generation: AtomicU64,
+}
+
+impl Default for Index {
+    fn default() -> Self {
+        Self {
+            records: Vec::new(),
+            paths: Vec::new(),
+            roots: Vec::new(),
+            by_path: PathIndex::default(),
+            live: 0,
+            candidate: CandidateIndex::new(),
+            candidate_enabled: true,
+            query_cache: true,
+            cache: Mutex::new(QueryCache::default()),
+            cache_generation: AtomicU64::new(0),
+        }
+    }
 }
 
 impl Clone for Index {
@@ -465,6 +489,8 @@ impl Clone for Index {
             by_path: self.by_path.clone(),
             live: self.live,
             candidate: self.candidate.clone(),
+            candidate_enabled: self.candidate_enabled,
+            query_cache: self.query_cache,
             cache: Mutex::new(QueryCache::default()),
             cache_generation: AtomicU64::new(0),
         }
@@ -496,6 +522,40 @@ pub struct MemoryBreakdown {
 impl Index {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Enable or disable the derived candidate index (F10). Disabling it drops
+    /// the candidate index (reclaiming its memory) and makes search fall back to
+    /// a linear scan over the reconstructed paths; enabling it rebuilds the
+    /// index from the current records.
+    pub fn set_candidate_enabled(&mut self, enabled: bool) {
+        if self.candidate_enabled == enabled {
+            return;
+        }
+        self.candidate_enabled = enabled;
+        if enabled {
+            self.rebuild_candidate();
+        } else {
+            self.candidate = CandidateIndex::new();
+        }
+        self.invalidate_cache();
+    }
+
+    /// Whether the candidate index is enabled (F10).
+    pub fn candidate_enabled(&self) -> bool {
+        self.candidate_enabled
+    }
+
+    /// Enable or disable the query-result memoization cache (F7). The benchmark
+    /// disables it to measure the cold path.
+    pub fn set_query_cache(&mut self, enabled: bool) {
+        self.query_cache = enabled;
+        self.invalidate_cache();
+    }
+
+    /// Whether the query-result cache is enabled (F7).
+    pub fn query_cache(&self) -> bool {
+        self.query_cache
     }
 
     /// The number of live (non-deleted) records.
@@ -613,6 +673,10 @@ impl Index {
     /// Rebuild the candidate index from the current records, dropping stale
     /// postings and tokens. Used after compaction and snapshot load.
     fn rebuild_candidate(&mut self) {
+        if !self.candidate_enabled {
+            self.candidate = CandidateIndex::new();
+            return;
+        }
         let mut candidate = CandidateIndex::new();
         let mut buf: Vec<u8> = Vec::new();
         for (i, rec) in self.records.iter().enumerate() {
@@ -675,6 +739,8 @@ impl Index {
             by_path,
             live,
             candidate,
+            candidate_enabled: true,
+            query_cache: true,
             cache: Mutex::new(QueryCache::default()),
             cache_generation: AtomicU64::new(0),
         }
@@ -687,7 +753,9 @@ impl Index {
         self.records.reserve(records);
         self.paths.reserve(path_bytes);
         self.by_path.reserve(records);
-        self.candidate.reserve(records, path_bytes);
+        if self.candidate_enabled {
+            self.candidate.reserve(records, path_bytes);
+        }
     }
 
     /// Insert many records at once, reusing scratch buffers and avoiding the
@@ -751,12 +819,14 @@ impl Index {
                 .insert_bytes(e.path, idx, &self.records, &self.paths);
 
             // Index the full path, ASCII-lowercased, reusing one buffer.
-            lower.clear();
-            lower.extend_from_slice(e.path);
-            lower.make_ascii_lowercase();
-            // Records are appended in increasing index order, so the posting
-            // lists can be pushed to instead of binary-searched.
-            self.candidate.insert_append(idx, &lower);
+            if self.candidate_enabled {
+                lower.clear();
+                lower.extend_from_slice(e.path);
+                lower.make_ascii_lowercase();
+                // Records are appended in increasing index order, so the posting
+                // lists can be pushed to instead of binary-searched.
+                self.candidate.insert_append(idx, &lower);
+            }
             self.live += 1;
             inserted += 1;
         }
@@ -869,9 +939,11 @@ impl Index {
         self.map_insert(path_str.as_ref(), idx);
         // Index the full path (not the stored basename) so a term can match the
         // parent components too. The candidate index stores it ASCII-lowercased.
-        let mut lower = path_str.as_bytes().to_vec();
-        lower.make_ascii_lowercase();
-        self.candidate.insert(idx, &lower);
+        if self.candidate_enabled {
+            let mut lower = path_str.as_bytes().to_vec();
+            lower.make_ascii_lowercase();
+            self.candidate.insert(idx, &lower);
+        }
         self.live += 1;
         self.invalidate_cache();
         idx
@@ -1099,9 +1171,11 @@ impl Index {
             // affected record (including files, whose basename is unchanged but
             // whose parent path moved). Append the new lowercased path; the old
             // postings are filtered out at match time and reclaimed on compaction.
-            let mut lower = new_path.as_bytes().to_vec();
-            lower.make_ascii_lowercase();
-            self.candidate.insert(i, &lower);
+            if self.candidate_enabled {
+                let mut lower = new_path.as_bytes().to_vec();
+                lower.make_ascii_lowercase();
+                self.candidate.insert(i, &lower);
+            }
         }
         self.invalidate_cache();
         true
@@ -1113,6 +1187,10 @@ impl Index {
     /// An empty query matches nothing. Repeated queries are served from a small
     /// memoization cache (F7) that is invalidated by any index mutation.
     pub fn search(&self, query: &str, limit: usize, offset: usize) -> SearchOutcome {
+        // F7: the benchmark disables the cache to measure the cold path.
+        if !self.query_cache {
+            return self.search_uncached(query, limit, offset).0;
+        }
         let key = (query.to_string(), limit, offset);
         let generation = self.cache_generation.load(AtomicOrdering::Relaxed);
         {
@@ -1178,7 +1256,11 @@ impl Index {
         // Narrow the scan to a candidate set when the query allows it. The
         // candidate set is always a superset of the matches, so verifying each
         // candidate with `match_record` yields the same results as a full scan.
-        let candidates = self.candidate.candidates(&q);
+        let candidates = if self.candidate_enabled {
+            self.candidate.candidates(&q)
+        } else {
+            None
+        };
         let (total, top, scanned, parallel) = match candidates {
             Some(cands) => {
                 let parallel = cands.len() >= PARALLEL_THRESHOLD;
@@ -1239,6 +1321,11 @@ impl Index {
     fn match_record(&self, idx: u32, rec: &FileRecord, q: &Query) -> Option<Rank> {
         if rec.is_deleted() {
             return None;
+        }
+        // F10: with the candidate index disabled there is no lowercased arena,
+        // so match the reconstructed path via the parent/name split.
+        if !self.candidate_enabled {
+            return self.match_record_original(rec, q);
         }
         let lower = self.candidate.lower_path(idx);
         let mut first_pos = u32::MAX;
@@ -1347,10 +1434,10 @@ impl Index {
         }
     }
 
-    /// The pre-M23 matcher, kept as a test-only reference so the candidate index
-    /// (F1) and the lowercased arena (F2) can be proven to preserve results
-    /// exactly. It matches the original-case path via the parent/name split.
-    #[cfg(test)]
+    /// The pre-M23 matcher: matches the original-case path via the parent/name
+    /// split. Used as the test-only reference for the candidate index (F1) and
+    /// the lowercased arena (F2), and as the production fallback when the
+    /// candidate index is disabled (F10).
     fn match_record_original(&self, rec: &FileRecord, q: &Query) -> Option<Rank> {
         if rec.is_deleted() {
             return None;
@@ -1880,6 +1967,53 @@ mod tests {
             let linear = index.search_linear(q, 100, 0);
             assert_eq!(narrowed.total, linear.total, "total differs for {q:?}");
             assert_eq!(narrowed.hits, linear.hits, "hits differ for {q:?}");
+        }
+    }
+
+    #[test]
+    fn disabling_the_candidate_index_falls_back_to_a_linear_scan() {
+        // F10: disabling the candidate index must return the same results (via
+        // the reconstructed-path matcher) and reclaim its memory.
+        let mut index = Index::new();
+        index.add_root(Path::new("/"), FsKind::Other);
+        for p in [
+            "/home/sam/Documents/report-2024.pdf",
+            "/home/sam/Documents/notes.md",
+            "/etc/config.toml",
+            "/tmp/Report.TXT",
+            "/opt/app/config.yaml",
+            "/tmp/Ünïcode.txt",
+        ] {
+            index.insert(Path::new(p), false, 1, 0);
+        }
+        let queries = [
+            "report",
+            "config",
+            "re",
+            "documents report",
+            "zzz-no-such-file",
+            "ünïcode",
+        ];
+        let enabled: Vec<_> = queries.iter().map(|q| index.search(q, 100, 0)).collect();
+
+        index.set_candidate_enabled(false);
+        assert!(!index.candidate_enabled());
+        assert_eq!(index.memory_breakdown().candidate_bytes, 0);
+        for (q, want) in queries.iter().zip(&enabled) {
+            let got = index.search(q, 100, 0);
+            assert_eq!(got.total, want.total, "total differs for {q:?}");
+            assert_eq!(got.hits, want.hits, "hits differ for {q:?}");
+        }
+
+        index.set_candidate_enabled(true);
+        assert!(index.candidate_enabled());
+        assert!(index.memory_breakdown().candidate_bytes > 0);
+        for (q, want) in queries.iter().zip(&enabled) {
+            assert_eq!(
+                index.search(q, 100, 0).hits,
+                want.hits,
+                "hits differ after re-enable for {q:?}"
+            );
         }
     }
 

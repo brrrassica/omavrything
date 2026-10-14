@@ -8,23 +8,30 @@
 //!
 //! Three structures cooperate:
 //!
-//! - **Trigram postings (F1).** Every path component is split on `/` and its
-//!   three-byte windows are recorded in `ngrams: trigram -> sorted record
-//!   indices`. A query term that is ASCII, at least three bytes long, and free of
-//!   `/` cannot span a separator, so intersecting the posting lists of its
-//!   trigrams yields a superset of the records that contain it. Terms that are
-//!   shorter, non-ASCII, or contain `/` contribute no constraint (the scan falls
-//!   back to every record for that term).
+//! - **Trigram postings (F1, F14, F15).** Every path component is split on `/`
+//!   and its three-byte windows are recorded. A query term that is ASCII, at
+//!   least three bytes long, and free of `/` cannot span a separator, so
+//!   intersecting the posting lists of its trigrams yields a superset of the
+//!   records that contain it. Terms that are shorter, non-ASCII, or contain `/`
+//!   contribute no constraint (the scan falls back to every record for that
+//!   term). The postings are stored in a **CSR / flat layout** (F14): one
+//!   varint-encoded, delta-encoded posting arena plus a per-trigram byte offset,
+//!   instead of a `HashMap<u32, Vec<u32>>` whose per-list `Vec` headers dominate
+//!   the memory. Delta + varint encoding (F15) shrinks the arena further while
+//!   keeping the intersection speedup.
 //! - **Lowercased path arena (F2).** Each record's full path is stored
 //!   ASCII-lowercased and back-to-back in `lower`, with a per-record offset and
 //!   length. The hot matching loop reads this contiguous arena instead of chasing
 //!   the record vector and the parent link, so it touches far less memory.
-//! - **Sorted token table (F3).** Each path component is also recorded as a
-//!   `(component, record)` entry, kept sorted by component bytes. A single-token
-//!   prefix query binary-searches the range of components that start with the
+//! - **Sorted token table (F3, F13).** Each record's **basename** is recorded as
+//!   a `(basename, record)` entry, kept sorted by basename bytes. A single-token
+//!   prefix query binary-searches the range of basenames that start with the
 //!   term. This is an *extra* candidate source unioned with the trigram set; the
 //!   trigram set already guarantees completeness, so the token table never
-//!   removes a true match.
+//!   removes a true match. Storing only the basename (not every path component)
+//!   keeps the table at one entry per record instead of one per component, and
+//!   the entry is packed to 8 bytes (F13) by deriving the basename length from
+//!   the record's stored path length rather than storing it per entry.
 //!
 //! The index is **append-only**, mirroring the record tombstones in
 //! [`crate::index`]: inserts and renames append new postings and tokens, and a
@@ -32,27 +39,121 @@
 //! (a deleted record never matches; a renamed record's current path is what is
 //! tested). [`crate::index::Index::compact`] rebuilds the whole structure, which
 //! reclaims the stale entries.
+//!
+//! ## Bulk build vs. live updates
+//!
+//! A cold scan appends every record with [`CandidateIndex::insert_append`] and
+//! then calls [`CandidateIndex::finish_bulk`], which finalizes the accumulated
+//! postings into the flat CSR arena. Live inserts and renames after that append
+//! to a small **delta** map, which is unioned with the CSR at lookup time and
+//! merged into the CSR on the next `finish_bulk` (e.g. from
+//! [`crate::index::Index::shrink`]). This keeps the steady-state memory in the
+//! compact CSR while preserving the append-only, incremental update path.
 
 use std::cmp::Ordering;
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
 use crate::query::{Query, Term};
+
+/// A fast, non-cryptographic hasher for the trigram maps (R8). The keys are
+/// packed trigrams (`u32`), so a single multiply is enough; the default SipHash
+/// is overkill and dominates the cold-scan insert cost.
+#[derive(Default)]
+struct TrigramHasher(u64);
+
+impl std::hash::Hasher for TrigramHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        // Not used by the trigram maps (their keys are `u32`), but implemented
+        // so the hasher is a valid `Hasher`.
+        for &b in bytes {
+            self.0 = (self.0 ^ b as u64).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+
+    fn write_u32(&mut self, n: u32) {
+        // Fibonacci hashing: multiply by a large odd constant; the high bits are
+        // well distributed.
+        self.0 = (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+/// The `BuildHasher` for the trigram maps (R8).
+#[derive(Default, Clone)]
+struct TrigramBuildHasher;
+
+impl std::hash::BuildHasher for TrigramBuildHasher {
+    type Hasher = TrigramHasher;
+    fn build_hasher(&self) -> TrigramHasher {
+        TrigramHasher(0)
+    }
+}
 
 /// Pack a three-byte trigram into a `u32` (little-endian byte order).
 fn pack_trigram(a: u8, b: u8, c: u8) -> u32 {
     (a as u32) | ((b as u32) << 8) | ((c as u32) << 16)
 }
 
-/// One entry in the sorted token table: a path component in the lowercased
-/// arena, and the record it belongs to.
+/// One entry in the sorted token table: the offset of a record's basename into
+/// [`CandidateIndex::lower`], and the record it belongs to (F13).
+///
+/// The basename length is **not** stored: it is derived from the record's stored
+/// path length, since the basename is always the suffix of the record's full
+/// path. This packs the entry from 12 to 8 bytes.
 #[derive(Debug, Clone, Copy)]
 struct TokenEntry {
-    /// Offset of the component into [`CandidateIndex::lower`].
+    /// Offset of the basename into [`CandidateIndex::lower`].
     off: u32,
-    /// Byte length of the component.
-    len: u16,
-    /// The record the component belongs to.
+    /// The record the basename belongs to.
     record: u32,
+}
+
+/// A finalized, flat trigram posting store (F14, F15).
+///
+/// `slots` maps a packed trigram to a slot index; `offsets[slot]..offsets[slot +
+/// 1]` is that trigram's byte range in `data`, which holds the record indices
+/// delta-encoded and varint-encoded (F15). The record indices within a slot are
+/// strictly increasing, so the deltas are positive and small.
+#[derive(Debug, Default, Clone)]
+struct CsrPostings {
+    /// Trigram -> slot index.
+    slots: HashMap<u32, u32, TrigramBuildHasher>,
+    /// Byte offsets into `data`; `offsets[i]..offsets[i + 1]` is slot `i`.
+    offsets: Vec<u32>,
+    /// Varint delta-encoded record indices, one contiguous range per slot.
+    data: Vec<u8>,
+}
+
+impl CsrPostings {
+    /// Build the flat layout from a trigram -> sorted record list map.
+    fn build(map: &HashMap<u32, Vec<u32>, TrigramBuildHasher>) -> Self {
+        let mut slots = HashMap::with_capacity_and_hasher(map.len(), TrigramBuildHasher);
+        let mut offsets = Vec::with_capacity(map.len() + 1);
+        let mut data = Vec::new();
+        offsets.push(0u32);
+        for (slot, (&tg, list)) in map.iter().enumerate() {
+            slots.insert(tg, slot as u32);
+            encode_delta_varint(list, &mut data);
+            offsets.push(data.len() as u32);
+        }
+        Self {
+            slots,
+            offsets,
+            data,
+        }
+    }
+
+    /// Decode the posting list for `slot` into sorted record indices.
+    fn decode(&self, slot: u32) -> Vec<u32> {
+        let s = slot as usize;
+        let start = self.offsets[s] as usize;
+        let end = self.offsets[s + 1] as usize;
+        decode_delta_varint(&self.data[start..end])
+    }
 }
 
 /// The candidate-narrowing index. See the module docs.
@@ -64,8 +165,12 @@ pub struct CandidateIndex {
     off: Vec<u32>,
     /// Per-record length in `lower`.
     len: Vec<u16>,
-    /// Trigram -> sorted record indices.
-    ngrams: HashMap<u32, Vec<u32>>,
+    /// Finalized flat trigram postings (F14, F15). Empty until `finish_bulk`.
+    csr: CsrPostings,
+    /// Trigram -> sorted record indices added after finalization (live inserts
+    /// and renames). Unioned with the CSR at lookup time and merged into it on
+    /// the next `finish_bulk`. During a bulk build this holds every posting.
+    delta: HashMap<u32, Vec<u32>, TrigramBuildHasher>,
     /// Sorted token table.
     tokens: Vec<TokenEntry>,
     /// Unsorted token additions, merged into `tokens` once they grow.
@@ -86,9 +191,9 @@ pub struct CandidateMemory {
     pub off: u64,
     /// Per-record length array bytes.
     pub len: u64,
-    /// Trigram posting-list bytes (record indices).
+    /// Trigram posting bytes (the CSR arena plus any delta postings).
     pub postings: u64,
-    /// Trigram map overhead (keys, `Vec` headers, control bytes).
+    /// Trigram map overhead (keys, slot values, offsets, control bytes).
     pub map: u64,
     /// Token table bytes (sorted plus pending).
     pub tokens: u64,
@@ -103,11 +208,80 @@ const PENDING_MIN: usize = 4096;
 /// records is stop-listed (F12): its list is dropped and it contributes no
 /// constraint, so the candidate set stays a superset. This bounds the postings,
 /// which dominate the candidate index's memory.
-const STOP_LIST_DIVISOR: usize = 20;
+///
+/// Tuned to 10 (R10): the memory curve is flat between 10 and 20 (306.9 vs
+/// 302.8 B/record on the 52 k hermetic tree), but the broad-query p50 is ~2x
+/// better at 10 (0.293 vs 0.62 ms) because the 5–10 % trigrams that 20 drops
+/// are exactly the ones a broad directory-component query needs. Beyond 20 the
+/// memory saving is marginal and the broad query stays slow.
+const STOP_LIST_DIVISOR: usize = 10;
 
 /// Stop-listing is only applied once the index is at least this large, so a
 /// small index keeps every posting list.
 const STOP_LIST_MIN_RECORDS: usize = 1000;
+
+/// The stop-list divisor, overridable with `OMAVRYTHING_STOP_LIST_DIVISOR` for
+/// measurement (R10). 0 disables the stop-list.
+fn stop_list_divisor() -> usize {
+    std::env::var("OMAVRYTHING_STOP_LIST_DIVISOR")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(STOP_LIST_DIVISOR)
+}
+
+/// Whether the token table is built, overridable with
+/// `OMAVRYTHING_TOKEN_TABLE=0` for measurement (R10).
+fn tokens_enabled() -> bool {
+    std::env::var("OMAVRYTHING_TOKEN_TABLE")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+}
+
+/// Append `v` to `out` as an unsigned LEB128 varint (F15).
+fn write_varint(mut v: u32, out: &mut Vec<u8>) {
+    while v >= 0x80 {
+        out.push((v as u8) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+/// Read an unsigned LEB128 varint from `data` at `*pos`, advancing `*pos`.
+fn read_varint(data: &[u8], pos: &mut usize) -> u32 {
+    let mut v = 0u32;
+    let mut shift = 0u32;
+    loop {
+        let b = data[*pos];
+        *pos += 1;
+        v |= ((b & 0x7f) as u32) << shift;
+        if b & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+    }
+    v
+}
+
+/// Delta + varint encode a sorted, deduplicated record list into `out` (F15).
+fn encode_delta_varint(list: &[u32], out: &mut Vec<u8>) {
+    let mut prev = 0u32;
+    for &v in list {
+        write_varint(v - prev, out);
+        prev = v;
+    }
+}
+
+/// Decode a delta + varint encoded record list (F15).
+fn decode_delta_varint(data: &[u8]) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    let mut prev = 0u32;
+    while pos < data.len() {
+        prev += read_varint(data, &mut pos);
+        out.push(prev);
+    }
+    out
+}
 
 impl CandidateIndex {
     pub fn new() -> Self {
@@ -155,10 +329,17 @@ impl CandidateIndex {
                 let tg = pack_trigram(w[0], w[1], w[2]);
                 // A stop-listed trigram has no posting list; skip it so a live
                 // insert does not rebuild a list the bulk build dropped (F12).
-                if self.stop.contains(&tg) {
+                // The stop-list is empty during the initial bulk build, so guard
+                // the lookup (R8).
+                if !self.stop.is_empty() && self.stop.contains(&tg) {
                     continue;
                 }
-                let list = self.ngrams.entry(tg).or_default();
+                // A small initial capacity avoids the first reallocations for a
+                // trigram that appears in many records (R8).
+                let list = self
+                    .delta
+                    .entry(tg)
+                    .or_insert_with(|| Vec::with_capacity(4));
                 if append {
                     // `idx` is the largest so far, so a push keeps the list
                     // sorted; skip a repeat of the same trigram within this path.
@@ -171,18 +352,19 @@ impl CandidateIndex {
             }
         }
 
-        // Token table: one entry per non-empty component.
-        let mut start = 0usize;
-        for (j, &b) in lower_path.iter().enumerate() {
-            if b == b'/' {
-                if j > start {
-                    self.push_token(off + start as u32, (j - start) as u16, idx);
-                }
-                start = j + 1;
+        // Token table (F13): only the basename is recorded, not every path
+        // component. The trigram set already covers directory components, so the
+        // token table is a basename-prefix shortcut; one entry per record instead
+        // of one per component cuts its memory ~10x. `OMAVRYTHING_TOKEN_TABLE=0`
+        // disables it entirely (a measurement knob for R10).
+        if tokens_enabled() {
+            let start = lower_path
+                .iter()
+                .rposition(|&b| b == b'/')
+                .map_or(0, |i| i + 1);
+            if start < lower_path.len() {
+                self.push_token(off + start as u32, idx);
             }
-        }
-        if start < lower_path.len() {
-            self.push_token(off + start as u32, (lower_path.len() - start) as u16, idx);
         }
 
         if self.pending.len() >= self.tokens.len().max(PENDING_MIN) {
@@ -200,11 +382,11 @@ impl CandidateIndex {
         self.tokens.reserve(records);
         // A rough upper bound on the number of distinct trigrams; capped so a
         // huge index does not reserve the full 16 MiB trigram space up front.
-        self.ngrams.reserve(records.min(1 << 20));
+        self.delta.reserve(records.min(1 << 20));
     }
 
-    fn push_token(&mut self, off: u32, len: u16, record: u32) {
-        self.pending.push(TokenEntry { off, len, record });
+    fn push_token(&mut self, off: u32, record: u32) {
+        self.pending.push(TokenEntry { off, record });
     }
 
     /// Sort the pending tokens and merge them into the sorted table.
@@ -213,12 +395,15 @@ impl CandidateIndex {
             return;
         }
         let lower = &self.lower;
-        self.pending.sort_unstable_by(|a, b| token_cmp(lower, a, b));
+        let off = &self.off;
+        let len = &self.len;
+        self.pending
+            .sort_unstable_by(|a, b| token_cmp(lower, off, len, a, b));
 
         let mut merged = Vec::with_capacity(self.tokens.len() + self.pending.len());
         let (mut i, mut j) = (0usize, 0usize);
         while i < self.tokens.len() && j < self.pending.len() {
-            if token_cmp(lower, &self.tokens[i], &self.pending[j]) != Ordering::Greater {
+            if token_cmp(lower, off, len, &self.tokens[i], &self.pending[j]) != Ordering::Greater {
                 merged.push(self.tokens[i]);
                 i += 1;
             } else {
@@ -232,11 +417,13 @@ impl CandidateIndex {
         self.pending.clear();
     }
 
-    /// Finalize a bulk build: merge any pending tokens into the sorted table and
-    /// compute the stop-list (F12).
+    /// Finalize a bulk build: merge any pending tokens into the sorted table,
+    /// compute the stop-list (F12), and flatten the accumulated postings into
+    /// the CSR arena (F14, F15).
     pub fn finish_bulk(&mut self) {
         self.merge_pending();
         self.compute_stop_list();
+        self.finalize_postings();
     }
 
     /// Drop the posting lists of the most frequent trigrams (F12). A dropped
@@ -254,9 +441,16 @@ impl CandidateIndex {
         if records < STOP_LIST_MIN_RECORDS {
             return;
         }
-        let threshold = records / STOP_LIST_DIVISOR;
+        // A measurement knob (R10): the divisor can be overridden at runtime so
+        // the stop-list's memory/latency trade-off can be measured. 0 disables
+        // the stop-list entirely.
+        let divisor = stop_list_divisor();
+        if divisor == 0 {
+            return;
+        }
+        let threshold = records / divisor;
         let mut stop = HashSet::new();
-        self.ngrams.retain(|&tg, list| {
+        self.delta.retain(|&tg, list| {
             if list.len() > threshold {
                 stop.insert(tg);
                 false
@@ -265,6 +459,41 @@ impl CandidateIndex {
             }
         });
         self.stop = stop;
+    }
+
+    /// Flatten the delta postings into the CSR arena (F14, F15). On the first
+    /// finalization the CSR is built directly from the delta; on a later one the
+    /// delta is merged into the existing CSR (decoded, unioned, re-encoded).
+    fn finalize_postings(&mut self) {
+        if self.delta.is_empty() {
+            return;
+        }
+        if self.csr.slots.is_empty() {
+            self.csr = CsrPostings::build(&self.delta);
+        } else {
+            let mut merged: HashMap<u32, Vec<u32>, TrigramBuildHasher> =
+                HashMap::with_capacity_and_hasher(
+                    self.csr.slots.len() + self.delta.len(),
+                    TrigramBuildHasher,
+                );
+            for (&tg, &slot) in &self.csr.slots {
+                merged.insert(tg, self.csr.decode(slot));
+            }
+            for (&tg, list) in &self.delta {
+                match merged.entry(tg) {
+                    Entry::Occupied(mut e) => {
+                        let dst = e.get_mut();
+                        let union = union_sorted(dst, list);
+                        *dst = union;
+                    }
+                    Entry::Vacant(e) => {
+                        e.insert(list.clone());
+                    }
+                }
+            }
+            self.csr = CsrPostings::build(&merged);
+        }
+        self.delta.clear();
     }
 
     /// The ASCII-lowercased full path of a record, or an empty slice when the
@@ -315,7 +544,7 @@ impl CandidateIndex {
             return None;
         }
 
-        let mut lists: Vec<&[u32]> = Vec::with_capacity(needle.len() - 2);
+        let mut lists: Vec<Vec<u32>> = Vec::with_capacity(needle.len() - 2);
         for w in needle.windows(3) {
             let tg = pack_trigram(w[0], w[1], w[2]);
             // A stop-listed trigram is too common to constrain the scan; skip it
@@ -323,7 +552,7 @@ impl CandidateIndex {
             if self.stop.contains(&tg) {
                 continue;
             }
-            match self.ngrams.get(&tg) {
+            match self.postings_for(tg) {
                 Some(list) => lists.push(list),
                 // A missing trigram means no record contains it, so no record
                 // contains the term.
@@ -338,7 +567,7 @@ impl CandidateIndex {
 
         // Intersect smallest-first to keep the working set small.
         lists.sort_by_key(|l| l.len());
-        let mut acc = lists[0].to_vec();
+        let mut acc = lists[0].clone();
         for list in &lists[1..] {
             acc = intersect_sorted(&acc, list);
             if acc.is_empty() {
@@ -353,9 +582,25 @@ impl CandidateIndex {
         Some(union_sorted(&acc, &token_cands))
     }
 
+    /// The posting list for a trigram: the decoded CSR slot unioned with any
+    /// delta postings, or `None` when no record contains the trigram.
+    fn postings_for(&self, tg: u32) -> Option<Vec<u32>> {
+        let csr = self.csr.slots.get(&tg).map(|&slot| self.csr.decode(slot));
+        let delta = self.delta.get(&tg);
+        match (csr, delta) {
+            (None, None) => None,
+            (Some(c), None) => Some(c),
+            (None, Some(d)) => Some(d.clone()),
+            (Some(c), Some(d)) => Some(union_sorted(&c, d)),
+        }
+    }
+
     /// Records with a path component that starts with `needle`, from the sorted
     /// token table and the pending additions.
     fn token_prefix_candidates(&self, needle: &[u8]) -> Vec<u32> {
+        if !tokens_enabled() {
+            return Vec::new();
+        }
         let mut out = Vec::new();
         let start = self
             .tokens
@@ -377,7 +622,7 @@ impl CandidateIndex {
     }
 
     fn token_slice(&self, t: &TokenEntry) -> &[u8] {
-        &self.lower[t.off as usize..t.off as usize + t.len as usize]
+        token_bytes(&self.lower, &self.off, &self.len, t)
     }
 
     /// A per-component breakdown of the candidate index's heap memory (F11).
@@ -385,10 +630,13 @@ impl CandidateIndex {
         let lower = self.lower.len() as u64;
         let off = (self.off.len() * std::mem::size_of::<u32>()) as u64;
         let len = (self.len.len() * std::mem::size_of::<u16>()) as u64;
-        let postings: u64 = self.ngrams.values().map(|v| (v.len() * 4) as u64).sum();
-        // A rough per-entry cost for the hash map: key (4) + Vec header (24) +
-        // one control byte.
-        let map = (self.ngrams.len() * (4 + 24 + 1)) as u64;
+        let delta_postings: u64 = self.delta.values().map(|v| (v.len() * 4) as u64).sum();
+        let postings = self.csr.data.len() as u64 + delta_postings;
+        // The CSR slot map (key + slot value + control byte), its offset array,
+        // and the delta map (key + `Vec` header + control byte).
+        let map = self.csr.slots.len() as u64 * (4 + 4 + 1)
+            + self.csr.offsets.len() as u64 * std::mem::size_of::<u32>() as u64
+            + self.delta.len() as u64 * (4 + 24 + 1);
         let tokens =
             ((self.tokens.len() + self.pending.len()) * std::mem::size_of::<TokenEntry>()) as u64;
         // A stop-list entry is a `u32` key plus a control byte.
@@ -417,18 +665,29 @@ impl CandidateIndex {
         self.len.shrink_to_fit();
         self.tokens.shrink_to_fit();
         self.pending.shrink_to_fit();
-        for list in self.ngrams.values_mut() {
+        self.csr.slots.shrink_to_fit();
+        self.csr.offsets.shrink_to_fit();
+        self.csr.data.shrink_to_fit();
+        for list in self.delta.values_mut() {
             list.shrink_to_fit();
         }
-        self.ngrams.shrink_to_fit();
+        self.delta.shrink_to_fit();
         self.stop.shrink_to_fit();
     }
 }
 
-/// Compare two token entries by their component bytes, then by record index.
-fn token_cmp(lower: &[u8], a: &TokenEntry, b: &TokenEntry) -> Ordering {
-    let sa = &lower[a.off as usize..a.off as usize + a.len as usize];
-    let sb = &lower[b.off as usize..b.off as usize + b.len as usize];
+/// The basename bytes of a token entry, deriving the length from the record's
+/// stored path (F13).
+fn token_bytes<'a>(lower: &'a [u8], off: &[u32], len: &[u16], t: &TokenEntry) -> &'a [u8] {
+    let start = t.off as usize;
+    let end = off[t.record as usize] as usize + len[t.record as usize] as usize;
+    &lower[start..end]
+}
+
+/// Compare two token entries by their basename bytes, then by record index.
+fn token_cmp(lower: &[u8], off: &[u32], len: &[u16], a: &TokenEntry, b: &TokenEntry) -> Ordering {
+    let sa = token_bytes(lower, off, len, a);
+    let sb = token_bytes(lower, off, len, b);
     sa.cmp(sb).then_with(|| a.record.cmp(&b.record))
 }
 
@@ -519,10 +778,12 @@ mod tests {
     }
 
     #[test]
-    fn token_prefix_lookup_finds_components() {
+    fn token_prefix_lookup_finds_basenames() {
+        // F13: the token table stores basenames only, so a prefix matches a
+        // basename, not a directory component.
         let c = build(&["/home/sam/config.toml", "/etc/conf.d/app.conf"]);
         let cands = c.token_prefix_candidates(b"conf");
-        assert_eq!(cands, vec![0, 1]);
+        assert_eq!(cands, vec![0]);
         let none = c.token_prefix_candidates(b"zzz");
         assert!(none.is_empty());
     }
@@ -542,7 +803,8 @@ mod tests {
             c.insert(i, p.as_bytes());
         }
         // No explicit finish_bulk: the pending buffer must still be searched.
-        let cands = c.token_prefix_candidates(b"dir");
+        // F13: the token table stores basenames, so the prefix is the basename.
+        let cands = c.token_prefix_candidates(b"file");
         assert_eq!(cands.len(), 10);
     }
 
@@ -627,5 +889,83 @@ mod tests {
             b.lower + b.off + b.len + b.postings + b.map + b.tokens + b.stop,
             c.memory_bytes()
         );
+    }
+
+    #[test]
+    fn token_entry_is_eight_bytes() {
+        // F13: the packed token entry must be 8 bytes, not 12.
+        assert_eq!(std::mem::size_of::<TokenEntry>(), 8);
+    }
+
+    #[test]
+    fn varint_round_trips() {
+        // F15: the varint codec must round-trip every value shape.
+        for list in [
+            vec![],
+            vec![0],
+            vec![0, 1, 2],
+            vec![5, 100, 1000, 100_000],
+            vec![u32::MAX],
+            vec![0, u32::MAX],
+        ] {
+            let mut data = Vec::new();
+            encode_delta_varint(&list, &mut data);
+            assert_eq!(decode_delta_varint(&data), list, "round-trip {list:?}");
+        }
+    }
+
+    #[test]
+    fn csr_postings_are_sorted_and_deduped() {
+        // F14/F15: every finalized slot decodes to a strictly increasing list.
+        let c = build(&[
+            "/home/sam/report-2024.pdf",
+            "/home/sam/report-2025.pdf",
+            "/home/sam/notes.md",
+            "/etc/config.toml",
+        ]);
+        assert!(!c.csr.slots.is_empty(), "expected a finalized CSR");
+        for &slot in c.csr.slots.values() {
+            let decoded = c.csr.decode(slot);
+            assert!(!decoded.is_empty());
+            assert!(
+                decoded.windows(2).all(|w| w[0] < w[1]),
+                "slot must be sorted and deduped: {decoded:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_insert_after_finalize_is_found() {
+        // F14: a live insert after finalization lands in the delta overlay and
+        // must still be found by a query.
+        let mut c = build(&["/home/sam/report.pdf"]);
+        c.insert(1, b"/home/sam/quarterly-report.pdf");
+        let cands = c.candidates(&Query::parse("quarterly")).unwrap();
+        assert!(cands.contains(&1), "delta insert must be a candidate");
+    }
+
+    #[test]
+    fn rename_after_finalize_updates_candidates() {
+        // F14: a rename after finalization appends to the delta overlay; the new
+        // path must be a candidate.
+        let mut c = build(&["/home/sam/old-name.txt"]);
+        c.insert(0, b"/home/sam/new-name.txt");
+        let cands = c.candidates(&Query::parse("new-name")).unwrap();
+        assert!(cands.contains(&0), "renamed record must be a candidate");
+    }
+
+    #[test]
+    fn delta_is_merged_into_csr_on_finish_bulk() {
+        // F14: a second `finish_bulk` folds the delta into the CSR and clears it,
+        // and the merged index still answers queries.
+        let mut c = build(&["/home/sam/report.pdf"]);
+        c.insert(1, b"/home/sam/quarterly-report.pdf");
+        assert!(!c.delta.is_empty(), "delta should hold the live insert");
+        c.finish_bulk();
+        assert!(c.delta.is_empty(), "finish_bulk must clear the delta");
+        let cands = c.candidates(&Query::parse("quarterly")).unwrap();
+        assert!(cands.contains(&1));
+        let cands = c.candidates(&Query::parse("report")).unwrap();
+        assert!(cands.contains(&0) && cands.contains(&1));
     }
 }

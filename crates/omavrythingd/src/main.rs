@@ -126,6 +126,16 @@ fn main() {
         info!(path = %root.path, fs_kind = ?root.fs_kind, "root");
     }
 
+    // F10: honour the candidate-index preference before the index settles, so a
+    // disabled index is not consulted (and its memory is reclaimed).
+    if !args.candidate_index {
+        index.set_candidate_enabled(false);
+    }
+    // F7: the benchmark disables the query cache to measure the cold path.
+    if !args.query_cache {
+        index.set_query_cache(false);
+    }
+
     // Reclaim the doubling slack left by the scan or snapshot load, then return
     // the scan's freed transient pages to the OS before the daemon idles.
     index.shrink();
@@ -141,6 +151,7 @@ fn main() {
         ntfs: args.ntfs,
         log_level: args.log_level,
         background_opacity: args.background_opacity,
+        candidate_index: args.candidate_index,
         state: args.state.clone(),
         state_path: args.state_path.clone(),
     }));
@@ -866,6 +877,10 @@ struct Args {
     metadata: bool,
     log_level: LogLevel,
     background_opacity: f64,
+    /// Whether the n-gram candidate index is built (F10).
+    candidate_index: bool,
+    /// Whether repeated queries are served from the memoization cache (F7).
+    query_cache: bool,
     /// The persisted runtime overrides, carried for `SetConfig` persistence.
     state: FileConfig,
     /// Where to persist `state`; `None` disables persistence.
@@ -892,6 +907,8 @@ struct RawArgs {
     state_config: Option<PathBuf>,
     no_config: bool,
     log_level: Option<String>,
+    candidate_index: Option<bool>,
+    no_query_cache: bool,
 }
 
 impl Args {
@@ -971,6 +988,12 @@ impl Args {
             .background_opacity
             .or(base.background_opacity)
             .unwrap_or(0.75);
+        let candidate_index = raw
+            .candidate_index
+            .or(state.candidate_index)
+            .or(base.candidate_index)
+            .unwrap_or(true);
+        let query_cache = !raw.no_query_cache;
 
         Ok(Self {
             roots,
@@ -986,6 +1009,8 @@ impl Args {
             metadata,
             log_level,
             background_opacity,
+            candidate_index,
+            query_cache,
             state,
             state_path,
         })
@@ -1076,6 +1101,8 @@ impl RawArgs {
                     }
                 }
                 "--no-config" => raw.no_config = true,
+                "--no-candidate-index" => raw.candidate_index = Some(false),
+                "--no-query-cache" => raw.no_query_cache = true,
                 "--log-level" => {
                     if let Some(value) = args.next() {
                         raw.log_level = Some(value);
@@ -1192,6 +1219,7 @@ fn print_help() {
          \x20                  [--no-watch] [--scan-interval <secs>] [--socket <path>]\n\
          \x20                  [--snapshot <path>] [--no-snapshot] [--snapshot-interval <secs>]\n\
          \x20                  [--no-dbus] [--no-ntfs] [--no-metadata] [--log-level <level>]\n\
+         \x20                  [--no-candidate-index] [--no-query-cache]\n\
          \n\
          Options:\n\
            --config <path>       Configuration file (default: {DEFAULT_CONFIG_PATH})\n\
@@ -1210,6 +1238,8 @@ fn print_help() {
            --no-dbus             Disable the D-Bus control interface\n\
            --no-ntfs             Disable NTFS partition detection and indexing\n\
            --no-metadata         Skip per-file size/mtime stats (names-only; faster scan)\n\
+           --no-candidate-index  Disable the n-gram candidate index (linear scan; bounds memory)\n\
+           --no-query-cache      Disable the query-result memoization cache (cold-path measurement)\n\
            --log-level <level>   Log level: error, warn, info, debug, trace (default: error)\n\
            -V, --version         Show the version\n\
            -h, --help            Show this help"

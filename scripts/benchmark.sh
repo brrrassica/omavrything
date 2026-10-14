@@ -35,6 +35,13 @@
 #   --keep              Keep the temporary tree and logs
 #   --budgets           Check the hermetic p50/p95 and cold-scan throughput
 #                       against per-size budgets; exit non-zero on regression
+#   --no-cache          Start the hermetic daemon with --no-query-cache so the
+#                       latency figures are cold-path, not cache hits (F7)
+#   --scaling           Also measure the cold scan with one rayon thread, to
+#                       show the parallel speedup (F8)
+#   --warm-start        Also measure a warm start from a snapshot (F6)
+#   --stop-list-divisor N  Override the F12 stop-list divisor (0 disables; R10)
+#   --no-token-table    Disable the F3 token table (R10)
 #   -h, --help          Show this help
 #
 # The default runs the hermetic benchmark and, if a daemon is reachable, the
@@ -59,6 +66,11 @@ do_profile=0
 json=0
 keep=0
 do_budgets=0
+no_cache=0
+do_scaling=0
+do_warm_start=0
+stop_list_divisor=""
+no_token_table=0
 files=5000
 queries=30
 duration=4
@@ -89,6 +101,11 @@ while [[ $# -gt 0 ]]; do
     --json) json=1 ;;
     --keep) keep=1 ;;
     --budgets) do_budgets=1 ;;
+    --no-cache) no_cache=1 ;;
+    --scaling) do_scaling=1 ;;
+    --warm-start) do_warm_start=1 ;;
+    --stop-list-divisor) stop_list_divisor="$2"; shift ;;
+    --no-token-table) no_token_table=1 ;;
     -h | --help) usage; exit 0 ;;
     *)
       echo "error: unknown option: $1" >&2
@@ -527,7 +544,13 @@ measure_latency() {
   # the human-readable line is written to stderr by the Python helper.
   local out
   out="$(python3 "$py" latency --socket "$sock" --query "$query" --count "$count" --warmup "$warmup" --json --title "$title")"
-  add_result "latency:$title" "$out"
+  # F7: with --no-cache the daemon has no memoization cache, so the figures are
+  # cold-path; tag the key so the two runs are distinguishable in --json.
+  local suffix=""
+  if [[ "$no_cache" == 1 ]]; then
+    suffix=":cold"
+  fi
+  add_result "latency:$title$suffix" "$out"
 }
 
 # ---- live daemon -----------------------------------------------------------
@@ -627,12 +650,38 @@ PY
 
   start_daemon() {
     local extra=("$@")
+    # A `--snapshot <path>` in `extra` means the caller wants persistence, so the
+    # default `--no-snapshot` is dropped (F6 warm-start measurement).
+    local snap_flag=(--no-snapshot)
+    local cache_flag=()
+    for a in "${extra[@]}"; do
+      if [[ "$a" == "--snapshot" ]]; then
+        snap_flag=()
+      fi
+    done
+    # F7: --no-cache starts the daemon without the query-result memoization cache
+    # so the latency figures are cold-path.
+    if [[ "$no_cache" == 1 ]]; then
+      cache_flag=(--no-query-cache)
+    fi
+    # R10 measurement knobs: the stop-list divisor and the token table.
+    local env_vars=()
+    if [[ -n "$stop_list_divisor" ]]; then
+      env_vars+=("OMAVRYTHING_STOP_LIST_DIVISOR=$stop_list_divisor")
+    fi
+    if [[ "$no_token_table" == 1 ]]; then
+      env_vars+=("OMAVRYTHING_TOKEN_TABLE=0")
+    fi
+    local env_prefix=()
+    if [[ ${#env_vars[@]} -gt 0 ]]; then
+      env_prefix=(env "${env_vars[@]}")
+    fi
     : > "$log"
     # A previous run leaves its socket file behind; remove it so the wait below
     # cannot be satisfied by a stale, unlistened socket.
     rm -f "$sock"
-    "$daemon_bin" --no-config --root "$root" --socket "$sock" \
-      --no-dbus --no-snapshot --no-ntfs --log-level info "${extra[@]}" \
+    "${env_prefix[@]}" "$daemon_bin" --no-config --root "$root" --socket "$sock" \
+      --no-dbus --no-ntfs --log-level info "${snap_flag[@]}" "${cache_flag[@]}" "${extra[@]}" \
       >"$log" 2>&1 &
     daemon_pid=$!
     for _ in $(seq 1 600); do
@@ -725,6 +774,53 @@ PY
       stop_daemon
     else
       say "error: the hermetic daemon did not start for the live-update run" >&2
+    fi
+  fi
+
+  # --- run C: single-thread cold scan (F8 scaling) -------------------------
+  if [[ "$do_scaling" == 1 ]]; then
+    say "cold scan with one rayon thread (F8 scaling):"
+    if RAYON_NUM_THREADS=1 start_daemon --scan-interval 0; then
+      scan_line="$(grep -m1 'indexed entries=' "$log" || true)"
+      entries1="$(sed -n 's/.*entries=\([0-9]*\).*/\1/p' <<<"$scan_line")"
+      elapsed1="$(sed -n 's/.*elapsed_ms=\([0-9]*\).*/\1/p' <<<"$scan_line")"
+      if [[ -n "$entries1" && -n "$elapsed1" && "$elapsed1" -gt 0 ]]; then
+        eps1="$(python3 -c "print(round($entries1 / ($elapsed1 / 1000.0), 1))")"
+        say "cold scan (1 thread): $entries1 entries in ${elapsed1} ms ($eps1 entries/s)"
+        add_result "indexing_1thread" "{\"entries\": $entries1, \"elapsed_ms\": $elapsed1, \"entries_per_sec\": $eps1}"
+      else
+        say "cold scan (1 thread): could not parse the scan line"
+      fi
+      stop_daemon
+    else
+      say "error: the single-thread hermetic daemon did not start" >&2
+    fi
+  fi
+
+  # --- run D: warm start from a snapshot (F6) ------------------------------
+  if [[ "$do_warm_start" == 1 ]]; then
+    snap="$tmp/index.snapshot"
+    say "warm start from a snapshot (F6):"
+    # The first run writes the snapshot on clean shutdown; the second loads it.
+    if start_daemon --scan-interval 0 --snapshot "$snap" --snapshot-interval 0; then
+      stop_daemon
+      if [[ -f "$snap" ]]; then
+        if start_daemon --scan-interval 0 --snapshot "$snap" --snapshot-interval 0; then
+          warm_line="$(grep -m1 'warm-started from snapshot' "$log" || true)"
+          warm_ms="$(sed -n 's/.*elapsed_ms=\([0-9]*\).*/\1/p' <<<"$warm_line")"
+          if [[ -n "$warm_ms" ]]; then
+            say "warm start: ${warm_ms} ms"
+            add_result "warm_start" "{\"elapsed_ms\": $warm_ms}"
+          else
+            say "warm start: could not parse the warm-start line"
+          fi
+          stop_daemon
+        fi
+      else
+        say "warm start: no snapshot was written"
+      fi
+    else
+      say "error: the hermetic daemon did not start for the warm-start run" >&2
     fi
   fi
 fi

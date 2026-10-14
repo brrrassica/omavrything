@@ -32,6 +32,10 @@ ntfs = true
 # Collect per-file size and mtime (needed for the results table).
 metadata = true
 
+# Build and consult the n-gram candidate index (F10). Disabling it bounds memory
+# on very large indexes at the cost of a linear scan per query.
+candidate_index = true
+
 # Log level: error, warn, info, debug, or trace. The default is "error" so a
 # production daemon is quiet unless something is wrong; raise it to "info" or
 # "debug" when diagnosing.
