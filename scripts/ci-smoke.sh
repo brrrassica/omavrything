@@ -300,6 +300,41 @@ if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
     "Keys.onPressed"
   expect_grep "overlay QML gates the input on the open state" "$overlay_qml" \
     "active: root.opened"
+  # Regression guard (2026-10-14): Text defaults to AutoText, which hands a
+  # string that "looks like" rich text to Qt's rich-text engine. File names and
+  # parent paths are attacker-controlled (any local user can create a directory
+  # whose name is HTML), so an <img src="..."> in a directory name would make
+  # the overlay load and decode an attacker-chosen local file (PNG/JPG/SVG/
+  # PDF/...) during a search — a memory-exhaustion vector in the shared shell.
+  # Every Text that renders index-derived data must set textFormat: Text.PlainText.
+  if awk '
+    /Text[[:space:]]*\{/ { intext = 1; plain = 0; dyn = 0; next }
+    intext && /textFormat:[[:space:]]*Text\.PlainText/ { plain = 1 }
+    intext && /text:[[:space:]]*rowDelegate\./ { dyn = 1 }
+    intext && /^[[:space:]]*\}/ {
+      if (dyn && !plain) { printf "unsafe Text at line %d\n", NR; bad = 1 }
+      intext = 0
+    }
+    END { exit bad }
+  ' "$overlay_qml"; then
+    ok "overlay QML renders index-derived text as plain text"
+  else
+    fail "overlay QML renders index-derived text with AutoText (rich-text <img> load)"
+  fi
+  # Regression guard (2026-10-14): the overlay writes the query to a runtime
+  # file the bar watches. A predictable path under /tmp lets another local user
+  # pre-create it as a symlink (the overlay would overwrite the link target) or
+  # feed the bar arbitrary content. The mirror must be derived from
+  # $XDG_RUNTIME_DIR and disabled when it is unset — never fall back to /tmp.
+  bar_qml="$plugin_dir/shell/omavrything/SearchBar.qml"
+  if grep -q 'XDG_RUNTIME_DIR") || ""' "$overlay_qml" &&
+    grep -q 'XDG_RUNTIME_DIR") || ""' "$bar_qml" &&
+    ! grep -Eq 'queryFile:.*"/tmp"' "$overlay_qml" &&
+    ! grep -Eq 'queryFile:.*"/tmp"' "$bar_qml"; then
+    ok "query mirror uses a private per-user path (no /tmp fallback)"
+  else
+    fail "query mirror may fall back to a world-writable /tmp path"
+  fi
   expect_path "CLI symlink installed" "$target_home/.local/bin/omavry" present
 else
   printf 'skip - per-user plugin checks (no SUDO_USER)\n'

@@ -154,3 +154,13 @@ keystroke. The overlay writes the query to
 `$XDG_RUNTIME_DIR/omavrything-query`; the bar widget watches that file. This is a
 spike-level channel (the two components cannot share QML state directly) and can
 be replaced by a shared singleton or a daemon broadcast later.
+
+The mirror is a private per-user channel and is deliberately confined to
+`$XDG_RUNTIME_DIR` (mode 0700). It does **not** fall back to `/tmp`: a
+predictable path in a world-writable directory would let another local user
+pre-create the file as a symlink (the overlay would then overwrite the link
+target with the query) or feed the bar arbitrary content. When
+`XDG_RUNTIME_DIR` is unset — which a Wayland session never does — the mirror is
+disabled rather than made world-writable. (The daemon socket keeps its `/tmp`
+fallback to stay consistent with the daemon and CLI; that is a separate,
+cross-cutting concern.)
