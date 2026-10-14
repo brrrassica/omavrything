@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! magic:      [u8; 8]  = b"OMAVSNAP"
-//! version:    u32 LE
+//! version:    u32 LE   (see [`VERSION`] / [`format_version`])
 //! roots:      u32 count, then per root:
 //!               fs_kind:    u8
 //!               device:     u64
@@ -17,9 +17,15 @@
 //! checksum:   u64 LE (FNV-1a over everything before it)
 //! ```
 //!
-//! Writes are atomic (temp file + `rename`) and the previous snapshot is kept as
-//! `<path>.prev`, so a corrupt or truncated snapshot falls back to the last good
-//! one and ultimately to a fresh scan.
+//! The format is explicitly versioned: [`decode`] rejects any version other than
+//! [`VERSION`] rather than misreading a future or past layout. Writes are atomic
+//! (temp file + `rename`) and the previous snapshot is kept as `<path>.prev`, so
+//! a corrupt or truncated snapshot falls back to the last good one and
+//! ultimately to a fresh scan.
+//!
+//! A snapshot can be loaded either by reading the whole file into memory
+//! ([`load`]) or by memory-mapping it ([`load_mmap`], F6); the latter avoids the
+//! intermediate read buffer. [`warm_start_with`] selects between them.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -31,7 +37,14 @@ use crate::index::{FileRecord, FsKind, Index, Root};
 use crate::scan::{ScanConfig, ScanReport, resolve_roots, scan, scan_into_index};
 
 const MAGIC: &[u8; 8] = b"OMAVSNAP";
-const VERSION: u32 = 4;
+/// The current snapshot format version. Bump it whenever the on-disk layout
+/// changes; [`decode`] rejects any other version rather than misreading it.
+pub const VERSION: u32 = 4;
+
+/// The snapshot format version this build reads and writes.
+pub fn format_version() -> u32 {
+    VERSION
+}
 
 /// A snapshot error.
 #[derive(Debug)]
@@ -75,6 +88,17 @@ pub struct RootIdentity {
     pub device: u64,
     /// btrfs subvolume generation, or 0 when unavailable.
     pub generation: u64,
+}
+
+/// How a warm start loads the snapshot (F6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SnapshotLoad {
+    /// Read the whole file into memory, then decode.
+    #[default]
+    Read,
+    /// Memory-map the file and decode from the mapping, avoiding the
+    /// intermediate read buffer.
+    Mmap,
 }
 
 /// The outcome of a warm start.
@@ -339,14 +363,52 @@ fn load_one(path: &Path) -> Result<(Index, Vec<RootIdentity>), SnapshotError> {
     decode(&bytes)
 }
 
+/// Load a snapshot by memory-mapping the file (F6), falling back to `<path>.prev`
+/// and then to a plain read if the mapping is unavailable.
+///
+/// The mapping avoids the intermediate read buffer that [`load`] allocates; the
+/// decoded index still owns its records and path arena, so the mapping is
+/// released once decoding finishes.
+pub fn load_mmap(path: &Path) -> Result<(Index, Vec<RootIdentity>), SnapshotError> {
+    match mmap_one(path) {
+        Ok(loaded) => Ok(loaded),
+        Err(_) => match mmap_one(&with_suffix(path, ".prev")) {
+            Ok(loaded) => Ok(loaded),
+            Err(_) => load(path),
+        },
+    }
+}
+
+fn mmap_one(path: &Path) -> Result<(Index, Vec<RootIdentity>), SnapshotError> {
+    let file = File::open(path)?;
+    // SAFETY: snapshots are written atomically (a temp file is renamed into
+    // place), so a mapped file is never mutated in place; a concurrent writer
+    // publishes a new inode rather than editing the mapped one.
+    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    decode(&mmap)
+}
+
 /// Build an index, warm-starting from `snapshot_path` when possible.
 ///
 /// Roots whose identity or filesystem kind changed (or that are new) are
 /// rescanned; roots that are no longer configured are dropped.
 pub fn warm_start(config: &ScanConfig, snapshot_path: &Path) -> WarmStartResult {
+    warm_start_with(config, snapshot_path, SnapshotLoad::Read)
+}
+
+/// Like [`warm_start`], but selects how the snapshot is loaded (F6).
+pub fn warm_start_with(
+    config: &ScanConfig,
+    snapshot_path: &Path,
+    load_mode: SnapshotLoad,
+) -> WarmStartResult {
     let roots = resolve_roots(config);
 
-    let Ok((mut index, stored_ids)) = load(snapshot_path) else {
+    let loaded = match load_mode {
+        SnapshotLoad::Read => load(snapshot_path),
+        SnapshotLoad::Mmap => load_mmap(snapshot_path),
+    };
+    let Ok((mut index, stored_ids)) = loaded else {
         let (index, report) = scan(config);
         let identities = roots
             .iter()
@@ -860,6 +922,77 @@ mod tests {
                 .all(|r| r.path != missing.to_string_lossy())
         );
         assert_eq!(warm.identities.len(), warm.index.roots().len());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn format_version_is_reported() {
+        assert_eq!(format_version(), VERSION);
+    }
+
+    #[test]
+    fn mmap_load_round_trips() {
+        // F6: the mmap load path must decode the same index as the read path.
+        let dir = temp_dir("mmap");
+        let path = dir.join("index.snapshot");
+        let index = sample_index();
+        let ids = vec![RootIdentity {
+            device: 5,
+            generation: 2,
+        }];
+        save(&index, &ids, &path).unwrap();
+
+        let (back, back_ids) = load_mmap(&path).unwrap();
+        assert_eq!(back.len(), index.len());
+        assert_eq!(back_ids, ids);
+        assert_eq!(back.search("report", 10, 0).hits.len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mmap_load_falls_back_to_prev() {
+        let dir = temp_dir("mmap-prev");
+        let path = dir.join("index.snapshot");
+        let ids = vec![RootIdentity {
+            device: 1,
+            generation: 0,
+        }];
+        let mut index = Index::new();
+        index.add_root(Path::new("/"), FsKind::Other);
+        index.insert(Path::new("/a.txt"), false, 1, 0);
+        save(&index, &ids, &path).unwrap();
+        index.insert(Path::new("/b.txt"), false, 2, 0);
+        save(&index, &ids, &path).unwrap();
+
+        // Corrupt the primary; the mmap loader must fall back to `.prev`.
+        fs::write(&path, b"garbage").unwrap();
+        let (loaded, _) = load_mmap(&path).unwrap();
+        assert!(loaded.find(Path::new("/a.txt")).is_some());
+        assert!(loaded.find(Path::new("/b.txt")).is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn warm_start_with_mmap_matches_read() {
+        let dir = temp_dir("warm-mmap");
+        let data = dir.join("data");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("a.txt"), b"x").unwrap();
+        let snap = dir.join("index.snapshot");
+        let config = ScanConfig::with_roots(vec![data.clone()]);
+
+        let cold = warm_start(&config, &snap);
+        save(&cold.index, &cold.identities, &snap).unwrap();
+
+        let read = warm_start_with(&config, &snap, SnapshotLoad::Read);
+        let mmap = warm_start_with(&config, &snap, SnapshotLoad::Mmap);
+        assert_eq!(read.outcome, WarmStart::Snapshot);
+        assert_eq!(mmap.outcome, WarmStart::Snapshot);
+        assert_eq!(read.index.len(), mmap.index.len());
+        assert!(mmap.index.find(&data.join("a.txt")).is_some());
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -18,8 +18,10 @@
 
 use std::borrow::Cow;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::path::Path;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
@@ -30,6 +32,11 @@ use crate::query::{Query, Rank};
 /// Above this many records, the scan is parallelized with rayon. Below it, the
 /// thread-pool overhead outweighs the gain.
 const PARALLEL_THRESHOLD: usize = 50_000;
+
+/// The number of records each rayon task processes sequentially (F8). Chunking
+/// amortizes rayon's per-item scheduling overhead over a contiguous run, which
+/// keeps the hot matching loop cache-friendly.
+const PARALLEL_CHUNK: usize = 4096;
 
 /// `flags` bit: the record is a directory.
 pub const FLAG_DIR: u8 = 1 << 0;
@@ -107,10 +114,22 @@ pub struct Hit {
 }
 
 /// The outcome of a query: the ranked page of hits plus the total match count.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SearchOutcome {
     pub hits: Vec<Hit>,
     pub total: usize,
+}
+
+/// One entry for a bulk insert (F5). The path is borrowed from the caller's
+/// walk arena, so a batch insert allocates nothing per entry.
+#[derive(Debug, Clone, Copy)]
+pub struct BatchEntry<'a> {
+    /// The full path bytes.
+    pub path: &'a [u8],
+    pub is_dir: bool,
+    pub is_symlink: bool,
+    pub size: u64,
+    pub mtime: i64,
 }
 
 /// A per-query timing breakdown, for profiling.
@@ -183,6 +202,11 @@ impl PathIndex {
         }
     }
 
+    /// Preallocate the primary map for `n` entries (F5).
+    fn reserve(&mut self, n: usize) {
+        self.main.reserve(n);
+    }
+
     fn len(&self) -> usize {
         self.main.len() + self.collisions.len()
     }
@@ -209,13 +233,25 @@ impl PathIndex {
     /// The record index for `key`, or `None`. `records`/`paths` are the index's
     /// arenas, used to confirm the hash match.
     fn get(&self, key: &str, records: &[FileRecord], paths: &[u8]) -> Option<u32> {
-        let h = fnv1a32(key.as_bytes());
+        self.get_bytes(key.as_bytes(), records, paths)
+    }
+
+    /// Like [`PathIndex::get`], but takes the key as raw bytes so a bulk insert
+    /// that already holds the path in an arena avoids allocating a `String` per
+    /// lookup (F5).
+    fn get_bytes(&self, key: &[u8], records: &[FileRecord], paths: &[u8]) -> Option<u32> {
+        let h = fnv1a32(key);
         if let Some(&idx) = self.main.get(&h) {
-            if record_path_eq(&records[idx as usize], records, paths, key.as_bytes()) {
+            if record_path_eq(&records[idx as usize], records, paths, key) {
                 return Some(idx);
             }
         }
-        self.collisions.get(key).copied()
+        // Collisions are keyed by the full path; a byte key is valid UTF-8 in
+        // practice (paths come from `OsStr` bytes), so a lossy conversion is
+        // only reached for the rare colliding path.
+        std::str::from_utf8(key)
+            .ok()
+            .and_then(|s| self.collisions.get(s).copied())
     }
 
     /// Record `key` -> `idx`, keeping a colliding path in the fallback map.
@@ -289,6 +325,22 @@ fn mtime_to_u32(mtime: i64) -> u32 {
     mtime.clamp(0, u32::MAX as i64) as u32
 }
 
+/// The parent path bytes of `path`, or `None` for the filesystem root. Mirrors
+/// [`std::path::Path::parent`] for the absolute paths the scanner produces.
+fn parent_bytes(path: &[u8]) -> Option<&[u8]> {
+    // Ignore a trailing separator (except for the root "/").
+    let trimmed = if path.len() > 1 && path.ends_with(b"/") {
+        &path[..path.len() - 1]
+    } else {
+        path
+    };
+    if trimmed.len() <= 1 {
+        return None;
+    }
+    let pos = trimmed.iter().rposition(|&b| b == b'/')?;
+    Some(&trimmed[..pos.max(1)])
+}
+
 /// Whether a record's stored bytes are its full path (directories and
 /// parentless records) rather than a basename (files with a parent).
 fn stores_full_path(rec: &FileRecord) -> bool {
@@ -339,8 +391,50 @@ fn record_path_eq(rec: &FileRecord, records: &[FileRecord], paths: &[u8], key: &
     }
 }
 
+/// The maximum number of memoized query results (F7).
+const QUERY_CACHE_CAPACITY: usize = 64;
+
+/// A bounded, insertion-ordered memoization cache for repeated queries (F7).
+///
+/// Typing a query one character at a time re-issues every prefix, and a UI that
+/// re-renders re-issues the same query; both hit this cache. It is cleared on
+/// **any** index mutation, so a cached result can never outlive the records it
+/// was computed from.
+#[derive(Debug, Default)]
+struct QueryCache {
+    entries: HashMap<(String, usize, usize), SearchOutcome>,
+    order: VecDeque<(String, usize, usize)>,
+    /// The index generation these entries were computed from. A mismatch means
+    /// the index was mutated and the entries are stale.
+    generation: u64,
+}
+
+impl QueryCache {
+    fn get(&self, key: &(String, usize, usize)) -> Option<SearchOutcome> {
+        self.entries.get(key).cloned()
+    }
+
+    fn put(&mut self, key: (String, usize, usize), value: SearchOutcome) {
+        if self.entries.contains_key(&key) {
+            return;
+        }
+        if self.entries.len() >= QUERY_CACHE_CAPACITY {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.order.push_back(key.clone());
+        self.entries.insert(key, value);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+    }
+}
+
 /// The in-memory index.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct Index {
     records: Vec<FileRecord>,
     paths: Vec<u8>,
@@ -351,6 +445,30 @@ pub struct Index {
     /// arena, and token table). Rebuilt on compaction and snapshot load; kept
     /// current on insert and rename.
     candidate: CandidateIndex,
+    /// Memoized query results (F7). Interior mutability so `search` can populate
+    /// it through `&self`.
+    cache: Mutex<QueryCache>,
+    /// Bumped on every mutation. A cache entry is valid only while this matches
+    /// the generation it was computed at, so invalidation is a single atomic
+    /// store rather than a lock-and-clear on the hot insert path.
+    cache_generation: AtomicU64,
+}
+
+impl Clone for Index {
+    /// Clone the index data but **not** the query cache: a clone is a distinct
+    /// index, so a cached result computed from the original must not be reused.
+    fn clone(&self) -> Self {
+        Self {
+            records: self.records.clone(),
+            paths: self.paths.clone(),
+            roots: self.roots.clone(),
+            by_path: self.by_path.clone(),
+            live: self.live,
+            candidate: self.candidate.clone(),
+            cache: Mutex::new(QueryCache::default()),
+            cache_generation: AtomicU64::new(0),
+        }
+    }
 }
 
 /// A per-component breakdown of the index's memory, for diagnostics.
@@ -394,6 +512,7 @@ impl Index {
     /// Keep only the roots whose path is in `keep`.
     pub(crate) fn retain_roots(&mut self, keep: &HashSet<String>) {
         self.roots.retain(|r| keep.contains(&r.path));
+        self.invalidate_cache();
     }
 
     /// The raw records, for snapshot serialization.
@@ -436,6 +555,7 @@ impl Index {
         if !self.records.iter().any(|r| r.is_deleted()) {
             return;
         }
+        self.invalidate_cache();
 
         let mut remap = vec![u32::MAX; self.records.len()];
         let mut records = Vec::with_capacity(self.live);
@@ -511,6 +631,7 @@ impl Index {
     /// the doubling slack left by a fresh scan or a snapshot load. Call it once
     /// the index has settled (after the initial scan or a warm start).
     pub fn shrink(&mut self) {
+        self.invalidate_cache();
         self.records.shrink_to_fit();
         self.paths.shrink_to_fit();
         self.by_path.shrink_to_fit();
@@ -551,7 +672,106 @@ impl Index {
             by_path,
             live,
             candidate,
+            cache: Mutex::new(QueryCache::default()),
+            cache_generation: AtomicU64::new(0),
         }
+    }
+
+    /// Preallocate the record vector, path arena, path map, and candidate index
+    /// for a bulk insert of `records` records totalling `path_bytes` of path
+    /// bytes (F5). A no-op hint: correctness does not depend on it.
+    pub fn reserve(&mut self, records: usize, path_bytes: usize) {
+        self.records.reserve(records);
+        self.paths.reserve(path_bytes);
+        self.by_path.reserve(records);
+        self.candidate.reserve(records, path_bytes);
+    }
+
+    /// Insert many records at once, reusing scratch buffers and avoiding the
+    /// per-entry `String` allocations of [`Index::insert_with_flags`] (F5).
+    ///
+    /// `entries` must be sorted by path so a parent precedes its children (the
+    /// scanner's walk buffer already is). Entries whose path is already indexed
+    /// are skipped. Returns the number of records inserted.
+    pub fn insert_batch<'a, I>(&mut self, entries: I) -> usize
+    where
+        I: IntoIterator<Item = BatchEntry<'a>>,
+    {
+        let mut inserted = 0usize;
+        let mut lower: Vec<u8> = Vec::new();
+        for e in entries {
+            if self.find_bytes(e.path).is_some() {
+                continue;
+            }
+            let parent = parent_bytes(e.path)
+                .and_then(|p| self.find_bytes(p))
+                .unwrap_or(u32::MAX);
+            let depth = e
+                .path
+                .iter()
+                .filter(|&&b| b == b'/')
+                .count()
+                .min(u8::MAX as usize) as u8;
+
+            // Directories (and parentless records) store their full path; files
+            // with a parent store only their basename.
+            let stored: &[u8] = if e.is_dir || parent == u32::MAX {
+                e.path
+            } else {
+                let start = e.path.iter().rposition(|&b| b == b'/').map_or(0, |p| p + 1);
+                &e.path[start..]
+            };
+
+            let path_off = self.paths.len() as u32;
+            self.paths.extend_from_slice(stored);
+            let path_len = stored.len().min(u16::MAX as usize) as u16;
+
+            let mut flags = 0u8;
+            if e.is_dir {
+                flags |= FLAG_DIR;
+            }
+            if e.is_symlink {
+                flags |= FLAG_SYMLINK;
+            }
+
+            let idx = self.records.len() as u32;
+            self.records.push(FileRecord {
+                size: size_to_u32(e.size),
+                mtime: mtime_to_u32(e.mtime),
+                parent,
+                path_off,
+                path_len,
+                depth,
+                flags,
+            });
+            self.by_path
+                .insert_bytes(e.path, idx, &self.records, &self.paths);
+
+            // Index the full path, ASCII-lowercased, reusing one buffer.
+            lower.clear();
+            lower.extend_from_slice(e.path);
+            lower.make_ascii_lowercase();
+            // Records are appended in increasing index order, so the posting
+            // lists can be pushed to instead of binary-searched.
+            self.candidate.insert_append(idx, &lower);
+            self.live += 1;
+            inserted += 1;
+        }
+        if inserted > 0 {
+            self.invalidate_cache();
+        }
+        inserted
+    }
+
+    /// The record index for a path given as raw bytes, if present.
+    pub(crate) fn find_bytes(&self, key: &[u8]) -> Option<u32> {
+        self.by_path.get_bytes(key, &self.records, &self.paths)
+    }
+
+    /// Invalidate every memoized query result. Called on any mutation (F7); a
+    /// single atomic increment, so it does not slow the insert path.
+    fn invalidate_cache(&self) {
+        self.cache_generation.fetch_add(1, AtomicOrdering::Relaxed);
     }
 
     /// Iterate over live (non-deleted) records as `(record index, record)`.
@@ -581,6 +801,7 @@ impl Index {
                 fs_kind,
             }),
         }
+        self.invalidate_cache();
         idx
     }
 
@@ -649,6 +870,7 @@ impl Index {
         lower.make_ascii_lowercase();
         self.candidate.insert(idx, &lower);
         self.live += 1;
+        self.invalidate_cache();
         idx
     }
 
@@ -681,6 +903,7 @@ impl Index {
         let rec = &mut self.records[idx as usize];
         rec.size = size_to_u32(size);
         rec.mtime = mtime_to_u32(mtime);
+        self.invalidate_cache();
         true
     }
 
@@ -781,6 +1004,7 @@ impl Index {
             self.map_remove(String::from_utf8_lossy(&buf).as_ref());
         }
         self.live -= to_delete.len();
+        self.invalidate_cache();
         true
     }
 
@@ -876,21 +1100,52 @@ impl Index {
             lower.make_ascii_lowercase();
             self.candidate.insert(i, &lower);
         }
+        self.invalidate_cache();
         true
     }
 
     /// Search the index, returning the ranked page `[offset, offset + limit)`
     /// and the total number of matches.
     ///
-    /// An empty query matches nothing.
+    /// An empty query matches nothing. Repeated queries are served from a small
+    /// memoization cache (F7) that is invalidated by any index mutation.
     pub fn search(&self, query: &str, limit: usize, offset: usize) -> SearchOutcome {
-        self.search_profiled(query, limit, offset).0
+        let key = (query.to_string(), limit, offset);
+        let generation = self.cache_generation.load(AtomicOrdering::Relaxed);
+        {
+            let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            if cache.generation != generation {
+                cache.clear();
+                cache.generation = generation;
+            }
+            if let Some(hit) = cache.get(&key) {
+                return hit;
+            }
+        }
+        let (outcome, _) = self.search_uncached(query, limit, offset);
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        // Only memoize if the index was not mutated while we searched.
+        if cache.generation == generation {
+            cache.put(key, outcome.clone());
+        }
+        outcome
     }
 
     /// Like [`Index::search`], but also returns a [`SearchTiming`] breakdown of
     /// where the time went. Used by the profiling example and the daemon's
-    /// opt-in query profiler.
+    /// opt-in query profiler. Bypasses the memoization cache so the timing is
+    /// always a real measurement.
     pub fn search_profiled(
+        &self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> (SearchOutcome, SearchTiming) {
+        self.search_uncached(query, limit, offset)
+    }
+
+    /// The uncached search implementation.
+    fn search_uncached(
         &self,
         query: &str,
         limit: usize,
@@ -1013,17 +1268,21 @@ impl Index {
 
     fn scan_parallel(&self, q: &Query, want: usize) -> (usize, TopN) {
         self.records
-            .par_iter()
+            .par_chunks(PARALLEL_CHUNK)
             .enumerate()
             .fold(
                 || (0usize, TopN::new(want)),
-                |(count, mut top), (i, rec)| {
-                    if let Some(rank) = self.match_record(i as u32, rec, q) {
-                        top.push(i as u32, rank);
-                        (count + 1, top)
-                    } else {
-                        (count, top)
+                |(count, mut top), (chunk_i, chunk)| {
+                    let base = chunk_i * PARALLEL_CHUNK;
+                    let mut count = count;
+                    for (j, rec) in chunk.iter().enumerate() {
+                        let i = (base + j) as u32;
+                        if let Some(rank) = self.match_record(i, rec, q) {
+                            top.push(i, rank);
+                            count += 1;
+                        }
                     }
+                    (count, top)
                 },
             )
             .reduce(
@@ -1051,16 +1310,18 @@ impl Index {
     /// Parallel variant of [`Index::scan_candidates`].
     fn scan_candidates_parallel(&self, q: &Query, cands: &[u32], want: usize) -> (usize, TopN) {
         cands
-            .par_iter()
+            .par_chunks(PARALLEL_CHUNK)
             .fold(
                 || (0usize, TopN::new(want)),
-                |(count, mut top), &i| {
-                    if let Some(rank) = self.match_record(i, &self.records[i as usize], q) {
-                        top.push(i, rank);
-                        (count + 1, top)
-                    } else {
-                        (count, top)
+                |(count, mut top), chunk| {
+                    let mut count = count;
+                    for &i in chunk {
+                        if let Some(rank) = self.match_record(i, &self.records[i as usize], q) {
+                            top.push(i, rank);
+                            count += 1;
+                        }
                     }
+                    (count, top)
                 },
             )
             .reduce(
@@ -1186,10 +1447,32 @@ impl TopN {
     }
 
     /// Merge another collector's candidates into this one.
+    ///
+    /// When the union fits within the limit the heaps are simply concatenated
+    /// (an O(n) heapify); otherwise the best `limit` of the union are selected
+    /// in linear time, which is cheaper than pushing every element of `other`
+    /// (F8).
     fn merge(&mut self, other: TopN) {
-        for Reverse((rank, Reverse(idx))) in other.heap {
-            self.push(idx, rank);
+        if other.heap.is_empty() {
+            return;
         }
+        if self.heap.is_empty() {
+            *self = other;
+            return;
+        }
+        if self.heap.len() + other.heap.len() <= self.limit {
+            self.heap.extend(other.heap);
+            return;
+        }
+        let mut all: Vec<Reverse<(Rank, Reverse<u32>)>> =
+            self.heap.drain().chain(other.heap).collect();
+        if all.len() > self.limit {
+            // The smallest keys are the best (the heap is a min-heap of
+            // `Reverse`), so partition the best `limit` to the front.
+            all.select_nth_unstable(self.limit - 1);
+            all.truncate(self.limit);
+        }
+        self.heap = BinaryHeap::from(all);
     }
 
     /// Consume the collector, returning `(record index, rank)` best-first.
@@ -1677,5 +1960,191 @@ mod tests {
         assert_eq!(back.search("report", 10, 0).hits.len(), 1);
         assert_eq!(back.search("notes", 10, 0).hits.len(), 1);
         assert_eq!(back.search("zzz", 10, 0).hits.len(), 0);
+    }
+
+    fn rank_with_pos(first_pos: u32) -> Rank {
+        Rank {
+            name_match: true,
+            first_pos,
+            path_len: 10,
+            depth: 1,
+            mtime: 0,
+        }
+    }
+
+    #[test]
+    fn insert_batch_matches_individual_inserts() {
+        // F5: a batch insert must produce exactly the same index as inserting
+        // each record one at a time.
+        let paths: Vec<String> = (0..500)
+            .map(|i| format!("/data/dir{:03}/file-{i:04}.txt", i % 20))
+            .collect();
+
+        let mut batched = Index::new();
+        batched.add_root(Path::new("/"), FsKind::Other);
+        batched.reserve(paths.len(), paths.iter().map(|p| p.len()).sum());
+        let entries: Vec<BatchEntry> = paths
+            .iter()
+            .map(|p| BatchEntry {
+                path: p.as_bytes(),
+                is_dir: false,
+                is_symlink: false,
+                size: 1,
+                mtime: 0,
+            })
+            .collect();
+        assert_eq!(batched.insert_batch(entries), paths.len());
+
+        let mut one_by_one = Index::new();
+        one_by_one.add_root(Path::new("/"), FsKind::Other);
+        for p in &paths {
+            one_by_one.insert(Path::new(p), false, 1, 0);
+        }
+
+        assert_eq!(batched.len(), one_by_one.len());
+        for q in ["file-0001", "dir003", "file-0499", "zzz"] {
+            assert_eq!(
+                batched.search(q, 100, 0).hits,
+                one_by_one.search(q, 100, 0).hits,
+                "results differ for {q:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn insert_batch_skips_existing_paths() {
+        let mut index = Index::new();
+        index.insert(Path::new("/a.txt"), false, 1, 0);
+        let entries = [
+            BatchEntry {
+                path: b"/a.txt",
+                is_dir: false,
+                is_symlink: false,
+                size: 9,
+                mtime: 0,
+            },
+            BatchEntry {
+                path: b"/b.txt",
+                is_dir: false,
+                is_symlink: false,
+                size: 2,
+                mtime: 0,
+            },
+        ];
+        assert_eq!(index.insert_batch(entries), 1);
+        assert_eq!(index.len(), 2);
+        // The pre-existing record is untouched.
+        assert_eq!(index.search("a.txt", 10, 0).hits[0].size, 1);
+    }
+
+    #[test]
+    fn insert_batch_links_parents_from_sorted_paths() {
+        let mut index = Index::new();
+        index.add_root(Path::new("/"), FsKind::Other);
+        let entries = [
+            BatchEntry {
+                path: b"/home",
+                is_dir: true,
+                is_symlink: false,
+                size: 0,
+                mtime: 0,
+            },
+            BatchEntry {
+                path: b"/home/sam",
+                is_dir: true,
+                is_symlink: false,
+                size: 0,
+                mtime: 0,
+            },
+            BatchEntry {
+                path: b"/home/sam/a.txt",
+                is_dir: false,
+                is_symlink: false,
+                size: 1,
+                mtime: 0,
+            },
+        ];
+        assert_eq!(index.insert_batch(entries), 3);
+        let root = index.find(Path::new("/")).unwrap();
+        let home = index.find(Path::new("/home")).unwrap();
+        let sam = index.find(Path::new("/home/sam")).unwrap();
+        let a = index.find(Path::new("/home/sam/a.txt")).unwrap();
+        assert_eq!(index.record(home).parent, root);
+        assert_eq!(index.record(sam).parent, home);
+        assert_eq!(index.record(a).parent, sam);
+        assert_eq!(index.path(a), "/home/sam/a.txt");
+    }
+
+    #[test]
+    fn query_cache_returns_identical_results_and_invalidates_on_mutation() {
+        // F7: a repeated query is served from the cache, and any mutation
+        // invalidates it.
+        let mut index = Index::new();
+        index.insert(Path::new("/home/report-1.txt"), false, 1, 0);
+        let first = index.search("report", 10, 0);
+        let second = index.search("report", 10, 0);
+        assert_eq!(first.hits, second.hits);
+        assert_eq!(first.total, second.total);
+
+        // A new matching record must appear after the mutation clears the cache.
+        index.insert(Path::new("/home/report-2.txt"), false, 1, 0);
+        assert_eq!(index.search("report", 10, 0).total, 2);
+
+        // A removal is reflected too.
+        assert!(index.remove(Path::new("/home/report-1.txt")));
+        assert_eq!(index.search("report", 10, 0).total, 1);
+    }
+
+    #[test]
+    fn query_cache_is_bounded() {
+        let mut index = Index::new();
+        for i in 0..200 {
+            index.insert(Path::new(&format!("/f{i}.txt")), false, 1, 0);
+        }
+        for i in 0..200 {
+            let _ = index.search(&format!("f{i}"), 10, 0);
+        }
+        let cache = index.cache.lock().unwrap();
+        assert!(cache.entries.len() <= QUERY_CACHE_CAPACITY);
+    }
+
+    #[test]
+    fn chunked_parallel_scan_matches_sequential() {
+        // F8: the chunked rayon scan must return the same page as the
+        // sequential scan.
+        let mut index = Index::new();
+        let n = PARALLEL_THRESHOLD + 5_000;
+        for i in 0..n {
+            index.insert(
+                Path::new(&format!("/data/dir{:03}/file-{i:06}.txt", i % 100)),
+                false,
+                i as u64,
+                0,
+            );
+        }
+        let q = Query::parse("file-000123");
+        let want = 100;
+        let (seq_total, seq_top) = index.scan_sequential(&q, want);
+        let (par_total, par_top) = index.scan_parallel(&q, want);
+        assert_eq!(seq_total, par_total);
+        assert_eq!(seq_top.into_sorted(), par_top.into_sorted());
+    }
+
+    #[test]
+    fn topn_merge_keeps_the_best() {
+        let mut a = TopN::new(3);
+        let mut b = TopN::new(3);
+        for (i, pos) in [(0u32, 5u32), (1, 3), (2, 9)] {
+            a.push(i, rank_with_pos(pos));
+        }
+        for (i, pos) in [(3u32, 1u32), (4, 7), (5, 2)] {
+            b.push(i, rank_with_pos(pos));
+        }
+        a.merge(b);
+        let sorted = a.into_sorted();
+        assert_eq!(sorted.len(), 3);
+        // Best three by earliest position: pos 1 (idx 3), 2 (idx 5), 3 (idx 1).
+        let idxs: Vec<u32> = sorted.iter().map(|(i, _)| *i).collect();
+        assert_eq!(idxs, vec![3, 5, 1]);
     }
 }

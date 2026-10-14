@@ -88,6 +88,18 @@ impl CandidateIndex {
     /// record it is an existing index, and the new postings are inserted in
     /// sorted position.
     pub fn insert(&mut self, idx: u32, lower_path: &[u8]) {
+        self.insert_inner(idx, lower_path, false);
+    }
+
+    /// Append a record whose index is greater than every index already inserted
+    /// (a fresh, monotonically increasing bulk build). Posting lists are pushed
+    /// to rather than binary-searched, which is markedly faster for a cold scan
+    /// (F5). The caller must guarantee `idx` is strictly increasing.
+    pub fn insert_append(&mut self, idx: u32, lower_path: &[u8]) {
+        self.insert_inner(idx, lower_path, true);
+    }
+
+    fn insert_inner(&mut self, idx: u32, lower_path: &[u8], append: bool) {
         let off = self.lower.len() as u32;
         self.lower.extend_from_slice(lower_path);
 
@@ -108,7 +120,13 @@ impl CandidateIndex {
             for w in comp.windows(3) {
                 let tg = pack_trigram(w[0], w[1], w[2]);
                 let list = self.ngrams.entry(tg).or_default();
-                if let Err(pos) = list.binary_search(&idx) {
+                if append {
+                    // `idx` is the largest so far, so a push keeps the list
+                    // sorted; skip a repeat of the same trigram within this path.
+                    if list.last() != Some(&idx) {
+                        list.push(idx);
+                    }
+                } else if let Err(pos) = list.binary_search(&idx) {
                     list.insert(pos, idx);
                 }
             }
@@ -131,6 +149,19 @@ impl CandidateIndex {
         if self.pending.len() >= self.tokens.len().max(PENDING_MIN) {
             self.merge_pending();
         }
+    }
+
+    /// Preallocate the arenas, posting map, and token table for a bulk build of
+    /// `records` records totalling `path_bytes` of lowercased path bytes (F5).
+    pub fn reserve(&mut self, records: usize, path_bytes: usize) {
+        self.lower.reserve(path_bytes);
+        self.off.reserve(records);
+        self.len.reserve(records);
+        self.pending.reserve(records);
+        self.tokens.reserve(records);
+        // A rough upper bound on the number of distinct trigrams; capped so a
+        // huge index does not reserve the full 16 MiB trigram space up front.
+        self.ngrams.reserve(records.min(1 << 20));
     }
 
     fn push_token(&mut self, off: u32, len: u16, record: u32) {
@@ -416,5 +447,36 @@ mod tests {
         // No explicit finish_bulk: the pending buffer must still be searched.
         let cands = c.token_prefix_candidates(b"dir");
         assert_eq!(cands.len(), 10);
+    }
+
+    #[test]
+    fn insert_append_matches_insert() {
+        // F5: the bulk-append path must build the same candidate index as the
+        // general insert path.
+        let paths = [
+            "/home/sam/report-2024.pdf",
+            "/home/sam/notes.md",
+            "/etc/config.toml",
+            "/home/sam/report-2025.pdf",
+            "/home/sam/aaaa.txt",
+        ];
+        let mut appended = CandidateIndex::new();
+        let mut inserted = CandidateIndex::new();
+        for (i, p) in paths.iter().enumerate() {
+            let mut lower = p.as_bytes().to_vec();
+            lower.make_ascii_lowercase();
+            appended.insert_append(i as u32, &lower);
+            inserted.insert(i as u32, &lower);
+        }
+        appended.finish_bulk();
+        inserted.finish_bulk();
+        for q in ["report", "config", "sam", "aaaa", "zzz"] {
+            let query = Query::parse(q);
+            assert_eq!(
+                appended.candidates(&query),
+                inserted.candidates(&query),
+                "candidates differ for {q:?}"
+            );
+        }
     }
 }

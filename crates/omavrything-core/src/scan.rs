@@ -12,14 +12,13 @@ use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::UNIX_EPOCH;
 
 use rayon::prelude::*;
 
 use crate::glob::GlobSet;
-use crate::index::{FsKind, Index};
+use crate::index::{BatchEntry, FsKind, Index};
 use crate::mounts::{self, Mount};
 
 /// Scanner configuration.
@@ -120,11 +119,15 @@ impl WalkBuffer {
         });
     }
 
+    /// The path bytes of an entry, borrowed from the arena.
+    fn path_bytes(&self, e: &CompactEntry) -> &[u8] {
+        let start = e.path_off as usize;
+        &self.arena[start..start + e.path_len as usize]
+    }
+
     /// The path of an entry, borrowed from the arena.
     fn path(&self, e: &CompactEntry) -> &Path {
-        let start = e.path_off as usize;
-        let bytes = &self.arena[start..start + e.path_len as usize];
-        Path::new(OsStr::from_bytes(bytes))
+        Path::new(OsStr::from_bytes(self.path_bytes(e)))
     }
 
     /// Sort entries by path, so parents precede their children.
@@ -176,36 +179,36 @@ pub fn scan_into_index(index: &mut Index, config: &ScanConfig) -> ScanReport {
         report.roots += 1;
     }
 
-    // Walk every root in parallel, collecting entries into one buffer.
-    let collected: Mutex<WalkBuffer> = Mutex::new(WalkBuffer::default());
+    // Walk every root in parallel, each subtree producing one buffer that is
+    // merged exactly once (F5), then insert the whole batch at once.
     let errors = AtomicUsize::new(0);
-    roots.par_iter().for_each(|(root, _)| {
-        let root_dev = fs::metadata(root).map(|m| m.dev()).ok();
-        walk(
-            root,
-            root_dev,
-            &excludes,
-            config.metadata,
-            &collected,
-            &errors,
-        );
-    });
+    let mut buffer = roots
+        .par_iter()
+        .map(|(root, _)| {
+            let root_dev = fs::metadata(root).map(|m| m.dev()).ok();
+            walk(root, root_dev, &excludes, config.metadata, &errors)
+        })
+        .reduce(WalkBuffer::default, |mut a, b| {
+            a.merge(b);
+            a
+        });
     report.errors = errors.load(Ordering::Relaxed);
-    let mut buffer = collected.into_inner().unwrap_or_default();
 
     // A parent path is always a strict prefix of its children, so sorting by
     // path guarantees parents are inserted before children.
     buffer.sort();
 
-    for e in &buffer.entries {
-        let path = buffer.path(e);
-        if index.find(path).is_some() {
-            report.skipped += 1;
-            continue;
-        }
-        index.insert_with_flags(path, e.is_dir, e.is_symlink, e.size, e.mtime);
-        report.entries += 1;
-    }
+    index.reserve(buffer.entries.len(), buffer.arena.len());
+    let total = buffer.entries.len();
+    let inserted = index.insert_batch(buffer.entries.iter().map(|e| BatchEntry {
+        path: buffer.path_bytes(e),
+        is_dir: e.is_dir,
+        is_symlink: e.is_symlink,
+        size: e.size,
+        mtime: e.mtime,
+    }));
+    report.entries += inserted;
+    report.skipped += total - inserted;
 
     report
 }
@@ -215,26 +218,18 @@ pub fn scan_into_index(index: &mut Index, config: &ScanConfig) -> ScanReport {
 pub fn scan_subtree(index: &mut Index, root: &Path, config: &ScanConfig) {
     let excludes = GlobSet::new(&config.excludes);
     let root_dev = fs::metadata(root).map(|m| m.dev()).ok();
-    let collected: Mutex<WalkBuffer> = Mutex::new(WalkBuffer::default());
     let errors = AtomicUsize::new(0);
-    walk(
-        root,
-        root_dev,
-        &excludes,
-        config.metadata,
-        &collected,
-        &errors,
-    );
+    let mut buffer = walk(root, root_dev, &excludes, config.metadata, &errors);
 
-    let mut buffer = collected.into_inner().unwrap_or_default();
     buffer.sort();
-    for e in &buffer.entries {
-        let path = buffer.path(e);
-        if index.find(path).is_some() {
-            continue;
-        }
-        index.insert_with_flags(path, e.is_dir, e.is_symlink, e.size, e.mtime);
-    }
+    index.reserve(buffer.entries.len(), buffer.arena.len());
+    index.insert_batch(buffer.entries.iter().map(|e| BatchEntry {
+        path: buffer.path_bytes(e),
+        is_dir: e.is_dir,
+        is_symlink: e.is_symlink,
+        size: e.size,
+        mtime: e.mtime,
+    }));
 }
 
 /// A prepared rescan: the entries discovered by walking the roots, the roots
@@ -256,20 +251,17 @@ pub struct RescanPlan {
 pub fn plan_rescan(config: &ScanConfig) -> RescanPlan {
     let excludes = GlobSet::new(&config.excludes);
     let roots = resolve_roots(config);
-    let collected: Mutex<WalkBuffer> = Mutex::new(WalkBuffer::default());
     let errors = AtomicUsize::new(0);
-    roots.par_iter().for_each(|(root, _)| {
-        let root_dev = fs::metadata(root).map(|m| m.dev()).ok();
-        walk(
-            root,
-            root_dev,
-            &excludes,
-            config.metadata,
-            &collected,
-            &errors,
-        );
-    });
-    let mut entries = collected.into_inner().unwrap_or_default();
+    let mut entries = roots
+        .par_iter()
+        .map(|(root, _)| {
+            let root_dev = fs::metadata(root).map(|m| m.dev()).ok();
+            walk(root, root_dev, &excludes, config.metadata, &errors)
+        })
+        .reduce(WalkBuffer::default, |mut a, b| {
+            a.merge(b);
+            a
+        });
     entries.sort();
     RescanPlan {
         entries,
@@ -397,9 +389,8 @@ fn walk(
     root_dev: Option<u64>,
     excludes: &GlobSet,
     collect_metadata: bool,
-    out: &Mutex<WalkBuffer>,
     errors: &AtomicUsize,
-) {
+) -> WalkBuffer {
     let mut subdirs: Vec<PathBuf> = Vec::new();
     let mut batch = WalkBuffer::default();
 
@@ -459,13 +450,17 @@ fn walk(
         errors.fetch_add(1, Ordering::Relaxed);
     }
 
-    if !batch.entries.is_empty() {
-        out.lock().unwrap().merge(batch);
-    }
-
-    subdirs
+    // Recurse in parallel and merge each subtree's buffer exactly once, so the
+    // walk never contends on a shared lock (F5).
+    let children = subdirs
         .into_par_iter()
-        .for_each(|d| walk(&d, root_dev, excludes, collect_metadata, out, errors));
+        .map(|d| walk(&d, root_dev, excludes, collect_metadata, errors))
+        .reduce(WalkBuffer::default, |mut a, b| {
+            a.merge(b);
+            a
+        });
+    batch.merge(children);
+    batch
 }
 
 #[cfg(test)]

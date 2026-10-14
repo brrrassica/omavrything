@@ -180,8 +180,9 @@ pub fn find_ascii_ci(hay: &[u8], needle: &[u8]) -> Option<usize> {
 
 /// Plain byte-substring search over an already-lowercased haystack.
 ///
-/// Uses `memchr` to skip to candidate positions, then verifies with a direct
-/// slice comparison. Allocates nothing.
+/// Uses `memchr::memmem`, whose substring search is SIMD-accelerated (F8), so
+/// the hot matching loop over the lowercased path arena runs at memory speed.
+/// Allocates nothing.
 pub fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() {
         return Some(0);
@@ -189,21 +190,7 @@ pub fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.len() > hay.len() {
         return None;
     }
-
-    let first = needle[0];
-    let mut start = 0;
-    while start + needle.len() <= hay.len() {
-        let pos = memchr::memchr(first, &hay[start..])?;
-        let idx = start + pos;
-        if idx + needle.len() > hay.len() {
-            return None;
-        }
-        if &hay[idx..idx + needle.len()] == needle {
-            return Some(idx);
-        }
-        start = idx + 1;
-    }
-    None
+    memchr::memmem::find(hay, needle)
 }
 
 /// A match score. `Ord` orders **better** matches as **greater**, so a
@@ -271,6 +258,17 @@ mod tests {
         // The only 'a' is at the very end, where the needle cannot fit.
         assert_eq!(find_ascii_ci(b"xxxxa", b"ab"), None);
         assert_eq!(find_ascii_ci(b"xxxxab", b"ab"), Some(4));
+    }
+
+    #[test]
+    fn find_bytes_locates_substrings() {
+        // F8: the SIMD (memmem) substring search must be correct.
+        assert_eq!(find_bytes(b"/home/sam/report.pdf", b"report"), Some(10));
+        assert_eq!(find_bytes(b"abc", b"abc"), Some(0));
+        assert_eq!(find_bytes(b"abc", b"abcd"), None);
+        assert_eq!(find_bytes(b"abc", b""), Some(0));
+        assert_eq!(find_bytes(b"abcabc", b"cab"), Some(2));
+        assert_eq!(find_bytes(b"abc", b"zzz"), None);
     }
 
     #[test]

@@ -76,7 +76,9 @@ fn main() {
 
     let (mut index, report, identities, outcome) = match &args.snapshot {
         Some(path) => {
-            let warm = snapshot::warm_start(&scan_config, path);
+            // Load the snapshot through an mmap (F6): it avoids the intermediate
+            // read buffer, and falls back to a plain read if mapping fails.
+            let warm = snapshot::warm_start_with(&scan_config, path, snapshot::SnapshotLoad::Mmap);
             (warm.index, warm.report, warm.identities, Some(warm.outcome))
         }
         None => {
