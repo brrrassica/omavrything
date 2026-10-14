@@ -84,6 +84,7 @@ struct Index {
     names: Vec<u8>,             // UTF-8 name arena
     paths: Vec<u8>,             // UTF-8 full-path arena
     roots: Vec<Root>,           // indexed mount points
+    candidate: CandidateIndex,  // derived: trigram postings, lowercased arena, token table
 }
 ```
 
@@ -102,7 +103,8 @@ struct Index {
 ```mermaid
 flowchart TD
     Q[Query string] --> SPLIT[Split on spaces into AND terms]
-    SPLIT --> SCAN[Linear scan of path arena]
+    SPLIT --> NARROW[Candidate narrowing: trigram postings + token table]
+    NARROW --> SCAN[Scan candidates in the lowercased path arena]
     SCAN --> MATCH{All terms are substrings}
     MATCH -- no --> SKIP[Skip record]
     MATCH -- yes --> RANK[Score and collect]
@@ -112,14 +114,27 @@ flowchart TD
 
 - **Semantics (v0.1):** case-insensitive substring over the full path; multiple
   space-separated terms are ANDed.
+- **Candidate narrowing (M23 F1–F3):** a derived `CandidateIndex` narrows the scan
+  before matching. A trigram index over path components intersects posting lists
+  for each ASCII term of at least three bytes that contains no `/`; a sorted token
+  table answers single-token prefix queries by binary search. The candidate set is
+  always a **superset** of the matches, so verifying each candidate with the exact
+  matcher yields results identical to a linear scan. Terms that are shorter,
+  non-ASCII, or contain `/` contribute no constraint, and a query with no
+  narrowing term falls back to the full scan.
+- **Cache-friendly matching (M23 F2):** each record's full path is stored
+  ASCII-lowercased in a contiguous arena, so the hot loop reads one arena instead
+  of chasing the record vector and the parent link.
 - **Matching:** `memchr`/SIMD substring search per term; the first term filters,
   subsequent terms refine.
 - **Ranking:** earlier match position, name match over path-only match, shorter
   path, shallower depth, and recency (mtime) as tie-breakers.
 - **Result cap:** the UI requests a bounded top-N (default 100); the daemon never
   materializes the full result set for the UI.
-- **Deferred:** regex/glob, whole-word, content search, and a trigram/suffix
-  index for very large indexes.
+- **Maintenance (M23 F4):** the candidate index is append-only, mirroring the
+  record tombstones: inserts and renames append postings and tokens, and stale
+  entries are filtered at match time. Compaction and snapshot load rebuild it.
+- **Deferred:** regex/glob, whole-word, and content search.
 
 ## 5. Scanner (Linux filesystems)
 

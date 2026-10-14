@@ -38,6 +38,9 @@ fn build_index(n: usize) -> Index {
             1_700_000_000 + i as i64,
         );
     }
+    // Settle the index the way the daemon does after its initial scan: merge the
+    // candidate index's pending tokens and release the doubling slack.
+    index.shrink();
     index
 }
 
@@ -50,7 +53,7 @@ fn profile_query(index: &Index, query: &str, limit: usize) {
     let (outcome, timing) = index.search_profiled(query, limit, 0);
     println!(
         "  {:<16} {:>8.2} ms  (scan {:>7.2}  sort {:>6.2}  mat {:>6.2})  \
-         hits={:<4} total={:<8} {}",
+         hits={:<4} total={:<8} scanned={:<8} {}",
         format!("{query:?}"),
         timing.total.as_secs_f64() * 1e3,
         timing.scan.as_secs_f64() * 1e3,
@@ -58,6 +61,7 @@ fn profile_query(index: &Index, query: &str, limit: usize) {
         timing.materialize.as_secs_f64() * 1e3,
         outcome.hits.len(),
         outcome.total,
+        timing.scanned,
         if timing.parallel {
             "parallel"
         } else {

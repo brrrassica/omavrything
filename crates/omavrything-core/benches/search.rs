@@ -24,6 +24,8 @@ fn build_index(n: usize) -> Index {
             1_700_000_000 + i as i64,
         );
     }
+    // Settle the index the way the daemon does after its initial scan.
+    index.shrink();
     index
 }
 

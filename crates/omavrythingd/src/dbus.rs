@@ -78,6 +78,7 @@ impl Manager {
         map.insert("paths_cap".into(), b.paths_cap.to_string());
         map.insert("map_len".into(), b.map_len.to_string());
         map.insert("map_cap_bytes".into(), b.map_cap_bytes.to_string());
+        map.insert("candidate_bytes".into(), b.candidate_bytes.to_string());
         map.insert("scanning".into(), self.config.scanning().to_string());
         map.insert(
             "uptime_secs".into(),

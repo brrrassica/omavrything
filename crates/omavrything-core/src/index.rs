@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 
+use crate::candidate::CandidateIndex;
 use crate::query::{Query, Rank};
 
 /// Above this many records, the scan is parallelized with rayon. Below it, the
@@ -346,6 +347,10 @@ pub struct Index {
     roots: Vec<Root>,
     by_path: PathIndex,
     live: usize,
+    /// Derived candidate-narrowing index (trigram postings, lowercased path
+    /// arena, and token table). Rebuilt on compaction and snapshot load; kept
+    /// current on insert and rename.
+    candidate: CandidateIndex,
 }
 
 /// A per-component breakdown of the index's memory, for diagnostics.
@@ -363,6 +368,9 @@ pub struct MemoryBreakdown {
     pub map_len: usize,
     /// Path map estimated bytes.
     pub map_cap_bytes: usize,
+    /// Candidate-index estimated bytes (trigram postings, lowercased arena, and
+    /// token table).
+    pub candidate_bytes: u64,
 }
 
 impl Index {
@@ -405,7 +413,7 @@ impl Index {
         let arenas = self.paths.len();
         let map =
             self.by_path.len() * (std::mem::size_of::<u32>() + std::mem::size_of::<u32>() + 1);
-        (records + arenas + map) as u64
+        (records + arenas + map) as u64 + self.candidate.memory_bytes()
     }
 
     /// A per-component breakdown of the index's memory, for diagnostics.
@@ -417,6 +425,7 @@ impl Index {
             paths_cap: self.paths.capacity(),
             map_len: self.by_path.len(),
             map_cap_bytes: self.by_path.capacity_bytes(),
+            candidate_bytes: self.candidate.memory_bytes(),
         }
     }
 
@@ -467,11 +476,33 @@ impl Index {
             self.by_path
                 .insert_bytes(&buf, i as u32, &self.records, &self.paths);
         }
+        // Record indices changed, so the derived candidate index must be rebuilt
+        // from scratch; this also reclaims the stale postings and tokens left by
+        // removed and renamed records.
+        self.rebuild_candidate();
         // The arena was pre-sized to its pre-compaction length, which still
         // includes the tombstones just dropped; release the excess capacity.
         self.records.shrink_to_fit();
         self.paths.shrink_to_fit();
         self.by_path.shrink_to_fit();
+    }
+
+    /// Rebuild the candidate index from the current records, dropping stale
+    /// postings and tokens. Used after compaction and snapshot load.
+    fn rebuild_candidate(&mut self) {
+        let mut candidate = CandidateIndex::new();
+        let mut buf: Vec<u8> = Vec::new();
+        for (i, rec) in self.records.iter().enumerate() {
+            if rec.is_deleted() {
+                continue;
+            }
+            buf.clear();
+            write_full_path_bytes(rec, &self.records, &self.paths, &mut buf);
+            buf.make_ascii_lowercase();
+            candidate.insert(i as u32, &buf);
+        }
+        candidate.finish_bulk();
+        self.candidate = candidate;
     }
 
     /// Release excess capacity in the record vector, path arena, and path map.
@@ -483,6 +514,10 @@ impl Index {
         self.records.shrink_to_fit();
         self.paths.shrink_to_fit();
         self.by_path.shrink_to_fit();
+        // Merge any pending tokens before releasing capacity, so the token table
+        // is fully sorted and the pending buffer does not hold a second copy.
+        self.candidate.finish_bulk();
+        self.candidate.shrink();
     }
 
     /// The path arena, for snapshot serialization.
@@ -494,6 +529,7 @@ impl Index {
     /// live count. Used by the snapshot loader.
     pub(crate) fn from_parts(records: Vec<FileRecord>, paths: Vec<u8>, roots: Vec<Root>) -> Self {
         let mut by_path = PathIndex::with_capacity(records.len());
+        let mut candidate = CandidateIndex::new();
         let mut live = 0usize;
         let mut buf: Vec<u8> = Vec::new();
         for (i, rec) in records.iter().enumerate() {
@@ -504,13 +540,17 @@ impl Index {
             buf.clear();
             write_full_path_bytes(rec, &records, &paths, &mut buf);
             by_path.insert_bytes(&buf, i as u32, &records, &paths);
+            buf.make_ascii_lowercase();
+            candidate.insert(i as u32, &buf);
         }
+        candidate.finish_bulk();
         Self {
             records,
             paths,
             roots,
             by_path,
             live,
+            candidate,
         }
     }
 
@@ -603,6 +643,11 @@ impl Index {
             flags,
         });
         self.map_insert(path_str.as_ref(), idx);
+        // Index the full path (not the stored basename) so a term can match the
+        // parent components too. The candidate index stores it ASCII-lowercased.
+        let mut lower = path_str.as_bytes().to_vec();
+        lower.make_ascii_lowercase();
+        self.candidate.insert(idx, &lower);
         self.live += 1;
         idx
     }
@@ -822,6 +867,14 @@ impl Index {
             if is_exact {
                 self.records[i as usize].parent = new_parent;
             }
+
+            // The candidate index stores the full path, which changed for every
+            // affected record (including files, whose basename is unchanged but
+            // whose parent path moved). Append the new lowercased path; the old
+            // postings are filtered out at match time and reclaimed on compaction.
+            let mut lower = new_path.as_bytes().to_vec();
+            lower.make_ascii_lowercase();
+            self.candidate.insert(i, &lower);
         }
         true
     }
@@ -862,13 +915,31 @@ impl Index {
         }
 
         let want = offset.saturating_add(limit);
-        let parallel = self.records.len() >= PARALLEL_THRESHOLD;
 
         let scan_started = Instant::now();
-        let (total, top) = if parallel {
-            self.scan_parallel(&q, want)
-        } else {
-            self.scan_sequential(&q, want)
+        // Narrow the scan to a candidate set when the query allows it. The
+        // candidate set is always a superset of the matches, so verifying each
+        // candidate with `match_record` yields the same results as a full scan.
+        let candidates = self.candidate.candidates(&q);
+        let (total, top, scanned, parallel) = match candidates {
+            Some(cands) => {
+                let parallel = cands.len() >= PARALLEL_THRESHOLD;
+                let (total, top) = if parallel {
+                    self.scan_candidates_parallel(&q, &cands, want)
+                } else {
+                    self.scan_candidates(&q, &cands, want)
+                };
+                (total, top, cands.len(), parallel)
+            }
+            None => {
+                let parallel = self.records.len() >= PARALLEL_THRESHOLD;
+                let (total, top) = if parallel {
+                    self.scan_parallel(&q, want)
+                } else {
+                    self.scan_sequential(&q, want)
+                };
+                (total, top, self.records.len(), parallel)
+            }
         };
         let scan = scan_started.elapsed();
 
@@ -893,7 +964,7 @@ impl Index {
                 sort,
                 materialize,
                 total: started.elapsed(),
-                scanned: self.records.len(),
+                scanned,
                 matched: total,
                 parallel,
             },
@@ -901,7 +972,122 @@ impl Index {
     }
 
     /// Score one record against the query, or `None` if it does not match.
-    fn match_record(&self, rec: &FileRecord, q: &Query) -> Option<Rank> {
+    ///
+    /// Matching runs over the candidate index's contiguous, ASCII-lowercased
+    /// path arena (F2), so the hot loop touches far less memory than chasing the
+    /// record vector and the parent link. The result is identical to matching
+    /// the original-case path: ASCII-lowercasing is byte-preserving, and a
+    /// non-ASCII term falls back to the Unicode-aware comparison.
+    fn match_record(&self, idx: u32, rec: &FileRecord, q: &Query) -> Option<Rank> {
+        if rec.is_deleted() {
+            return None;
+        }
+        let lower = self.candidate.lower_path(idx);
+        let mut first_pos = u32::MAX;
+        for term in q.terms() {
+            let pos = term.find_lower(lower)?;
+            first_pos = first_pos.min(pos as u32);
+        }
+        let name = self.candidate.lower_name(idx);
+        let name_match = q.terms().iter().all(|t| t.find_lower(name).is_some());
+        Some(Rank {
+            name_match,
+            first_pos,
+            path_len: lower.len() as u32,
+            depth: rec.depth as u16,
+            mtime: rec.mtime as i64,
+        })
+    }
+
+    fn scan_sequential(&self, q: &Query, want: usize) -> (usize, TopN) {
+        let mut top = TopN::new(want);
+        let mut total = 0usize;
+        for (i, rec) in self.records.iter().enumerate() {
+            if let Some(rank) = self.match_record(i as u32, rec, q) {
+                total += 1;
+                top.push(i as u32, rank);
+            }
+        }
+        (total, top)
+    }
+
+    fn scan_parallel(&self, q: &Query, want: usize) -> (usize, TopN) {
+        self.records
+            .par_iter()
+            .enumerate()
+            .fold(
+                || (0usize, TopN::new(want)),
+                |(count, mut top), (i, rec)| {
+                    if let Some(rank) = self.match_record(i as u32, rec, q) {
+                        top.push(i as u32, rank);
+                        (count + 1, top)
+                    } else {
+                        (count, top)
+                    }
+                },
+            )
+            .reduce(
+                || (0usize, TopN::new(want)),
+                |(c1, mut t1), (c2, t2)| {
+                    t1.merge(t2);
+                    (c1 + c2, t1)
+                },
+            )
+    }
+
+    /// Scan only the candidate records, verifying each with the exact matcher.
+    fn scan_candidates(&self, q: &Query, cands: &[u32], want: usize) -> (usize, TopN) {
+        let mut top = TopN::new(want);
+        let mut total = 0usize;
+        for &i in cands {
+            if let Some(rank) = self.match_record(i, &self.records[i as usize], q) {
+                total += 1;
+                top.push(i, rank);
+            }
+        }
+        (total, top)
+    }
+
+    /// Parallel variant of [`Index::scan_candidates`].
+    fn scan_candidates_parallel(&self, q: &Query, cands: &[u32], want: usize) -> (usize, TopN) {
+        cands
+            .par_iter()
+            .fold(
+                || (0usize, TopN::new(want)),
+                |(count, mut top), &i| {
+                    if let Some(rank) = self.match_record(i, &self.records[i as usize], q) {
+                        top.push(i, rank);
+                        (count + 1, top)
+                    } else {
+                        (count, top)
+                    }
+                },
+            )
+            .reduce(
+                || (0usize, TopN::new(want)),
+                |(c1, mut t1), (c2, t2)| {
+                    t1.merge(t2);
+                    (c1 + c2, t1)
+                },
+            )
+    }
+
+    fn hit(&self, idx: u32) -> Hit {
+        let rec = &self.records[idx as usize];
+        Hit {
+            path: self.path(idx).into_owned(),
+            name: self.name(idx).to_string(),
+            size: rec.size as u64,
+            mtime: rec.mtime as i64,
+            is_dir: rec.is_dir(),
+        }
+    }
+
+    /// The pre-M23 matcher, kept as a test-only reference so the candidate index
+    /// (F1) and the lowercased arena (F2) can be proven to preserve results
+    /// exactly. It matches the original-case path via the parent/name split.
+    #[cfg(test)]
+    fn match_record_original(&self, rec: &FileRecord, q: &Query) -> Option<Rank> {
         if rec.is_deleted() {
             return None;
         }
@@ -939,51 +1125,30 @@ impl Index {
         })
     }
 
-    fn scan_sequential(&self, q: &Query, want: usize) -> (usize, TopN) {
+    /// A full linear scan using the pre-M23 matcher, for equivalence tests.
+    #[cfg(test)]
+    fn search_linear(&self, query: &str, limit: usize, offset: usize) -> SearchOutcome {
+        let q = Query::parse(query);
+        if q.is_empty() || limit == 0 {
+            return SearchOutcome::default();
+        }
+        let want = offset.saturating_add(limit);
         let mut top = TopN::new(want);
         let mut total = 0usize;
         for (i, rec) in self.records.iter().enumerate() {
-            if let Some(rank) = self.match_record(rec, q) {
+            if let Some(rank) = self.match_record_original(rec, &q) {
                 total += 1;
                 top.push(i as u32, rank);
             }
         }
-        (total, top)
-    }
-
-    fn scan_parallel(&self, q: &Query, want: usize) -> (usize, TopN) {
-        self.records
-            .par_iter()
-            .enumerate()
-            .fold(
-                || (0usize, TopN::new(want)),
-                |(count, mut top), (i, rec)| {
-                    if let Some(rank) = self.match_record(rec, q) {
-                        top.push(i as u32, rank);
-                        (count + 1, top)
-                    } else {
-                        (count, top)
-                    }
-                },
-            )
-            .reduce(
-                || (0usize, TopN::new(want)),
-                |(c1, mut t1), (c2, t2)| {
-                    t1.merge(t2);
-                    (c1 + c2, t1)
-                },
-            )
-    }
-
-    fn hit(&self, idx: u32) -> Hit {
-        let rec = &self.records[idx as usize];
-        Hit {
-            path: self.path(idx).into_owned(),
-            name: self.name(idx).to_string(),
-            size: rec.size as u64,
-            mtime: rec.mtime as i64,
-            is_dir: rec.is_dir(),
-        }
+        let hits = top
+            .into_sorted()
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|(i, _)| self.hit(i))
+            .collect();
+        SearchOutcome { hits, total }
     }
 }
 
@@ -1385,5 +1550,132 @@ mod tests {
         assert!(outcome.hits.is_empty());
         assert_eq!(outcome.total, 0);
         assert_eq!(timing.matched, 0);
+    }
+
+    #[test]
+    fn candidate_narrowing_matches_the_linear_scan() {
+        // F1/F2 acceptance: the candidate index and the lowercased arena must
+        // return exactly the same results as the pre-M23 linear scan.
+        let mut index = Index::new();
+        index.add_root(Path::new("/"), FsKind::Other);
+        for p in [
+            "/home/sam/Documents/report-2024.pdf",
+            "/home/sam/Documents/notes.md",
+            "/home/sam/Pictures/holiday.jpg",
+            "/etc/config.toml",
+            "/var/log/syslog",
+            "/usr/share/doc/README",
+            "/home/bob/report.txt",
+            "/tmp/Report.TXT",
+            "/opt/app/config.yaml",
+            "/home/sam/.config/app/settings.json",
+            "/tmp/Ünïcode.txt",
+        ] {
+            index.insert(Path::new(p), false, 1, 0);
+        }
+
+        // Selective, broad, short, slash-containing, multi-term, non-ASCII, and
+        // no-match queries.
+        for q in [
+            "report",
+            "config",
+            "re",
+            "sam/report",
+            "documents report",
+            "zzz-no-such-file",
+            "REPORT",
+            "readme",
+            "app",
+            "settings.json",
+            "ünïcode",
+            "documents pictures",
+        ] {
+            let narrowed = index.search(q, 100, 0);
+            let linear = index.search_linear(q, 100, 0);
+            assert_eq!(narrowed.total, linear.total, "total differs for {q:?}");
+            assert_eq!(narrowed.hits, linear.hits, "hits differ for {q:?}");
+        }
+    }
+
+    #[test]
+    fn selective_query_scans_a_small_fraction() {
+        // F1 acceptance: a selective query on a large index scans only a small
+        // fraction of the records.
+        let mut index = Index::new();
+        let n = 20_000;
+        for i in 0..n {
+            index.insert(
+                Path::new(&format!("/data/dir{:04}/file-{i:06}.txt", i % 500)),
+                false,
+                1,
+                0,
+            );
+        }
+        let (out, timing) = index.search_profiled("file-000123", 100, 0);
+        assert_eq!(out.total, 1);
+        assert!(
+            timing.scanned < n / 10,
+            "selective query scanned {} of {n}",
+            timing.scanned
+        );
+    }
+
+    #[test]
+    fn ngram_index_stays_consistent_after_live_updates() {
+        // F4 acceptance: the candidate index tracks insert/remove/rename and
+        // survives a compaction rebuild.
+        let mut index = Index::new();
+        index.insert(Path::new("/home/sam/alpha.txt"), false, 1, 0);
+        index.insert(Path::new("/home/sam/beta.txt"), false, 1, 0);
+
+        assert!(index.rename(
+            Path::new("/home/sam/alpha.txt"),
+            Path::new("/home/sam/gamma.txt")
+        ));
+        assert_eq!(index.search("alpha", 10, 0).hits.len(), 0);
+        assert_eq!(index.search("gamma", 10, 0).hits.len(), 1);
+
+        assert!(index.remove(Path::new("/home/sam/beta.txt")));
+        assert_eq!(index.search("beta", 10, 0).hits.len(), 0);
+
+        index.insert(Path::new("/home/sam/delta.txt"), false, 1, 0);
+        assert_eq!(index.search("delta", 10, 0).hits.len(), 1);
+
+        // Compaction rebuilds the candidate index; results must be unchanged.
+        index.compact();
+        assert_eq!(index.search("gamma", 10, 0).hits.len(), 1);
+        assert_eq!(index.search("delta", 10, 0).hits.len(), 1);
+        assert_eq!(index.search("beta", 10, 0).hits.len(), 0);
+        assert_eq!(index.search("alpha", 10, 0).hits.len(), 0);
+    }
+
+    #[test]
+    fn token_prefix_query_is_narrowed() {
+        // F3: a single-token prefix query is answered from the candidate index
+        // without scanning every record.
+        let mut index = Index::new();
+        for i in 0..1000 {
+            index.insert(Path::new(&format!("/data/other-{i}.txt")), false, 1, 0);
+        }
+        index.insert(Path::new("/data/configuration.toml"), false, 1, 0);
+        let (out, timing) = index.search_profiled("conf", 10, 0);
+        assert_eq!(out.total, 1);
+        assert!(timing.scanned < 1000, "scanned {}", timing.scanned);
+    }
+
+    #[test]
+    fn candidate_index_survives_a_snapshot_round_trip() {
+        // The candidate index is derived, so a snapshot load must rebuild it and
+        // return the same results.
+        let mut index = Index::new();
+        index.add_root(Path::new("/"), FsKind::Other);
+        index.insert(Path::new("/home/sam/report.pdf"), false, 1, 0);
+        index.insert(Path::new("/home/sam/notes.md"), false, 1, 0);
+
+        let bytes = crate::snapshot::encode(&index, &[]);
+        let (back, _) = crate::snapshot::decode(&bytes).unwrap();
+        assert_eq!(back.search("report", 10, 0).hits.len(), 1);
+        assert_eq!(back.search("notes", 10, 0).hits.len(), 1);
+        assert_eq!(back.search("zzz", 10, 0).hits.len(), 0);
     }
 }

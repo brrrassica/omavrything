@@ -53,12 +53,38 @@ impl Term {
         }
     }
 
+    /// The lowercased ASCII needle, or `None` for a non-ASCII term.
+    ///
+    /// Used by the candidate index to derive trigrams and token prefixes.
+    pub fn ascii(&self) -> Option<&[u8]> {
+        self.ascii.as_deref()
+    }
+
     /// The earliest byte position where this term matches `hay`, if any.
     pub fn find(&self, hay: &[u8]) -> Option<usize> {
         if let Some(needle) = &self.ascii {
             find_ascii_ci(hay, needle)
         } else if let Some(needle) = &self.unicode {
             String::from_utf8_lossy(hay)
+                .to_lowercase()
+                .find(needle.as_str())
+        } else {
+            None
+        }
+    }
+
+    /// The earliest byte position where this term matches an already
+    /// ASCII-lowercased haystack, if any.
+    ///
+    /// The candidate index stores each path ASCII-lowercased, so an ASCII term
+    /// is a plain byte search (no per-byte case folding) and a non-ASCII term
+    /// falls back to the Unicode-aware comparison. Positions are identical to
+    /// [`Term::find`] because ASCII-lowercasing is byte-preserving.
+    pub fn find_lower(&self, lower: &[u8]) -> Option<usize> {
+        if let Some(needle) = &self.ascii {
+            find_bytes(lower, needle)
+        } else if let Some(needle) = &self.unicode {
+            String::from_utf8_lossy(lower)
                 .to_lowercase()
                 .find(needle.as_str())
         } else {
@@ -145,6 +171,34 @@ pub fn find_ascii_ci(hay: &[u8], needle: &[u8]) -> Option<usize> {
             return None;
         }
         if hay[idx..idx + needle.len()].eq_ignore_ascii_case(needle) {
+            return Some(idx);
+        }
+        start = idx + 1;
+    }
+    None
+}
+
+/// Plain byte-substring search over an already-lowercased haystack.
+///
+/// Uses `memchr` to skip to candidate positions, then verifies with a direct
+/// slice comparison. Allocates nothing.
+pub fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    if needle.len() > hay.len() {
+        return None;
+    }
+
+    let first = needle[0];
+    let mut start = 0;
+    while start + needle.len() <= hay.len() {
+        let pos = memchr::memchr(first, &hay[start..])?;
+        let idx = start + pos;
+        if idx + needle.len() > hay.len() {
+            return None;
+        }
+        if &hay[idx..idx + needle.len()] == needle {
             return Some(idx);
         }
         start = idx + 1;
