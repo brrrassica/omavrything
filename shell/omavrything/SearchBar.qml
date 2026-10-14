@@ -18,7 +18,13 @@ BarWidget {
   // Mirrors the scratchpad's query so the bar reacts to every keystroke.
   property string query: ""
 
-  readonly property string queryFile: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/omavrything-query"
+  // The query mirror is a private channel between the overlay and the bar. It
+  // must never live in a world-writable directory (see SearchOverlay.qml): a
+  // predictable path under /tmp lets another local user pre-create it as a
+  // symlink or feed the bar arbitrary content. Use $XDG_RUNTIME_DIR (0700) and
+  // disable the mirror when it is unset rather than falling back to /tmp.
+  readonly property string runtimeDir: Quickshell.env("XDG_RUNTIME_DIR") || ""
+  readonly property string queryFile: runtimeDir !== "" ? runtimeDir + "/omavrything-query" : ""
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -35,9 +41,10 @@ BarWidget {
 
   // Seed the mirror file so `watchChanges` has something to watch. Without this,
   // a bar widget that starts before the overlay has ever opened watches a
-  // non-existent path and may miss the file's creation.
+  // non-existent path and may miss the file's creation. Skipped when the mirror
+  // is disabled (no private per-user directory).
   Component.onCompleted: {
-    if (!queryFileView.exists) queryFileView.setText("")
+    if (root.queryFile !== "" && !queryFileView.exists) queryFileView.setText("")
   }
 
   WidgetButton {

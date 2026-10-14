@@ -1,6 +1,6 @@
 # Installation and setup
 
-`omavrything` is at **v0.1.7**:, but released and used day to day. Install it
+`omavrything` is at **v0.1.8**:, but released and used day to day. Install it
 from a release archive or from source (§1–2). It targets
 **Omarchy Quattro (4.x)** only — Hyprland, `omarchy-shell` (Quickshell), Arch
 Linux. There is no backwards compatibility with earlier Omarchy releases that
