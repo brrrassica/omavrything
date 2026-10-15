@@ -327,7 +327,11 @@ pub fn run(
     event_tx: UnboundedSender<IndexEvent>,
     policy: Arc<Mutex<NtfsPolicy>>,
 ) {
+    // The D-Bus service is event-driven and does no CPU-bound work, so a small
+    // fixed worker pool is enough; the default (one worker per core) spawns a
+    // thread per core that is idle for the daemon's whole life (rc6 RSS spike).
     let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
     {

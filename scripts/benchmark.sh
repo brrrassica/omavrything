@@ -176,6 +176,11 @@ find_daemon_pid() {
 # RSS per record, and — when the daemon exposes its index accounting (the live
 # daemon, via D-Bus status) — the index's own bytes per record, i.e. how
 # memory-efficient the in-memory cache is.
+#
+# The RSS is also broken down (rc6 RSS spike) into the resident file-backed
+# pages (the binary's text/data, `RssFile`), the anonymous heap and stacks
+# (`RssAnon`), and the thread count, so the fixed daemon overhead can be
+# separated from the index itself.
 record_memory() {
   local key="$1" pid="$2" title="${3:-daemon}" entries="${4:-}" index_bytes="${5:-}"
   [[ "$do_memory" == 1 && -n "$pid" ]] || return 0
@@ -184,8 +189,17 @@ record_memory() {
   hwm="$(read_mem_kb "$pid" VmHWM)"
   [[ -n "$rss" ]] || return 0
   hwm="${hwm:-$rss}"
+  local rss_anon rss_file rss_shmem threads
+  rss_anon="$(read_mem_kb "$pid" RssAnon)"
+  rss_file="$(read_mem_kb "$pid" RssFile)"
+  rss_shmem="$(read_mem_kb "$pid" RssShmem)"
+  threads="$(read_mem_kb "$pid" Threads)"
   local msg="memory ($title): rss=$((rss / 1024)) MiB  peak=$((hwm / 1024)) MiB"
   local jobj="{\"rss_kb\": $rss, \"peak_rss_kb\": $hwm"
+  if [[ -n "$rss_anon" ]]; then
+    msg+="  anon=$((rss_anon / 1024)) MiB file=$((rss_file / 1024)) MiB threads=${threads:-?}"
+    jobj+=", \"rss_anon_kb\": ${rss_anon:-0}, \"rss_file_kb\": ${rss_file:-0}, \"rss_shmem_kb\": ${rss_shmem:-0}, \"threads\": ${threads:-0}"
+  fi
   if [[ -n "$entries" && "$entries" -gt 0 ]]; then
     local rss_bpr peak_bpr
     rss_bpr="$(awk -v r="$rss" -v n="$entries" 'BEGIN { printf "%.1f", r * 1024 / n }')"
@@ -583,10 +597,16 @@ if [[ "$run_live" == "yes" ]]; then
   live_candidate_off=""
   live_candidate_len=""
   live_candidate_stop=""
+  live_records_cap=""
+  live_paths_cap=""
+  live_map_cap_bytes=""
   if [[ -n "$cli_bin" ]]; then
     live_status="$("$cli_bin" status 2>/dev/null || true)"
     live_entries="$(sed -n 's/^entries: //p' <<<"$live_status")"
     live_index_bytes="$(sed -n 's/^memory_bytes: //p' <<<"$live_status")"
+    live_records_cap="$(sed -n 's/^records_cap: //p' <<<"$live_status")"
+    live_paths_cap="$(sed -n 's/^paths_cap: //p' <<<"$live_status")"
+    live_map_cap_bytes="$(sed -n 's/^map_cap_bytes: //p' <<<"$live_status")"
     live_candidate="$(sed -n 's/^candidate_bytes: //p' <<<"$live_status")"
     live_candidate_postings="$(sed -n 's/^candidate_postings: //p' <<<"$live_status")"
     live_candidate_lower="$(sed -n 's/^candidate_lower: //p' <<<"$live_status")"
@@ -614,12 +634,22 @@ if [[ "$run_live" == "yes" ]]; then
       say "memory: could not resolve the live daemon pid for $live_socket"
     fi
   fi
+  # Capacity-vs-length report (rc6 RSS spike): the index's own accounting counts
+  # used bytes, so any gap between capacity and length is resident slack that the
+  # per-record figure does not capture.
+  if [[ -n "$live_records_cap" && -n "$live_entries" && "$live_entries" -gt 0 ]]; then
+    say "index capacity: records_cap=${live_records_cap} paths_cap=${live_paths_cap} map_cap_bytes=${live_map_cap_bytes}"
+    add_result "capacity:live" "$(python3 -c 'import json,sys; i=lambda x: int(x) if x else 0; print(json.dumps({"records_cap": i(sys.argv[1]), "paths_cap": i(sys.argv[2]), "map_cap_bytes": i(sys.argv[3])}))' "$live_records_cap" "$live_paths_cap" "$live_map_cap_bytes")"
+  fi
   # Per-component candidate-index breakdown (F11), from the daemon's own
   # accounting. This is the memory the n-gram index costs, split by component.
   if [[ -n "$live_candidate" && "$live_candidate" -gt 0 && -n "$live_entries" && "$live_entries" -gt 0 ]]; then
     cand_bpr="$(awk -v b="$live_candidate" -v n="$live_entries" 'BEGIN { printf "%.1f", b / n }')"
     say "candidate index: ${live_candidate} B (${cand_bpr} B/record)  postings=${live_candidate_postings} lower=${live_candidate_lower} tokens=${live_candidate_tokens} map=${live_candidate_map} off=${live_candidate_off} len=${live_candidate_len} stop=${live_candidate_stop}"
-    add_result "candidate:live" "$(python3 -c 'import json,sys; print(json.dumps({"bytes": int(sys.argv[1]), "bytes_per_record": float(sys.argv[2]), "postings": int(sys.argv[3]), "lower": int(sys.argv[4]), "tokens": int(sys.argv[5]), "map": int(sys.argv[6]), "off": int(sys.argv[7]), "len": int(sys.argv[8]), "stop": int(sys.argv[9])}))' "$live_candidate" "$cand_bpr" "$live_candidate_postings" "$live_candidate_lower" "$live_candidate_tokens" "$live_candidate_map" "$live_candidate_off" "$live_candidate_len" "$live_candidate_stop")"
+    # A component may be absent (rc5 dropped the token table, so
+    # `candidate_tokens` is empty); coerce an empty field to 0 rather than
+    # failing the int() conversion.
+    add_result "candidate:live" "$(python3 -c 'import json,sys; i=lambda x: int(x) if x else 0; print(json.dumps({"bytes": i(sys.argv[1]), "bytes_per_record": float(sys.argv[2]), "postings": i(sys.argv[3]), "lower": i(sys.argv[4]), "tokens": i(sys.argv[5]), "map": i(sys.argv[6]), "off": i(sys.argv[7]), "len": i(sys.argv[8]), "stop": i(sys.argv[9])}))' "$live_candidate" "$cand_bpr" "$live_candidate_postings" "$live_candidate_lower" "$live_candidate_tokens" "$live_candidate_map" "$live_candidate_off" "$live_candidate_len" "$live_candidate_stop")"
   fi
 fi
 
@@ -734,6 +764,31 @@ PY
     say "error: the hermetic daemon did not start; see $log" >&2
     sed 's/^/  /' "$log" >&2 || true
   fi
+
+  # --- run E: empty-index baseline (fixed daemon overhead) -----------------
+  # Start the daemon on an empty root so the RSS is the pure fixed overhead
+  # (binary text/data, runtimes, thread stacks) with zero records. This is the
+  # intercept of the RSS-vs-N line (rc6 RSS spike), and it is what the per-record
+  # figure at a small tree size is dominated by.
+  empty_root="$tmp/empty"
+  mkdir -p "$empty_root"
+  say "empty-index baseline (fixed daemon overhead):"
+  rm -f "$sock"
+  "$daemon_bin" --no-config --root "$empty_root" --socket "$sock" \
+    --no-dbus --no-ntfs --no-snapshot --log-level error \
+    >"$tmp/empty.log" 2>&1 &
+  daemon_pid=$!
+  for _ in $(seq 1 600); do
+    [[ -S "$sock" ]] && break
+    kill -0 "$daemon_pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  if [[ -S "$sock" ]]; then
+    record_memory "memory:empty" "$daemon_pid" "empty-index" "0"
+  else
+    say "empty-index baseline: daemon did not start"
+  fi
+  stop_daemon
 
   # --- run B: live-update burst --------------------------------------------
   if [[ "$do_live_update" == 1 ]]; then

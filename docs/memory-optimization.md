@@ -188,3 +188,39 @@ the per-record `off`/`len`/`parent` arrays (10 B/record). D (derive `off`/`len`
 from the record's `path_off`/`path_len`) would remove 6 B/record; N (stream
 metadata) and G (drop `PathIndex`) are the base-index fallbacks and are not
 needed now that the target is met.
+
+## 8. Daemon overhead (0.2.0-rc6)
+
+The index accounting (`memory_bytes`) is not the whole RSS: the daemon's own
+overhead — the binary, thread stacks, runtimes, and allocator retention — is the
+rest. At rc5 the live daemon (1.4 M entries) sat at 308 MB RSS against 171 MB of
+index accounting, so ~137 MB was overhead. The rc6 work (see
+[`plans/rss-overhead-0.2.0-rc6.md`](../plans/rss-overhead-0.2.0-rc6.md)) cut it:
+
+- **Binary size.** A `[profile.release]` with fat LTO, one codegen unit, and
+  stripped symbols cut the daemon binary from 7.66 MB to 4.04 MB (−47 %). The
+  resident text (`RssFile`) is the dominant fixed cost, so this is the largest
+  single win. `panic = "abort"` is deliberately **not** set: it would defeat the
+  NTFS `catch_unwind` containment.
+- **Threads and runtimes.** The rayon global pool is bounded to
+  `min(cores, 4)` (the scan is I/O-bound and scales only ~1.4× from 1 to 16
+  cores), the D-Bus tokio runtime uses 2 worker threads, and the daemon's own
+  threads get explicit 1 MiB (control) / 512 KiB (per-connection) stacks. Thread
+  count fell from 20 to 8.
+- **Allocator.** `M_MMAP_THRESHOLD` and `M_TRIM_THRESHOLD` are lowered to 64 KiB
+  so large transient buffers are mmap'd and returned, and `trim_heap()` is called
+  after the live-update shrink, not only at startup.
+- **Capacity slack.** The record and path vectors were found at **exactly 2×
+  their length** on the live daemon (~75 MB of spare capacity). The live-update
+  and rescan paths never called `shrink()`. A new `Index::shrink_if_slack()`
+  (records and paths only, so it is a memcpy rather than a `HashMap` rehash) is
+  called from the watcher, and the full `shrink()` after a rescan.
+
+Measured: the empty-index baseline is 5 MiB; the 500 k hermetic tree fell from
+115.7 to ~104 B/record; and the live-update burst RSS fell from 104 MiB to
+~33 MiB (451 → ~145 B/record). mimalloc was evaluated as an alternative
+allocator and **rejected** (315 MiB vs 49 MiB at 500 k).
+
+The live index itself is ~128 B/record (longer real paths, the `by_path` map),
+so RSS/record under 100 B at 1.4 M still needs the live index to approach the
+synthetic 81.2 B/record; that is a separate lever from the overhead.

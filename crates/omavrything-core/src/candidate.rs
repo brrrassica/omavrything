@@ -404,17 +404,13 @@ impl CandidateIndex {
             // for both basename and ancestor-directory matches.
             index_trigrams(&mut self.delta, &self.stop, idx, lower_path, append);
         }
-
     }
 
     /// Maintain the bulk-build subtree stack: close every open directory whose
     /// subtree does not include the new record, then open the new record if it is
     /// a directory.
     fn push_subtree(&mut self, idx: u32, full_path: &[u8], is_dir: bool) {
-        loop {
-            let Some(&(d, doff, dlen)) = self.stack.last() else {
-                break;
-            };
+        while let Some(&(d, doff, dlen)) = self.stack.last() {
             let descendant = {
                 let dp = &self.lower[doff as usize..(doff + dlen) as usize];
                 is_descendant(full_path, dp)
@@ -928,14 +924,7 @@ mod tests {
         let c = build(&["/home/sam/report.pdf", "/etc/config.toml"]);
         let b = c.memory_breakdown();
         assert_eq!(
-            b.lower
-                + b.off
-                + b.len
-                + b.parent
-                + b.postings
-                + b.map
-                + b.subtree
-                + b.stop,
+            b.lower + b.off + b.len + b.parent + b.postings + b.map + b.subtree + b.stop,
             c.memory_bytes()
         );
     }

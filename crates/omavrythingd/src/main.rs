@@ -61,6 +61,9 @@ fn main() {
     // Constrain the allocator before any thread spawns so the scan's transient
     // buffers are returned to the OS rather than retained in per-thread arenas.
     tune_allocator();
+    // Bound the rayon pool before the scan builds it, so the daemon does not
+    // spawn one worker per core for an I/O-bound walk (rc6 RSS spike).
+    tune_scan_pool();
     let args = match Args::parse() {
         Ok(args) => args,
         Err(err) => {
@@ -176,14 +179,18 @@ fn main() {
         let index = Arc::clone(&index);
         let config = Arc::clone(&config);
         let events = event_tx.clone();
-        std::thread::spawn(move || run_watcher(index, config, events));
+        spawn_thread("omavry-watch", CONTROL_STACK, move || {
+            run_watcher(index, config, events)
+        });
     }
 
     if args.scan_interval > 0 {
         let index = Arc::clone(&index);
         let config = Arc::clone(&config);
         let events = event_tx.clone();
-        std::thread::spawn(move || run_scheduler(index, config, events));
+        spawn_thread("omavry-sched", CONTROL_STACK, move || {
+            run_scheduler(index, config, events)
+        });
     }
 
     if let Some(path) = &args.snapshot {
@@ -192,7 +199,9 @@ fn main() {
             let identities = Arc::clone(&identities);
             let config = Arc::clone(&config);
             let path = path.clone();
-            std::thread::spawn(move || run_snapshot(index, identities, config, path));
+            spawn_thread("omavry-snap", CONTROL_STACK, move || {
+                run_snapshot(index, identities, config, path)
+            });
         }
     }
 
@@ -201,13 +210,17 @@ fn main() {
         let config = Arc::clone(&config);
         let events = event_tx.clone();
         let policy = Arc::clone(&policy);
-        std::thread::spawn(move || dbus::run(index, config, started, event_rx, events, policy));
+        spawn_thread("omavry-dbus", CONTROL_STACK, move || {
+            dbus::run(index, config, started, event_rx, events, policy)
+        });
     }
 
     if args.ntfs {
         let index = Arc::clone(&index);
         let policy = Arc::clone(&policy);
-        std::thread::spawn(move || run_ntfs_startup(index, policy));
+        spawn_thread("omavry-ntfs", CONTROL_STACK, move || {
+            run_ntfs_startup(index, policy)
+        });
     }
 
     // A stale socket from a previous run would make bind() fail.
@@ -287,7 +300,7 @@ fn main() {
                 active.fetch_add(1, Ordering::Relaxed);
                 let index = Arc::clone(&index);
                 let active = Arc::clone(&active);
-                std::thread::spawn(move || {
+                spawn_thread("omavry-conn", CONNECTION_STACK, move || {
                     serve(stream, index, profile);
                     active.fetch_sub(1, Ordering::Relaxed);
                 });
@@ -410,11 +423,20 @@ fn run_watcher(
                     continue;
                 }
                 let scan = config.scan();
-                {
+                let shrank = {
                     let mut idx = write_index(&index);
                     for event in &batch {
                         live::apply(&mut idx, event, &scan);
                     }
+                    // Reclaim the doubling slack the inserts left, so a
+                    // long-running daemon does not hold 2x capacity forever
+                    // (rc6 RSS spike). A no-op when the slack is small.
+                    idx.shrink_if_slack()
+                };
+                if shrank {
+                    // The shrink freed pages; return them to the OS rather than
+                    // leaving them in the glibc arena (rc6 RSS spike).
+                    trim_heap();
                 }
                 // Watch newly created directories.
                 for event in &batch {
@@ -483,6 +505,9 @@ fn run_scheduler(
             let (report, entries) = {
                 let mut idx = write_index(&index);
                 let report = apply_rescan(&mut idx, plan);
+                // A rescan appends the new entries and leaves the vectors at
+                // their doubled capacity; reclaim it (rc6 RSS spike).
+                idx.shrink();
                 (report, idx.len() as u64)
             };
             config.set_scanning(false);
@@ -652,7 +677,7 @@ fn install_shutdown_handler(
     }
 
     let read_fd = fds[0];
-    std::thread::spawn(move || {
+    spawn_thread("omavry-shutdown", CONTROL_STACK, move || {
         let mut byte = [0u8; 1];
         loop {
             // SAFETY: `read_fd` is a valid pipe read end and `byte` is 1 byte.
@@ -854,9 +879,52 @@ fn trim_heap() {
 /// [`trim_heap`] effective. A no-op on non-glibc targets.
 fn tune_allocator() {
     #[cfg(target_env = "gnu")]
-    // SAFETY: `mallopt` has no preconditions; `M_ARENA_MAX` is a valid option.
+    // SAFETY: `mallopt` has no preconditions; the options are valid.
     unsafe {
         libc::mallopt(libc::M_ARENA_MAX, 1);
+        // Make large transient buffers (the scan's walk buffer, the candidate
+        // build's staging maps, the encoded snapshot) use mmap, so they are
+        // returned to the OS on free without waiting for a trim (rc6 RSS spike).
+        libc::mallopt(libc::M_MMAP_THRESHOLD, 64 * 1024);
+        // Trim the heap top more eagerly when a large block is freed.
+        libc::mallopt(libc::M_TRIM_THRESHOLD, 64 * 1024);
+    }
+}
+
+/// Stack size for the daemon's long-lived control threads. The default 8 MiB is
+/// virtual and mostly untouched, but an explicit smaller size keeps the resident
+/// stack pages bounded (rc6 RSS spike).
+const CONTROL_STACK: usize = 1 << 20;
+/// Stack size for a per-connection thread.
+const CONNECTION_STACK: usize = 512 << 10;
+
+/// Spawn a named thread with an explicit stack size. A spawn failure is ignored
+/// (the daemon degrades rather than aborting).
+fn spawn_thread<F: FnOnce() + Send + 'static>(name: &str, stack: usize, f: F) {
+    let _ = std::thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(stack)
+        .spawn(f);
+}
+
+/// Bound the rayon global pool used by the scan and the parallel search.
+///
+/// The scan is I/O-bound and scales only ~1.4x from one to sixteen cores (F8),
+/// so a small pool keeps the throughput while cutting the resident thread
+/// stacks. Override with `OMAVRYTHING_SCAN_THREADS`; the default is
+/// `min(cores, 4)`.
+fn tune_scan_pool() {
+    let threads = std::env::var("OMAVRYTHING_SCAN_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get().min(4))
+                .unwrap_or(4)
+        });
+    if !omavrything_core::tune_scan_pool(threads) {
+        debug!("scan pool already built; OMAVRYTHING_SCAN_THREADS ignored");
     }
 }
 

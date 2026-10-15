@@ -9,6 +9,35 @@ Notable changes to `omavrything`. The format follows
 The next release is a **performance-first** robustness release. The work below is
 planned, not yet shipped; this note records the direction.
 
+### Changed (0.2.0-rc6 — daemon RSS overhead)
+
+The rc5 index accounting reached 81.2 B/record on the 1 M synthetic tree, but the
+end-to-end RSS/record was still dominated by the daemon's own overhead. rc6 cuts
+that overhead (see [`plans/rss-overhead-0.2.0-rc6.md`](plans/rss-overhead-0.2.0-rc6.md)):
+
+- **Release profile.** A `[profile.release]` with fat LTO, one codegen unit, and
+  stripped symbols cut the daemon binary from 7.66 MB to 4.04 MB (−47 %). The
+  resident text is the largest fixed cost. `panic = "abort"` is deliberately not
+  set, because it would defeat the NTFS `catch_unwind` containment.
+- **Threads and runtimes.** The rayon global pool is bounded to `min(cores, 4)`
+  (override with `OMAVRYTHING_SCAN_THREADS`), the D-Bus tokio runtime uses 2
+  worker threads, and the daemon's threads get explicit stack sizes. Thread count
+  fell from 20 to 8.
+- **Allocator.** `M_MMAP_THRESHOLD`/`M_TRIM_THRESHOLD` are lowered to 64 KiB and
+  `trim_heap()` now runs after the live-update shrink.
+- **Capacity slack.** The record and path vectors were found at exactly 2× their
+  length on the live daemon (~75 MB of spare capacity) because the live-update
+  and rescan paths never shrank them. A new `Index::shrink_if_slack()` is called
+  from the watcher, and the full `shrink()` after a rescan.
+- **Benchmark.** `scripts/benchmark.sh` now reports the RSS breakdown
+  (`RssAnon`/`RssFile`/`RssShmem`/threads), an empty-index baseline, and the
+  index capacity-vs-length figures.
+
+Measured: the empty-index baseline is 5 MiB; the 500 k hermetic tree fell from
+115.7 to ~104 B/record; the live-update burst RSS fell from 104 MiB to ~33 MiB
+(451 → ~145 B/record). mimalloc was evaluated and rejected (315 MiB vs 49 MiB at
+500 k).
+
 ### Planned
 
 - **Indexing and search performance (highest priority).** The search path is

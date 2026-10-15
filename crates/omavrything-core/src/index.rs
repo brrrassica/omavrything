@@ -729,6 +729,38 @@ impl Index {
         self.candidate.shrink();
     }
 
+    /// Reclaim the doubling slack in the record and path vectors, but only when
+    /// it is large enough to be worth the reallocation (rc6 RSS spike). Returns
+    /// whether a shrink happened, so the caller can trim the allocator.
+    ///
+    /// A `Vec` that grew past a power of two keeps 2x capacity until something
+    /// calls `shrink_to_fit`; the live-update and rescan paths never did, so a
+    /// long-running daemon held tens of MB of spare capacity (measured: the
+    /// record and path vectors at exactly 2x their length on a 1.4 M index).
+    ///
+    /// This deliberately shrinks **only** the two big vectors, not the path map
+    /// or the candidate index: a `Vec::shrink_to_fit` is a memcpy, whereas a
+    /// `HashMap::shrink_to_fit` rehashes every entry, so this is cheap enough to
+    /// run under the write lock on the live-update path. The path map and
+    /// candidate slack are reclaimed by the full [`Index::shrink`] on a rescan
+    /// or at startup. A no-op when the spare capacity is small, so a small
+    /// inotify batch does not trigger a reallocation on every event.
+    pub fn shrink_if_slack(&mut self) -> bool {
+        let records_slack = self.records.capacity().saturating_sub(self.records.len());
+        let paths_slack = self.paths.capacity().saturating_sub(self.paths.len());
+        // Reclaim when the spare capacity is at least a quarter of the used size.
+        let records_used = self.records.len().max(1);
+        let paths_used = self.paths.len().max(1);
+        if records_slack * 4 >= records_used || paths_slack * 4 >= paths_used {
+            self.invalidate_cache();
+            self.records.shrink_to_fit();
+            self.paths.shrink_to_fit();
+            true
+        } else {
+            false
+        }
+    }
+
     /// The path arena, for snapshot serialization.
     pub(crate) fn paths(&self) -> &[u8] {
         &self.paths
@@ -1376,7 +1408,11 @@ impl Index {
                     name_match = false;
                 }
             }
-            (first_pos, (parent.len() + sep.len() + name.len()) as u32, name_match)
+            (
+                first_pos,
+                (parent.len() + sep.len() + name.len()) as u32,
+                name_match,
+            )
         };
         // Return the packed sort key directly, so the scan does not build and
         // copy a `Rank` struct per record (J).

@@ -112,3 +112,15 @@ much larger index the daemon is killed and restarted by systemd
 (`Restart=on-failure`), which then warm-starts from the snapshot. To index more,
 raise `MemoryMax` or reduce the indexed roots/excludes. A user-run daemon has no
 such cap and is limited only by available RAM.
+
+### Daemon overhead (0.2.0-rc6)
+
+The index accounting is not the whole RSS. rc6 cut the daemon's own overhead
+(see [`memory-optimization.md`](memory-optimization.md#8-daemon-overhead-020-rc6)):
+the binary is 47 % smaller (fat LTO + strip), the thread count fell from 20 to 8
+(a bounded rayon pool and a 2-worker D-Bus runtime), the glibc thresholds are
+tuned, and the live-update and rescan paths now reclaim the record/path vector
+doubling slack. The empty-index baseline is 5 MiB, and the live-update burst RSS
+fell from 104 MiB to ~33 MiB. `scripts/benchmark.sh` reports the RSS breakdown
+(`RssAnon`/`RssFile`/`RssShmem`/threads) and an empty-index baseline so the fixed
+overhead is visible separately from the index.
