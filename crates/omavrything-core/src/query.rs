@@ -113,6 +113,30 @@ impl Term {
         best
     }
 
+    /// The earliest position where this term matches `parent` + `/` + `name`,
+    /// and whether it matched within `name` (for ranking), for an
+    /// already-lowercased `parent` and `name` (the candidate index's deduped
+    /// arena, A). Positions are identical to [`Term::find_in_file_path`] because
+    /// ASCII-lowercasing is byte-preserving.
+    pub fn find_in_file_path_lower(
+        &self,
+        parent: &[u8],
+        name: &[u8],
+        sep: &[u8],
+    ) -> Option<(usize, bool)> {
+        let parent_pos = self.find_lower(parent);
+        let name_pos = self.find_lower(name);
+        let name_match = name_pos.is_some();
+        // The parent precedes the name, so a parent match is the earliest; the
+        // boundary (only reachable for a term containing `/`) precedes the name.
+        let pos = match (parent_pos, name_pos) {
+            (Some(p), _) => p,
+            (None, Some(p)) => parent.len() + sep.len() + p,
+            (None, None) => self.find_boundary(parent, name, sep)?,
+        };
+        Some((pos, name_match))
+    }
+
     /// The position where this term spans the `parent`/`name` separator, if any.
     ///
     /// `sep` is `/` for a normal parent, or empty for the filesystem root `/`
@@ -190,6 +214,12 @@ pub fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.len() > hay.len() {
         return None;
     }
+    // A single-byte needle is a plain `memchr`, which avoids `memmem`'s
+    // substring-search setup. This is the common case for a one-character query,
+    // which is also the full-scan case the candidate index cannot narrow.
+    if needle.len() == 1 {
+        return memchr::memchr(needle[0], hay);
+    }
     memchr::memmem::find(hay, needle)
 }
 
@@ -227,6 +257,22 @@ impl Ord for Rank {
 impl PartialOrd for Rank {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+impl Rank {
+    /// Pack the rank into a single `u64` sort key (larger is better) so the
+    /// top-N heap compares one integer instead of a multi-field struct. The
+    /// fields are saturated to fit: `first_pos` and `path_len` to 12 bits
+    /// (4095), `depth` to 6 bits (63), and `mtime` to 33 bits. The saturation
+    /// only affects paths longer than 4 KiB, which are rare.
+    pub fn key(&self) -> u64 {
+        let name = (self.name_match as u64) << 63;
+        let pos = 4095u64 - self.first_pos.min(4095) as u64;
+        let len = 4095u64 - self.path_len.min(4095) as u64;
+        let dep = 63u64 - self.depth.min(63) as u64;
+        let mt = self.mtime.max(0) as u64 & 0x1_FFFF_FFFF;
+        name | (pos << 51) | (len << 39) | (dep << 33) | mt
     }
 }
 

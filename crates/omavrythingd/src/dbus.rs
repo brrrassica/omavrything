@@ -88,7 +88,6 @@ impl Manager {
             b.candidate.postings.to_string(),
         );
         map.insert("candidate_map".into(), b.candidate.map.to_string());
-        map.insert("candidate_tokens".into(), b.candidate.tokens.to_string());
         map.insert("candidate_stop".into(), b.candidate.stop.to_string());
         map.insert("scanning".into(), self.config.scanning().to_string());
         map.insert(

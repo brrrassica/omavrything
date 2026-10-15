@@ -325,6 +325,26 @@ fn mtime_to_u32(mtime: i64) -> u32 {
     mtime.clamp(0, u32::MAX as i64) as u32
 }
 
+/// The exclusive end of each directory's descendant range, derived from the
+/// parent links. `ends[i]` is the index after the last record in `i`'s subtree
+/// (only meaningful for directories). This is robust to records that are not
+/// sorted by path, unlike the candidate index's incremental stack (E).
+fn subtree_ends(records: &[FileRecord]) -> Vec<u32> {
+    let mut ends = vec![0u32; records.len()];
+    for (i, rec) in records.iter().enumerate() {
+        let end = (i + 1) as u32;
+        let mut p = rec.parent;
+        while p != u32::MAX {
+            let pi = p as usize;
+            if ends[pi] < end {
+                ends[pi] = end;
+            }
+            p = records[pi].parent;
+        }
+    }
+    ends
+}
+
 /// The parent path bytes of `path`, or `None` for the filesystem root. Mirrors
 /// [`std::path::Path::parent`] for the absolute paths the scanner produces.
 fn parent_bytes(path: &[u8]) -> Option<&[u8]> {
@@ -686,9 +706,10 @@ impl Index {
             buf.clear();
             write_full_path_bytes(rec, &self.records, &self.paths, &mut buf);
             buf.make_ascii_lowercase();
-            candidate.insert(i as u32, &buf);
+            candidate.insert_append(i as u32, &buf, rec.is_dir(), rec.parent);
         }
         candidate.finish_bulk();
+        candidate.set_subtree_end(subtree_ends(&self.records));
         self.candidate = candidate;
     }
 
@@ -729,9 +750,10 @@ impl Index {
             write_full_path_bytes(rec, &records, &paths, &mut buf);
             by_path.insert_bytes(&buf, i as u32, &records, &paths);
             buf.make_ascii_lowercase();
-            candidate.insert(i as u32, &buf);
+            candidate.insert_append(i as u32, &buf, rec.is_dir(), rec.parent);
         }
         candidate.finish_bulk();
+        candidate.set_subtree_end(subtree_ends(&records));
         Self {
             records,
             paths,
@@ -825,7 +847,7 @@ impl Index {
                 lower.make_ascii_lowercase();
                 // Records are appended in increasing index order, so the posting
                 // lists can be pushed to instead of binary-searched.
-                self.candidate.insert_append(idx, &lower);
+                self.candidate.insert_append(idx, &lower, e.is_dir, parent);
             }
             self.live += 1;
             inserted += 1;
@@ -942,7 +964,7 @@ impl Index {
         if self.candidate_enabled {
             let mut lower = path_str.as_bytes().to_vec();
             lower.make_ascii_lowercase();
-            self.candidate.insert(idx, &lower);
+            self.candidate.insert(idx, &lower, is_dir, parent);
         }
         self.live += 1;
         self.invalidate_cache();
@@ -1174,7 +1196,8 @@ impl Index {
             if self.candidate_enabled {
                 let mut lower = new_path.as_bytes().to_vec();
                 lower.make_ascii_lowercase();
-                self.candidate.insert(i, &lower);
+                let parent = self.records[i as usize].parent;
+                self.candidate.insert(i, &lower, rec.is_dir(), parent);
             }
         }
         self.invalidate_cache();
@@ -1292,7 +1315,7 @@ impl Index {
             .into_iter()
             .skip(offset)
             .take(limit)
-            .map(|(i, _)| self.hit(i))
+            .map(|i| self.hit(i))
             .collect();
         let materialize = materialize_started.elapsed();
 
@@ -1318,7 +1341,7 @@ impl Index {
     /// record vector and the parent link. The result is identical to matching
     /// the original-case path: ASCII-lowercasing is byte-preserving, and a
     /// non-ASCII term falls back to the Unicode-aware comparison.
-    fn match_record(&self, idx: u32, rec: &FileRecord, q: &Query) -> Option<Rank> {
+    fn match_record(&self, idx: u32, rec: &FileRecord, q: &Query) -> Option<u64> {
         if rec.is_deleted() {
             return None;
         }
@@ -1327,30 +1350,55 @@ impl Index {
         if !self.candidate_enabled {
             return self.match_record_original(rec, q);
         }
-        let lower = self.candidate.lower_path(idx);
-        let mut first_pos = u32::MAX;
-        for term in q.terms() {
-            let pos = term.find_lower(lower)?;
-            first_pos = first_pos.min(pos as u32);
-        }
-        let name = self.candidate.lower_name(idx);
-        let name_match = q.terms().iter().all(|t| t.find_lower(name).is_some());
-        Some(Rank {
-            name_match,
-            first_pos,
-            path_len: lower.len() as u32,
-            depth: rec.depth as u16,
-            mtime: rec.mtime as i64,
-        })
+        // A (deduped lowercased arena): a directory stores its full lowercased
+        // path; a file stores only its basename and references its parent, so
+        // the full path is matched as parent + "/" + basename.
+        let (first_pos, path_len, name_match) = if stores_full_path(rec) {
+            let path = self.candidate.lower_stored(idx);
+            let name = self.candidate.lower_name(idx);
+            let mut first_pos = u32::MAX;
+            for term in q.terms() {
+                let pos = term.find_lower(path)?;
+                first_pos = first_pos.min(pos as u32);
+            }
+            let name_match = q.terms().iter().all(|t| t.find_lower(name).is_some());
+            (first_pos, path.len() as u32, name_match)
+        } else {
+            let parent = self.candidate.lower_parent(idx);
+            let name = self.candidate.lower_stored(idx);
+            let sep: &[u8] = if parent.ends_with(b"/") { b"" } else { b"/" };
+            let mut first_pos = u32::MAX;
+            let mut name_match = true;
+            for term in q.terms() {
+                let (pos, nm) = term.find_in_file_path_lower(parent, name, sep)?;
+                first_pos = first_pos.min(pos as u32);
+                if !nm {
+                    name_match = false;
+                }
+            }
+            (first_pos, (parent.len() + sep.len() + name.len()) as u32, name_match)
+        };
+        // Return the packed sort key directly, so the scan does not build and
+        // copy a `Rank` struct per record (J).
+        Some(
+            Rank {
+                name_match,
+                first_pos,
+                path_len,
+                depth: rec.depth as u16,
+                mtime: rec.mtime as i64,
+            }
+            .key(),
+        )
     }
 
     fn scan_sequential(&self, q: &Query, want: usize) -> (usize, TopN) {
         let mut top = TopN::new(want);
         let mut total = 0usize;
         for (i, rec) in self.records.iter().enumerate() {
-            if let Some(rank) = self.match_record(i as u32, rec, q) {
+            if let Some(key) = self.match_record(i as u32, rec, q) {
                 total += 1;
-                top.push(i as u32, rank);
+                top.push(i as u32, key);
             }
         }
         (total, top)
@@ -1367,8 +1415,8 @@ impl Index {
                     let mut count = count;
                     for (j, rec) in chunk.iter().enumerate() {
                         let i = (base + j) as u32;
-                        if let Some(rank) = self.match_record(i, rec, q) {
-                            top.push(i, rank);
+                        if let Some(key) = self.match_record(i, rec, q) {
+                            top.push(i, key);
                             count += 1;
                         }
                     }
@@ -1389,9 +1437,9 @@ impl Index {
         let mut top = TopN::new(want);
         let mut total = 0usize;
         for &i in cands {
-            if let Some(rank) = self.match_record(i, &self.records[i as usize], q) {
+            if let Some(key) = self.match_record(i, &self.records[i as usize], q) {
                 total += 1;
-                top.push(i, rank);
+                top.push(i, key);
             }
         }
         (total, top)
@@ -1406,8 +1454,8 @@ impl Index {
                 |(count, mut top), chunk| {
                     let mut count = count;
                     for &i in chunk {
-                        if let Some(rank) = self.match_record(i, &self.records[i as usize], q) {
-                            top.push(i, rank);
+                        if let Some(key) = self.match_record(i, &self.records[i as usize], q) {
+                            top.push(i, key);
                             count += 1;
                         }
                     }
@@ -1438,7 +1486,7 @@ impl Index {
     /// split. Used as the test-only reference for the candidate index (F1) and
     /// the lowercased arena (F2), and as the production fallback when the
     /// candidate index is disabled (F10).
-    fn match_record_original(&self, rec: &FileRecord, q: &Query) -> Option<Rank> {
+    fn match_record_original(&self, rec: &FileRecord, q: &Query) -> Option<u64> {
         if rec.is_deleted() {
             return None;
         }
@@ -1467,13 +1515,16 @@ impl Index {
         };
         let name = self.name_bytes(rec);
         let name_match = q.terms().iter().all(|t| t.find(name).is_some());
-        Some(Rank {
-            name_match,
-            first_pos,
-            path_len,
-            depth: rec.depth as u16,
-            mtime: rec.mtime as i64,
-        })
+        Some(
+            Rank {
+                name_match,
+                first_pos,
+                path_len,
+                depth: rec.depth as u16,
+                mtime: rec.mtime as i64,
+            }
+            .key(),
+        )
     }
 
     /// A full linear scan using the pre-M23 matcher, for equivalence tests.
@@ -1497,7 +1548,7 @@ impl Index {
             .into_iter()
             .skip(offset)
             .take(limit)
-            .map(|(i, _)| self.hit(i))
+            .map(|i| self.hit(i))
             .collect();
         SearchOutcome { hits, total }
     }
@@ -1510,7 +1561,7 @@ impl Index {
 /// stable across the parallel scan.
 struct TopN {
     limit: usize,
-    heap: BinaryHeap<Reverse<(Rank, Reverse<u32>)>>,
+    heap: BinaryHeap<Reverse<(u64, Reverse<u32>)>>,
 }
 
 impl TopN {
@@ -1521,17 +1572,21 @@ impl TopN {
         }
     }
 
-    fn push(&mut self, idx: u32, rank: Rank) {
+    fn push(&mut self, idx: u32, key: u64) {
         if self.limit == 0 {
             return;
         }
-        let key = (rank, Reverse(idx));
+        // The key is a single `u64` so the heap compares one integer instead of
+        // a multi-field struct (J). This is the dominant cost of a broad query,
+        // where every record matches and is pushed.
         if self.heap.len() < self.limit {
-            self.heap.push(Reverse(key));
-        } else if let Some(Reverse(worst)) = self.heap.peek() {
-            if key > *worst {
+            self.heap.push(Reverse((key, Reverse(idx))));
+            return;
+        }
+        if let Some(Reverse((worst_key, worst_idx))) = self.heap.peek() {
+            if key > *worst_key || (key == *worst_key && idx < worst_idx.0) {
                 self.heap.pop();
-                self.heap.push(Reverse(key));
+                self.heap.push(Reverse((key, Reverse(idx))));
             }
         }
     }
@@ -1554,7 +1609,7 @@ impl TopN {
             self.heap.extend(other.heap);
             return;
         }
-        let mut all: Vec<Reverse<(Rank, Reverse<u32>)>> =
+        let mut all: Vec<Reverse<(u64, Reverse<u32>)>> =
             self.heap.drain().chain(other.heap).collect();
         if all.len() > self.limit {
             // The smallest keys are the best (the heap is a min-heap of
@@ -1565,16 +1620,17 @@ impl TopN {
         self.heap = BinaryHeap::from(all);
     }
 
-    /// Consume the collector, returning `(record index, rank)` best-first.
-    fn into_sorted(self) -> Vec<(u32, Rank)> {
-        let mut v: Vec<(u32, Rank)> = self
+    /// Consume the collector, returning the record indices best-first.
+    fn into_sorted(self) -> Vec<u32> {
+        let mut v: Vec<(u64, u32)> = self
             .heap
             .into_iter()
-            .map(|Reverse((rank, Reverse(idx)))| (idx, rank))
+            .map(|Reverse((key, Reverse(idx)))| (key, idx))
             .collect();
-        // Best first; ties broken by ascending record index for determinism.
-        v.sort_by_key(|a| Reverse((a.1, Reverse(a.0))));
-        v
+        // Best first (larger key); ties broken by ascending record index for
+        // determinism.
+        v.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        v.into_iter().map(|(_, idx)| idx).collect()
     }
 }
 
@@ -1976,6 +2032,19 @@ mod tests {
         // the reconstructed-path matcher) and reclaim its memory.
         let mut index = Index::new();
         index.add_root(Path::new("/"), FsKind::Other);
+        // Directory records are included because the two-level candidate index
+        // indexes directory names per directory record (E).
+        for p in [
+            "/home",
+            "/home/sam",
+            "/home/sam/Documents",
+            "/etc",
+            "/tmp",
+            "/opt",
+            "/opt/app",
+        ] {
+            index.insert(Path::new(p), true, 0, 0);
+        }
         for p in [
             "/home/sam/Documents/report-2024.pdf",
             "/home/sam/Documents/notes.md",
@@ -2099,7 +2168,7 @@ mod tests {
         assert_eq!(back.search("zzz", 10, 0).hits.len(), 0);
     }
 
-    fn rank_with_pos(first_pos: u32) -> Rank {
+    fn rank_with_pos(first_pos: u32) -> u64 {
         Rank {
             name_match: true,
             first_pos,
@@ -2107,24 +2176,32 @@ mod tests {
             depth: 1,
             mtime: 0,
         }
+        .key()
     }
 
     #[test]
     fn insert_batch_matches_individual_inserts() {
         // F5: a batch insert must produce exactly the same index as inserting
-        // each record one at a time.
-        let paths: Vec<String> = (0..500)
-            .map(|i| format!("/data/dir{:03}/file-{i:04}.txt", i % 20))
-            .collect();
+        // each record one at a time. The paths are sorted and include a
+        // directory record per directory (the scanner's contract), so the
+        // two-level candidate index can use subtree ranges (E).
+        let mut paths: Vec<(String, bool)> = vec![("/data".to_string(), true)];
+        for d in 0..20 {
+            paths.push((format!("/data/dir{d:03}"), true));
+        }
+        for i in 0..500 {
+            paths.push((format!("/data/dir{:03}/file-{i:04}.txt", i % 20), false));
+        }
+        paths.sort_by(|a, b| a.0.cmp(&b.0));
 
         let mut batched = Index::new();
         batched.add_root(Path::new("/"), FsKind::Other);
-        batched.reserve(paths.len(), paths.iter().map(|p| p.len()).sum());
+        batched.reserve(paths.len(), paths.iter().map(|(p, _)| p.len()).sum());
         let entries: Vec<BatchEntry> = paths
             .iter()
-            .map(|p| BatchEntry {
+            .map(|(p, is_dir)| BatchEntry {
                 path: p.as_bytes(),
-                is_dir: false,
+                is_dir: *is_dir,
                 is_symlink: false,
                 size: 1,
                 mtime: 0,
@@ -2134,8 +2211,8 @@ mod tests {
 
         let mut one_by_one = Index::new();
         one_by_one.add_root(Path::new("/"), FsKind::Other);
-        for p in &paths {
-            one_by_one.insert(Path::new(p), false, 1, 0);
+        for (p, is_dir) in &paths {
+            one_by_one.insert(Path::new(p), *is_dir, 1, 0);
         }
 
         assert_eq!(batched.len(), one_by_one.len());
@@ -2281,7 +2358,6 @@ mod tests {
         let sorted = a.into_sorted();
         assert_eq!(sorted.len(), 3);
         // Best three by earliest position: pos 1 (idx 3), 2 (idx 5), 3 (idx 1).
-        let idxs: Vec<u32> = sorted.iter().map(|(i, _)| *i).collect();
-        assert_eq!(idxs, vec![3, 5, 1]);
+        assert_eq!(sorted, vec![3, 5, 1]);
     }
 }

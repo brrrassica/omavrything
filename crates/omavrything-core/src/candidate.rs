@@ -1,5 +1,5 @@
-//! Candidate-narrowing index: trigram postings, a lowercased path arena, and a
-//! sorted token table.
+//! Candidate-narrowing index: a two-level trigram index, a lowercased path
+//! arena, and a sorted token table.
 //!
 //! The linear scan in [`crate::index`] examines every record. This module builds
 //! a derived index that lets a query narrow the scan to a small candidate set
@@ -8,17 +8,26 @@
 //!
 //! Three structures cooperate:
 //!
-//! - **Trigram postings (F1, F14, F15).** Every path component is split on `/`
-//!   and its three-byte windows are recorded. A query term that is ASCII, at
-//!   least three bytes long, and free of `/` cannot span a separator, so
-//!   intersecting the posting lists of its trigrams yields a superset of the
-//!   records that contain it. Terms that are shorter, non-ASCII, or contain `/`
-//!   contribute no constraint (the scan falls back to every record for that
-//!   term). The postings are stored in a **CSR / flat layout** (F14): one
-//!   varint-encoded, delta-encoded posting arena plus a per-trigram byte offset,
-//!   instead of a `HashMap<u32, Vec<u32>>` whose per-list `Vec` headers dominate
-//!   the memory. Delta + varint encoding (F15) shrinks the arena further while
-//!   keeping the intersection speedup.
+//! - **Two-level trigram postings (E).** The naive design records the trigrams of
+//!   *every* path component of *every* record, so a directory's trigrams are
+//!   repeated in each of its descendants — the postings dominate the index's
+//!   memory. The two-level design instead records:
+//!   - **Level 1** — the trigrams of each record's **basename**, once per record.
+//!   - **Level 2** — the trigrams of each **directory's name**, once per
+//!     directory. A directory's trigrams apply to all of its descendants, which
+//!     are a **contiguous range** of record indices because records are inserted
+//!     sorted by path. The range is stored in `subtree_end` and expanded at
+//!     lookup time.
+//!
+//!   A query term that is ASCII, at least three bytes long, and free of `/`
+//!   cannot span a separator, so intersecting the posting lists of its trigrams
+//!   yields a superset of the records that contain it. Terms that are shorter,
+//!   non-ASCII, or contain `/` contribute no constraint (the scan falls back to
+//!   every record for that term). The postings are stored in a **CSR / flat
+//!   layout** (F14): one varint-encoded, delta-encoded posting arena plus a
+//!   per-trigram byte offset, instead of a `HashMap<u32, Vec<u32>>` whose per-list
+//!   `Vec` headers dominate the memory. Delta + varint encoding (F15) shrinks the
+//!   arena further while keeping the intersection speedup.
 //! - **Lowercased path arena (F2).** Each record's full path is stored
 //!   ASCII-lowercased and back-to-back in `lower`, with a per-record offset and
 //!   length. The hot matching loop reads this contiguous arena instead of chasing
@@ -44,14 +53,15 @@
 //!
 //! A cold scan appends every record with [`CandidateIndex::insert_append`] and
 //! then calls [`CandidateIndex::finish_bulk`], which finalizes the accumulated
-//! postings into the flat CSR arena. Live inserts and renames after that append
-//! to a small **delta** map, which is unioned with the CSR at lookup time and
-//! merged into the CSR on the next `finish_bulk` (e.g. from
-//! [`crate::index::Index::shrink`]). This keeps the steady-state memory in the
-//! compact CSR while preserving the append-only, incremental update path.
+//! postings into the flat CSR arenas and closes the subtree ranges. Live inserts
+//! and renames after that append to a small **delta** map holding the record's
+//! **full-path** component trigrams, which is unioned with the CSR at lookup
+//! time. A live record is therefore covered for both basename and
+//! ancestor-directory matches without touching the bulk subtree ranges. The
+//! delta is reclaimed on the next full rebuild ([`crate::index::Index::compact`]
+//! or a snapshot load).
 
 use std::cmp::Ordering;
-use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
 use crate::query::{Query, Term};
@@ -93,35 +103,26 @@ impl std::hash::BuildHasher for TrigramBuildHasher {
     }
 }
 
+/// A trigram -> sorted record list map, the staging form of the postings.
+type TrigramMap = HashMap<u32, Vec<u32>, TrigramBuildHasher>;
+
 /// Pack a three-byte trigram into a `u32` (little-endian byte order).
 fn pack_trigram(a: u8, b: u8, c: u8) -> u32 {
     (a as u32) | ((b as u32) << 8) | ((c as u32) << 16)
 }
 
-/// One entry in the sorted token table: the offset of a record's basename into
-/// [`CandidateIndex::lower`], and the record it belongs to (F13).
-///
-/// The basename length is **not** stored: it is derived from the record's stored
-/// path length, since the basename is always the suffix of the record's full
-/// path. This packs the entry from 12 to 8 bytes.
-#[derive(Debug, Clone, Copy)]
-struct TokenEntry {
-    /// Offset of the basename into [`CandidateIndex::lower`].
-    off: u32,
-    /// The record the basename belongs to.
-    record: u32,
-}
-
 /// A finalized, flat trigram posting store (F14, F15).
 ///
-/// `slots` maps a packed trigram to a slot index; `offsets[slot]..offsets[slot +
+/// `keys` is the sorted list of packed trigrams; `offsets[slot]..offsets[slot +
 /// 1]` is that trigram's byte range in `data`, which holds the record indices
 /// delta-encoded and varint-encoded (F15). The record indices within a slot are
-/// strictly increasing, so the deltas are positive and small.
+/// strictly increasing, so the deltas are positive and small. A sorted key array
+/// plus binary search (F) replaces the previous `HashMap<u32, u32>`, whose
+/// control bytes and bucket slack cost more than the keys themselves.
 #[derive(Debug, Default, Clone)]
 struct CsrPostings {
-    /// Trigram -> slot index.
-    slots: HashMap<u32, u32, TrigramBuildHasher>,
+    /// Sorted packed trigrams; `keys[i]` is slot `i`.
+    keys: Vec<u32>,
     /// Byte offsets into `data`; `offsets[i]..offsets[i + 1]` is slot `i`.
     offsets: Vec<u32>,
     /// Varint delta-encoded record indices, one contiguous range per slot.
@@ -130,21 +131,26 @@ struct CsrPostings {
 
 impl CsrPostings {
     /// Build the flat layout from a trigram -> sorted record list map.
-    fn build(map: &HashMap<u32, Vec<u32>, TrigramBuildHasher>) -> Self {
-        let mut slots = HashMap::with_capacity_and_hasher(map.len(), TrigramBuildHasher);
-        let mut offsets = Vec::with_capacity(map.len() + 1);
+    fn build(map: &TrigramMap) -> Self {
+        let mut keys: Vec<u32> = map.keys().copied().collect();
+        keys.sort_unstable();
+        let mut offsets = Vec::with_capacity(keys.len() + 1);
         let mut data = Vec::new();
         offsets.push(0u32);
-        for (slot, (&tg, list)) in map.iter().enumerate() {
-            slots.insert(tg, slot as u32);
-            encode_delta_varint(list, &mut data);
+        for &tg in &keys {
+            encode_delta_varint(&map[&tg], &mut data);
             offsets.push(data.len() as u32);
         }
         Self {
-            slots,
+            keys,
             offsets,
             data,
         }
+    }
+
+    /// The slot for a trigram, or `None` when absent.
+    fn slot_of(&self, tg: u32) -> Option<u32> {
+        self.keys.binary_search(&tg).ok().map(|i| i as u32)
     }
 
     /// Decode the posting list for `slot` into sorted record indices.
@@ -165,16 +171,29 @@ pub struct CandidateIndex {
     off: Vec<u32>,
     /// Per-record length in `lower`.
     len: Vec<u16>,
-    /// Finalized flat trigram postings (F14, F15). Empty until `finish_bulk`.
+    /// Per-record parent directory index (`u32::MAX` for a root), used to
+    /// reconstruct a file's full path from its parent's stored path (A).
+    parent: Vec<u32>,
+    /// Level 1: finalized basename-trigram postings (F14, F15). Empty until
+    /// `finish_bulk`.
     csr: CsrPostings,
-    /// Trigram -> sorted record indices added after finalization (live inserts
-    /// and renames). Unioned with the CSR at lookup time and merged into it on
-    /// the next `finish_bulk`. During a bulk build this holds every posting.
-    delta: HashMap<u32, Vec<u32>, TrigramBuildHasher>,
-    /// Sorted token table.
-    tokens: Vec<TokenEntry>,
-    /// Unsorted token additions, merged into `tokens` once they grow.
-    pending: Vec<TokenEntry>,
+    /// Level 2: finalized directory-name-trigram postings (E). Empty until
+    /// `finish_bulk`.
+    dir_csr: CsrPostings,
+    /// Sorted `(directory record, exclusive end of its descendant range)` pairs
+    /// (E). Only directories appear; the range is `[dir, end)`.
+    subtree_end: Vec<(u32, u32)>,
+    /// Bulk-build staging for level 1 (basename trigrams), then the live overlay
+    /// (full-path component trigrams) after `finish_bulk`.
+    delta: TrigramMap,
+    /// Bulk-build staging for level 2 (directory-name trigrams).
+    dir_delta: TrigramMap,
+    /// Bulk-build stack of open directories `(record, path_off, path_len)`, used
+    /// to close subtree ranges. Empty after `finish_bulk`.
+    stack: Vec<(u32, u32, u32)>,
+    /// Whether the bulk build has been finalized. Before it, `candidates`
+    /// declines to narrow (the subtree ranges are incomplete).
+    bulk_finalized: bool,
     /// Stop-listed trigrams (F12): too common to be worth a posting list, so
     /// their list is dropped and they contribute no constraint. A query term
     /// whose trigrams are all stop-listed cannot narrow the scan.
@@ -191,18 +210,17 @@ pub struct CandidateMemory {
     pub off: u64,
     /// Per-record length array bytes.
     pub len: u64,
-    /// Trigram posting bytes (the CSR arena plus any delta postings).
+    /// Per-record parent array bytes (A).
+    pub parent: u64,
+    /// Trigram posting bytes (the CSR arenas plus any delta postings).
     pub postings: u64,
     /// Trigram map overhead (keys, slot values, offsets, control bytes).
     pub map: u64,
-    /// Token table bytes (sorted plus pending).
-    pub tokens: u64,
+    /// Subtree-range array bytes (E).
+    pub subtree: u64,
     /// Stop-list set bytes.
     pub stop: u64,
 }
-
-/// The number of pending tokens below which a merge is not worth it.
-const PENDING_MIN: usize = 4096;
 
 /// A trigram whose posting list covers more than `1 / STOP_LIST_DIVISOR` of the
 /// records is stop-listed (F12): its list is dropped and it contributes no
@@ -227,14 +245,6 @@ fn stop_list_divisor() -> usize {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(STOP_LIST_DIVISOR)
-}
-
-/// Whether the token table is built, overridable with
-/// `OMAVRYTHING_TOKEN_TABLE=0` for measurement (R10).
-fn tokens_enabled() -> bool {
-    std::env::var("OMAVRYTHING_TOKEN_TABLE")
-        .map(|v| v != "0")
-        .unwrap_or(true)
 }
 
 /// Append `v` to `out` as an unsigned LEB128 varint (F15).
@@ -283,6 +293,50 @@ fn decode_delta_varint(data: &[u8]) -> Vec<u32> {
     out
 }
 
+/// The basename of a path: the bytes after the last `/`.
+fn basename_of(path: &[u8]) -> &[u8] {
+    let start = path.iter().rposition(|&b| b == b'/').map_or(0, |p| p + 1);
+    &path[start..]
+}
+
+/// Whether `child` is `parent` itself or a descendant of it.
+fn is_descendant(child: &[u8], parent: &[u8]) -> bool {
+    if !child.starts_with(parent) {
+        return false;
+    }
+    if child.len() == parent.len() {
+        return true;
+    }
+    parent.ends_with(b"/") || child[parent.len()] == b'/'
+}
+
+/// Index the trigrams of every `/`-separated component of `bytes` into `map`.
+fn index_trigrams(map: &mut TrigramMap, stop: &HashSet<u32>, idx: u32, bytes: &[u8], append: bool) {
+    for comp in bytes.split(|&b| b == b'/') {
+        if comp.len() < 3 {
+            continue;
+        }
+        for w in comp.windows(3) {
+            let tg = pack_trigram(w[0], w[1], w[2]);
+            // A stop-listed trigram has no posting list; skip it so a live
+            // insert does not rebuild a list the bulk build dropped (F12).
+            if !stop.is_empty() && stop.contains(&tg) {
+                continue;
+            }
+            let list = map.entry(tg).or_insert_with(|| Vec::with_capacity(4));
+            if append {
+                // `idx` is the largest so far, so a push keeps the list sorted;
+                // skip a repeat of the same trigram within this path.
+                if list.last() != Some(&idx) {
+                    list.push(idx);
+                }
+            } else if let Err(pos) = list.binary_search(&idx) {
+                list.insert(pos, idx);
+            }
+        }
+    }
+}
+
 impl CandidateIndex {
     pub fn new() -> Self {
         Self::default()
@@ -292,138 +346,140 @@ impl CandidateIndex {
     /// tokens.
     ///
     /// `idx` is the record's index. For a freshly appended record it is
-    /// `records.len()`, so the trigram posting lists stay sorted; for a renamed
-    /// record it is an existing index, and the new postings are inserted in
-    /// sorted position.
-    pub fn insert(&mut self, idx: u32, lower_path: &[u8]) {
-        self.insert_inner(idx, lower_path, false);
+    /// `records.len()`, so the posting lists stay sorted; for a renamed record it
+    /// is an existing index, and the new postings are inserted in sorted
+    /// position. `is_dir` selects the level-2 (directory) postings during a bulk
+    /// build.
+    pub fn insert(&mut self, idx: u32, lower_path: &[u8], is_dir: bool, parent: u32) {
+        self.insert_inner(idx, lower_path, is_dir, parent, false);
     }
 
     /// Append a record whose index is greater than every index already inserted
     /// (a fresh, monotonically increasing bulk build). Posting lists are pushed
     /// to rather than binary-searched, which is markedly faster for a cold scan
     /// (F5). The caller must guarantee `idx` is strictly increasing.
-    pub fn insert_append(&mut self, idx: u32, lower_path: &[u8]) {
-        self.insert_inner(idx, lower_path, true);
+    pub fn insert_append(&mut self, idx: u32, lower_path: &[u8], is_dir: bool, parent: u32) {
+        self.insert_inner(idx, lower_path, is_dir, parent, true);
     }
 
-    fn insert_inner(&mut self, idx: u32, lower_path: &[u8], append: bool) {
+    fn insert_inner(
+        &mut self,
+        idx: u32,
+        lower_path: &[u8],
+        is_dir: bool,
+        parent: u32,
+        append: bool,
+    ) {
+        // Store the basename for files (with a parent), the full path for
+        // directories and parentless records, mirroring the main arena (A).
+        let stored: &[u8] = if is_dir || parent == u32::MAX {
+            lower_path
+        } else {
+            basename_of(lower_path)
+        };
         let off = self.lower.len() as u32;
-        self.lower.extend_from_slice(lower_path);
+        self.lower.extend_from_slice(stored);
 
         let i = idx as usize;
         if self.off.len() <= i {
             self.off.resize(i + 1, u32::MAX);
             self.len.resize(i + 1, 0);
+            self.parent.resize(i + 1, u32::MAX);
         }
         self.off[i] = off;
-        self.len[i] = lower_path.len().min(u16::MAX as usize) as u16;
+        self.len[i] = stored.len().min(u16::MAX as usize) as u16;
+        self.parent[i] = parent;
 
-        // Trigram postings over each path component. A term without `/` cannot
-        // span a separator, so component trigrams are sufficient.
-        for comp in lower_path.split(|&b| b == b'/') {
-            if comp.len() < 3 {
-                continue;
+        if append {
+            // Sorted bulk build: two-level. Level 1 = basename trigrams; level 2
+            // = directory-name trigrams; maintain the subtree stack.
+            let basename = basename_of(lower_path);
+            index_trigrams(&mut self.delta, &self.stop, idx, basename, append);
+            if is_dir {
+                index_trigrams(&mut self.dir_delta, &self.stop, idx, basename, append);
             }
-            for w in comp.windows(3) {
-                let tg = pack_trigram(w[0], w[1], w[2]);
-                // A stop-listed trigram has no posting list; skip it so a live
-                // insert does not rebuild a list the bulk build dropped (F12).
-                // The stop-list is empty during the initial bulk build, so guard
-                // the lookup (R8).
-                if !self.stop.is_empty() && self.stop.contains(&tg) {
-                    continue;
-                }
-                // A small initial capacity avoids the first reallocations for a
-                // trigram that appears in many records (R8).
-                let list = self
-                    .delta
-                    .entry(tg)
-                    .or_insert_with(|| Vec::with_capacity(4));
-                if append {
-                    // `idx` is the largest so far, so a push keeps the list
-                    // sorted; skip a repeat of the same trigram within this path.
-                    if list.last() != Some(&idx) {
-                        list.push(idx);
-                    }
-                } else if let Err(pos) = list.binary_search(&idx) {
-                    list.insert(pos, idx);
-                }
-            }
+            self.push_subtree(idx, lower_path, is_dir);
+        } else {
+            // Unsorted/live: index every path component so the record is covered
+            // for both basename and ancestor-directory matches.
+            index_trigrams(&mut self.delta, &self.stop, idx, lower_path, append);
         }
 
-        // Token table (F13): only the basename is recorded, not every path
-        // component. The trigram set already covers directory components, so the
-        // token table is a basename-prefix shortcut; one entry per record instead
-        // of one per component cuts its memory ~10x. `OMAVRYTHING_TOKEN_TABLE=0`
-        // disables it entirely (a measurement knob for R10).
-        if tokens_enabled() {
-            let start = lower_path
-                .iter()
-                .rposition(|&b| b == b'/')
-                .map_or(0, |i| i + 1);
-            if start < lower_path.len() {
-                self.push_token(off + start as u32, idx);
-            }
-        }
+    }
 
-        if self.pending.len() >= self.tokens.len().max(PENDING_MIN) {
-            self.merge_pending();
+    /// Maintain the bulk-build subtree stack: close every open directory whose
+    /// subtree does not include the new record, then open the new record if it is
+    /// a directory.
+    fn push_subtree(&mut self, idx: u32, full_path: &[u8], is_dir: bool) {
+        loop {
+            let Some(&(d, doff, dlen)) = self.stack.last() else {
+                break;
+            };
+            let descendant = {
+                let dp = &self.lower[doff as usize..(doff + dlen) as usize];
+                is_descendant(full_path, dp)
+            };
+            if descendant {
+                break;
+            }
+            self.set_dir_end(d, idx);
+            self.stack.pop();
+        }
+        if is_dir {
+            let i = idx as usize;
+            self.stack.push((idx, self.off[i], self.len[i] as u32));
         }
     }
 
-    /// Preallocate the arenas, posting map, and token table for a bulk build of
+    /// Record the exclusive end of directory `d`'s descendant range.
+    fn set_dir_end(&mut self, d: u32, end: u32) {
+        self.subtree_end.push((d, end));
+    }
+
+    /// Replace the subtree-range array with one derived from the record parent
+    /// links (E). The Index computes this so the ranges are correct even when
+    /// records are not sorted by path (e.g. after live updates). The dense
+    /// per-record array is compacted to the directories only.
+    pub fn set_subtree_end(&mut self, ends: Vec<u32>) {
+        self.subtree_end = ends
+            .into_iter()
+            .enumerate()
+            .filter(|(_, e)| *e != 0)
+            .map(|(i, e)| (i as u32, e))
+            .collect();
+    }
+
+    /// Preallocate the arenas, posting maps, and token table for a bulk build of
     /// `records` records totalling `path_bytes` of lowercased path bytes (F5).
     pub fn reserve(&mut self, records: usize, path_bytes: usize) {
         self.lower.reserve(path_bytes);
         self.off.reserve(records);
         self.len.reserve(records);
-        self.pending.reserve(records);
-        self.tokens.reserve(records);
+        self.subtree_end.reserve(records);
         // A rough upper bound on the number of distinct trigrams; capped so a
         // huge index does not reserve the full 16 MiB trigram space up front.
         self.delta.reserve(records.min(1 << 20));
     }
 
-    fn push_token(&mut self, off: u32, record: u32) {
-        self.pending.push(TokenEntry { off, record });
-    }
-
-    /// Sort the pending tokens and merge them into the sorted table.
-    fn merge_pending(&mut self) {
-        if self.pending.is_empty() {
+    /// Finalize a bulk build: close the subtree ranges, compute the stop-list
+    /// (F12), and flatten the accumulated postings into the CSR arenas (F14, F15).
+    ///
+    /// Idempotent: a second call (e.g. from [`crate::index::Index::shrink`]) only
+    /// merges tokens, so the live overlay is never folded into the bulk arenas.
+    pub fn finish_bulk(&mut self) {
+        if self.bulk_finalized {
             return;
         }
-        let lower = &self.lower;
-        let off = &self.off;
-        let len = &self.len;
-        self.pending
-            .sort_unstable_by(|a, b| token_cmp(lower, off, len, a, b));
-
-        let mut merged = Vec::with_capacity(self.tokens.len() + self.pending.len());
-        let (mut i, mut j) = (0usize, 0usize);
-        while i < self.tokens.len() && j < self.pending.len() {
-            if token_cmp(lower, off, len, &self.tokens[i], &self.pending[j]) != Ordering::Greater {
-                merged.push(self.tokens[i]);
-                i += 1;
-            } else {
-                merged.push(self.pending[j]);
-                j += 1;
-            }
+        // Close any directories still open at the end of the bulk build.
+        let n = self.off.len() as u32;
+        while let Some((d, _, _)) = self.stack.pop() {
+            self.set_dir_end(d, n);
         }
-        merged.extend_from_slice(&self.tokens[i..]);
-        merged.extend_from_slice(&self.pending[j..]);
-        self.tokens = merged;
-        self.pending.clear();
-    }
-
-    /// Finalize a bulk build: merge any pending tokens into the sorted table,
-    /// compute the stop-list (F12), and flatten the accumulated postings into
-    /// the CSR arena (F14, F15).
-    pub fn finish_bulk(&mut self) {
-        self.merge_pending();
+        self.subtree_end.sort_unstable();
+        self.subtree_end.dedup();
         self.compute_stop_list();
         self.finalize_postings();
+        self.bulk_finalized = true;
     }
 
     /// Drop the posting lists of the most frequent trigrams (F12). A dropped
@@ -458,47 +514,35 @@ impl CandidateIndex {
                 true
             }
         });
+        // A directory trigram that appears in most directories would expand to
+        // most of the index, so stop-list it too (E).
+        self.dir_delta.retain(|&tg, list| {
+            if list.len() > threshold {
+                stop.insert(tg);
+                false
+            } else {
+                true
+            }
+        });
         self.stop = stop;
     }
 
-    /// Flatten the delta postings into the CSR arena (F14, F15). On the first
-    /// finalization the CSR is built directly from the delta; on a later one the
-    /// delta is merged into the existing CSR (decoded, unioned, re-encoded).
+    /// Flatten the staged postings into the CSR arenas (F14, F15).
     fn finalize_postings(&mut self) {
-        if self.delta.is_empty() {
-            return;
-        }
-        if self.csr.slots.is_empty() {
+        if !self.delta.is_empty() {
             self.csr = CsrPostings::build(&self.delta);
-        } else {
-            let mut merged: HashMap<u32, Vec<u32>, TrigramBuildHasher> =
-                HashMap::with_capacity_and_hasher(
-                    self.csr.slots.len() + self.delta.len(),
-                    TrigramBuildHasher,
-                );
-            for (&tg, &slot) in &self.csr.slots {
-                merged.insert(tg, self.csr.decode(slot));
-            }
-            for (&tg, list) in &self.delta {
-                match merged.entry(tg) {
-                    Entry::Occupied(mut e) => {
-                        let dst = e.get_mut();
-                        let union = union_sorted(dst, list);
-                        *dst = union;
-                    }
-                    Entry::Vacant(e) => {
-                        e.insert(list.clone());
-                    }
-                }
-            }
-            self.csr = CsrPostings::build(&merged);
+            self.delta.clear();
         }
-        self.delta.clear();
+        if !self.dir_delta.is_empty() {
+            self.dir_csr = CsrPostings::build(&self.dir_delta);
+            self.dir_delta.clear();
+        }
     }
 
-    /// The ASCII-lowercased full path of a record, or an empty slice when the
-    /// record has no entry.
-    pub fn lower_path(&self, idx: u32) -> &[u8] {
+    /// The bytes stored for a record: the lowercased basename for a file (with a
+    /// parent), the lowercased full path for a directory or parentless record
+    /// (A). Empty when the record has no entry.
+    pub fn lower_stored(&self, idx: u32) -> &[u8] {
         let i = idx as usize;
         if i >= self.off.len() || self.off[i] == u32::MAX {
             return &[];
@@ -507,11 +551,19 @@ impl CandidateIndex {
         &self.lower[off..off + self.len[i] as usize]
     }
 
-    /// The basename of a record's lowercased full path.
+    /// The basename of a record's lowercased path.
     pub fn lower_name(&self, idx: u32) -> &[u8] {
-        let p = self.lower_path(idx);
-        let start = p.iter().rposition(|&b| b == b'/').map_or(0, |i| i + 1);
-        &p[start..]
+        basename_of(self.lower_stored(idx))
+    }
+
+    /// The lowercased full path of a record's parent directory (A). The parent
+    /// is always a directory, so it stores its full path.
+    pub fn lower_parent(&self, idx: u32) -> &[u8] {
+        let i = idx as usize;
+        if i >= self.parent.len() || self.parent[i] == u32::MAX {
+            return &[];
+        }
+        self.lower_stored(self.parent[i])
     }
 
     /// The candidate record indices for `q`, or `None` when no term can narrow
@@ -575,54 +627,65 @@ impl CandidateIndex {
             }
         }
 
-        // F3: union with the token-prefix candidates. The trigram set already
-        // guarantees completeness, so this only ever adds records that the
-        // matcher then confirms or rejects.
-        let token_cands = self.token_prefix_candidates(needle);
-        Some(union_sorted(&acc, &token_cands))
+        Some(acc)
     }
 
-    /// The posting list for a trigram: the decoded CSR slot unioned with any
-    /// delta postings, or `None` when no record contains the trigram.
+    /// The posting list for a trigram: the union of the level-1 basename
+    /// postings, the level-2 directory postings expanded to their descendant
+    /// ranges, and the live delta. `None` when no record contains the trigram.
     fn postings_for(&self, tg: u32) -> Option<Vec<u32>> {
-        let csr = self.csr.slots.get(&tg).map(|&slot| self.csr.decode(slot));
-        let delta = self.delta.get(&tg);
-        match (csr, delta) {
-            (None, None) => None,
-            (Some(c), None) => Some(c),
-            (None, Some(d)) => Some(d.clone()),
-            (Some(c), Some(d)) => Some(union_sorted(&c, d)),
+        let mut parts: Vec<Vec<u32>> = Vec::new();
+        if let Some(slot) = self.csr.slot_of(tg) {
+            parts.push(self.csr.decode(slot));
+        }
+        if let Some(slot) = self.dir_csr.slot_of(tg) {
+            parts.push(self.expand_dirs(&self.dir_csr.decode(slot)));
+        }
+        if let Some(d) = self.delta.get(&tg) {
+            parts.push(d.clone());
+        }
+        if let Some(d) = self.dir_delta.get(&tg) {
+            parts.push(self.expand_dirs(d));
+        }
+        match parts.len() {
+            0 => None,
+            1 => Some(parts.pop().unwrap()),
+            _ => {
+                let mut acc = parts.pop().unwrap();
+                for p in parts {
+                    acc = union_sorted(&acc, &p);
+                }
+                Some(acc)
+            }
         }
     }
 
-    /// Records with a path component that starts with `needle`, from the sorted
-    /// token table and the pending additions.
-    fn token_prefix_candidates(&self, needle: &[u8]) -> Vec<u32> {
-        if !tokens_enabled() {
-            return Vec::new();
-        }
+    /// Expand a sorted list of directory records to the union of their
+    /// descendant ranges `[dir, subtree_end[dir])`, merging overlapping ranges.
+    fn expand_dirs(&self, dirs: &[u32]) -> Vec<u32> {
+        // An unset range (0) means the directory is still open (the bulk build
+        // has not closed it), so its subtree extends to the current end. This
+        // keeps the expansion a superset even before `finish_bulk`.
+        let n = self.off.len() as u32;
+        let end_of = |d: u32| -> u32 {
+            match self.subtree_end.binary_search_by_key(&d, |&(k, _)| k) {
+                Ok(i) => self.subtree_end[i].1,
+                Err(_) => n,
+            }
+        };
         let mut out = Vec::new();
-        let start = self
-            .tokens
-            .partition_point(|t| self.token_slice(t) < needle);
-        for t in &self.tokens[start..] {
-            if !self.token_slice(t).starts_with(needle) {
-                break;
+        let mut i = 0usize;
+        while i < dirs.len() {
+            let start = dirs[i];
+            let mut end = end_of(start);
+            i += 1;
+            while i < dirs.len() && dirs[i] < end {
+                end = end.max(end_of(dirs[i]));
+                i += 1;
             }
-            out.push(t.record);
+            out.extend(start..end);
         }
-        for t in &self.pending {
-            if self.token_slice(t).starts_with(needle) {
-                out.push(t.record);
-            }
-        }
-        out.sort_unstable();
-        out.dedup();
         out
-    }
-
-    fn token_slice(&self, t: &TokenEntry) -> &[u8] {
-        token_bytes(&self.lower, &self.off, &self.len, t)
     }
 
     /// A per-component breakdown of the candidate index's heap memory (F11).
@@ -630,24 +693,31 @@ impl CandidateIndex {
         let lower = self.lower.len() as u64;
         let off = (self.off.len() * std::mem::size_of::<u32>()) as u64;
         let len = (self.len.len() * std::mem::size_of::<u16>()) as u64;
+        let parent = (self.parent.len() * std::mem::size_of::<u32>()) as u64;
         let delta_postings: u64 = self.delta.values().map(|v| (v.len() * 4) as u64).sum();
-        let postings = self.csr.data.len() as u64 + delta_postings;
-        // The CSR slot map (key + slot value + control byte), its offset array,
-        // and the delta map (key + `Vec` header + control byte).
-        let map = self.csr.slots.len() as u64 * (4 + 4 + 1)
-            + self.csr.offsets.len() as u64 * std::mem::size_of::<u32>() as u64
-            + self.delta.len() as u64 * (4 + 24 + 1);
-        let tokens =
-            ((self.tokens.len() + self.pending.len()) * std::mem::size_of::<TokenEntry>()) as u64;
+        let dir_delta_postings: u64 = self.dir_delta.values().map(|v| (v.len() * 4) as u64).sum();
+        let postings = self.csr.data.len() as u64
+            + self.dir_csr.data.len() as u64
+            + delta_postings
+            + dir_delta_postings;
+        // The CSR slot maps (key + slot value + control byte), their offset
+        // arrays, and the delta maps (key + `Vec` header + control byte).
+        let map = (self.csr.keys.len() + self.dir_csr.keys.len()) as u64
+            * std::mem::size_of::<u32>() as u64
+            + (self.csr.offsets.len() + self.dir_csr.offsets.len()) as u64
+                * std::mem::size_of::<u32>() as u64
+            + (self.delta.len() + self.dir_delta.len()) as u64 * (4 + 24 + 1);
+        let subtree = (self.subtree_end.len() * std::mem::size_of::<(u32, u32)>()) as u64;
         // A stop-list entry is a `u32` key plus a control byte.
         let stop = (self.stop.len() * (4 + 1)) as u64;
         CandidateMemory {
             lower,
             off,
             len,
+            parent,
             postings,
             map,
-            tokens,
+            subtree,
             stop,
         }
     }
@@ -655,40 +725,32 @@ impl CandidateIndex {
     /// An estimate of the heap bytes held by the candidate index.
     pub fn memory_bytes(&self) -> u64 {
         let b = self.memory_breakdown();
-        b.lower + b.off + b.len + b.postings + b.map + b.tokens + b.stop
+        b.lower + b.off + b.len + b.parent + b.postings + b.map + b.subtree + b.stop
     }
 
-    /// Release excess capacity in the arenas, posting lists, and token table.
+    /// Release excess capacity in the arenas and posting lists.
     pub fn shrink(&mut self) {
         self.lower.shrink_to_fit();
         self.off.shrink_to_fit();
         self.len.shrink_to_fit();
-        self.tokens.shrink_to_fit();
-        self.pending.shrink_to_fit();
-        self.csr.slots.shrink_to_fit();
+        self.parent.shrink_to_fit();
+        self.subtree_end.shrink_to_fit();
+        self.csr.keys.shrink_to_fit();
         self.csr.offsets.shrink_to_fit();
         self.csr.data.shrink_to_fit();
+        self.dir_csr.keys.shrink_to_fit();
+        self.dir_csr.offsets.shrink_to_fit();
+        self.dir_csr.data.shrink_to_fit();
         for list in self.delta.values_mut() {
             list.shrink_to_fit();
         }
         self.delta.shrink_to_fit();
+        for list in self.dir_delta.values_mut() {
+            list.shrink_to_fit();
+        }
+        self.dir_delta.shrink_to_fit();
         self.stop.shrink_to_fit();
     }
-}
-
-/// The basename bytes of a token entry, deriving the length from the record's
-/// stored path (F13).
-fn token_bytes<'a>(lower: &'a [u8], off: &[u32], len: &[u16], t: &TokenEntry) -> &'a [u8] {
-    let start = t.off as usize;
-    let end = off[t.record as usize] as usize + len[t.record as usize] as usize;
-    &lower[start..end]
-}
-
-/// Compare two token entries by their basename bytes, then by record index.
-fn token_cmp(lower: &[u8], off: &[u32], len: &[u16], a: &TokenEntry, b: &TokenEntry) -> Ordering {
-    let sa = token_bytes(lower, off, len, a);
-    let sb = token_bytes(lower, off, len, b);
-    sa.cmp(sb).then_with(|| a.record.cmp(&b.record))
 }
 
 /// Intersect two sorted, deduplicated slices.
@@ -744,7 +806,7 @@ mod tests {
         for (i, p) in paths.iter().enumerate() {
             let mut lower = p.as_bytes().to_vec();
             lower.make_ascii_lowercase();
-            c.insert(i as u32, &lower);
+            c.insert(i as u32, &lower, false, u32::MAX);
         }
         c.finish_bulk();
         c
@@ -778,54 +840,34 @@ mod tests {
     }
 
     #[test]
-    fn token_prefix_lookup_finds_basenames() {
-        // F13: the token table stores basenames only, so a prefix matches a
-        // basename, not a directory component.
-        let c = build(&["/home/sam/config.toml", "/etc/conf.d/app.conf"]);
-        let cands = c.token_prefix_candidates(b"conf");
-        assert_eq!(cands, vec![0]);
-        let none = c.token_prefix_candidates(b"zzz");
-        assert!(none.is_empty());
-    }
-
-    #[test]
     fn lower_path_and_name_are_lowercased() {
         let c = build(&["/Home/Sam/Report.PDF"]);
-        assert_eq!(c.lower_path(0), b"/home/sam/report.pdf");
+        assert_eq!(c.lower_stored(0), b"/home/sam/report.pdf");
         assert_eq!(c.lower_name(0), b"report.pdf");
-    }
-
-    #[test]
-    fn pending_tokens_are_merged_and_queryable() {
-        let mut c = CandidateIndex::new();
-        for i in 0..10 {
-            let p = format!("/dir{i}/file{i}.txt");
-            c.insert(i, p.as_bytes());
-        }
-        // No explicit finish_bulk: the pending buffer must still be searched.
-        // F13: the token table stores basenames, so the prefix is the basename.
-        let cands = c.token_prefix_candidates(b"file");
-        assert_eq!(cands.len(), 10);
     }
 
     #[test]
     fn insert_append_matches_insert() {
         // F5: the bulk-append path must build the same candidate index as the
-        // general insert path.
-        let paths = [
-            "/home/sam/report-2024.pdf",
-            "/home/sam/notes.md",
-            "/etc/config.toml",
-            "/home/sam/report-2025.pdf",
-            "/home/sam/aaaa.txt",
+        // general insert path. Directory records are included because the
+        // two-level design indexes directory names per directory record (E).
+        let paths: [(&str, bool); 8] = [
+            ("/etc", true),
+            ("/etc/config.toml", false),
+            ("/home", true),
+            ("/home/sam", true),
+            ("/home/sam/aaaa.txt", false),
+            ("/home/sam/notes.md", false),
+            ("/home/sam/report-2024.pdf", false),
+            ("/home/sam/report-2025.pdf", false),
         ];
         let mut appended = CandidateIndex::new();
         let mut inserted = CandidateIndex::new();
-        for (i, p) in paths.iter().enumerate() {
+        for (i, (p, is_dir)) in paths.iter().enumerate() {
             let mut lower = p.as_bytes().to_vec();
             lower.make_ascii_lowercase();
-            appended.insert_append(i as u32, &lower);
-            inserted.insert(i as u32, &lower);
+            appended.insert_append(i as u32, &lower, *is_dir, u32::MAX);
+            inserted.insert(i as u32, &lower, *is_dir, u32::MAX);
         }
         appended.finish_bulk();
         inserted.finish_bulk();
@@ -848,7 +890,7 @@ mod tests {
         let n = STOP_LIST_MIN_RECORDS * 2;
         for i in 0..n {
             let p = format!("/data/common-{i:06}.txt");
-            c.insert_append(i as u32, p.as_bytes());
+            c.insert_append(i as u32, p.as_bytes(), false, u32::MAX);
         }
         c.finish_bulk();
         // "common" appears in every path, so its trigrams are stop-listed.
@@ -870,7 +912,7 @@ mod tests {
         let n = STOP_LIST_MIN_RECORDS * 2;
         for i in 0..n {
             let p = format!("/data/common-{i:06}.txt");
-            c.insert_append(i as u32, p.as_bytes());
+            c.insert_append(i as u32, p.as_bytes(), false, u32::MAX);
         }
         c.finish_bulk();
         let stop_before = c.stop.clone();
@@ -886,15 +928,16 @@ mod tests {
         let c = build(&["/home/sam/report.pdf", "/etc/config.toml"]);
         let b = c.memory_breakdown();
         assert_eq!(
-            b.lower + b.off + b.len + b.postings + b.map + b.tokens + b.stop,
+            b.lower
+                + b.off
+                + b.len
+                + b.parent
+                + b.postings
+                + b.map
+                + b.subtree
+                + b.stop,
             c.memory_bytes()
         );
-    }
-
-    #[test]
-    fn token_entry_is_eight_bytes() {
-        // F13: the packed token entry must be 8 bytes, not 12.
-        assert_eq!(std::mem::size_of::<TokenEntry>(), 8);
     }
 
     #[test]
@@ -923,8 +966,8 @@ mod tests {
             "/home/sam/notes.md",
             "/etc/config.toml",
         ]);
-        assert!(!c.csr.slots.is_empty(), "expected a finalized CSR");
-        for &slot in c.csr.slots.values() {
+        assert!(!c.csr.keys.is_empty(), "expected a finalized CSR");
+        for slot in 0..c.csr.keys.len() as u32 {
             let decoded = c.csr.decode(slot);
             assert!(!decoded.is_empty());
             assert!(
@@ -939,7 +982,7 @@ mod tests {
         // F14: a live insert after finalization lands in the delta overlay and
         // must still be found by a query.
         let mut c = build(&["/home/sam/report.pdf"]);
-        c.insert(1, b"/home/sam/quarterly-report.pdf");
+        c.insert(1, b"/home/sam/quarterly-report.pdf", false, u32::MAX);
         let cands = c.candidates(&Query::parse("quarterly")).unwrap();
         assert!(cands.contains(&1), "delta insert must be a candidate");
     }
@@ -949,20 +992,52 @@ mod tests {
         // F14: a rename after finalization appends to the delta overlay; the new
         // path must be a candidate.
         let mut c = build(&["/home/sam/old-name.txt"]);
-        c.insert(0, b"/home/sam/new-name.txt");
+        c.insert(0, b"/home/sam/new-name.txt", false, u32::MAX);
         let cands = c.candidates(&Query::parse("new-name")).unwrap();
         assert!(cands.contains(&0), "renamed record must be a candidate");
     }
 
     #[test]
-    fn delta_is_merged_into_csr_on_finish_bulk() {
-        // F14: a second `finish_bulk` folds the delta into the CSR and clears it,
-        // and the merged index still answers queries.
+    fn directory_trigrams_expand_to_descendants() {
+        // E: a directory's name trigrams must match all of its descendants via
+        // the contiguous subtree range, without a per-record posting.
+        let mut c = CandidateIndex::new();
+        // Sorted by path: /data, /data/alpha, /data/alpha/a.txt, /data/alpha/b.txt,
+        // /data/beta, /data/beta/c.txt
+        let paths: [(&str, bool); 6] = [
+            ("/data", true),
+            ("/data/alpha", true),
+            ("/data/alpha/a.txt", false),
+            ("/data/alpha/b.txt", false),
+            ("/data/beta", true),
+            ("/data/beta/c.txt", false),
+        ];
+        for (i, (p, is_dir)) in paths.iter().enumerate() {
+            c.insert_append(i as u32, p.as_bytes(), *is_dir, u32::MAX);
+        }
+        c.finish_bulk();
+        // "alpha" is a directory name; its descendants are records 1, 2, 3.
+        let cands = c.candidates(&Query::parse("alpha")).unwrap();
+        assert!(cands.contains(&1) && cands.contains(&2) && cands.contains(&3));
+        assert!(!cands.contains(&5), "beta's child must not match alpha");
+        // "beta" matches records 4 and 5.
+        let cands = c.candidates(&Query::parse("beta")).unwrap();
+        assert!(cands.contains(&4) && cands.contains(&5));
+        assert!(!cands.contains(&2));
+    }
+
+    #[test]
+    fn delta_is_not_folded_into_csr_on_second_finish_bulk() {
+        // E: after finalization the delta holds live full-path components, which
+        // must not be folded into the basename CSR by a later `finish_bulk`.
         let mut c = build(&["/home/sam/report.pdf"]);
-        c.insert(1, b"/home/sam/quarterly-report.pdf");
+        c.insert(1, b"/home/sam/quarterly-report.pdf", false, u32::MAX);
         assert!(!c.delta.is_empty(), "delta should hold the live insert");
         c.finish_bulk();
-        assert!(c.delta.is_empty(), "finish_bulk must clear the delta");
+        assert!(
+            !c.delta.is_empty(),
+            "a second finish_bulk must not fold the live overlay into the CSR"
+        );
         let cands = c.candidates(&Query::parse("quarterly")).unwrap();
         assert!(cands.contains(&1));
         let cands = c.candidates(&Query::parse("report")).unwrap();

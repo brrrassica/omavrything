@@ -157,3 +157,34 @@ partial record across chunk boundaries, cutting the peak to ~836 MB.
 5. Replace the transient `WalkEntry` buffer with a compact arena.
 6. Evaluate the bitmap cache (3) and, only if still needed, the radical path
    dedup (2b).
+
+## 7. Candidate-index memory (0.2.0, M23.6)
+
+The M23 candidate index (trigram postings + lowercased arena) dominated the
+index's memory: at rc4 it was 191.4 B/record on the real tree, 76 % of the
+index. The 0.2.0 work (E, A, C, F) shrank it to **35.8 B/record** on the 1 M
+synthetic tree (from 67.1 B/record), bringing the whole index to **81.2
+B/record** — under the ~100 B/record target — while keeping the full scan at
+~4.4 ms (4.2 ns/record).
+
+| Change | What | 1 M synthetic (B/record) |
+| --- | --- | --- |
+| baseline (rc4) | full-path lowercased arena + per-component trigrams + token table | 67.1 |
+| **E** | two-level trigram index: basename trigrams per record + directory-name trigrams per directory, expanded via subtree ranges | postings 12.0 → 9.0 |
+| **A** | dedupe the lowercased arena: basename for files, full path for dirs, parent reference | lower 40.2 → 16.4 |
+| **C** | drop the token table (the trigram set already guarantees completeness) | tokens 8.0 → 0 |
+| **F** | sorted key array + binary search instead of the CSR `slots` HashMap | map 0.03 → 0.02 |
+
+The two-level design (E) requires directory records (the scanner inserts them)
+and a subtree range per directory; the Index derives the ranges from the parent
+links so they are correct even when records are not sorted by path (e.g. after
+live updates). A live record is covered by a small delta overlay holding its
+full-path component trigrams, so the bulk subtree ranges are never consulted for
+it. The subtree ranges are stored sparsely (one `(dir, end)` pair per directory,
+~0.4 B/record) rather than as a dense per-record array.
+
+The remaining candidate-index cost is the lowercased arena (16.4 B/record) and
+the per-record `off`/`len`/`parent` arrays (10 B/record). D (derive `off`/`len`
+from the record's `path_off`/`path_len`) would remove 6 B/record; N (stream
+metadata) and G (drop `PathIndex`) are the base-index fallbacks and are not
+needed now that the target is met.
