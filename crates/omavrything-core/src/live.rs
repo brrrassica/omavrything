@@ -3,8 +3,8 @@
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use crate::index::Index;
-use crate::scan::{ScanConfig, scan_subtree};
+use crate::index::{DeltaIndex, FileRecord, Index, PathIndex};
+use crate::scan::{ScanConfig, scan_subtree, scan_subtree_into_delta};
 
 /// A filesystem change observed by the watcher.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +61,98 @@ fn apply_modified(index: &mut Index, path: &Path) -> bool {
     };
     let size = if metadata.is_dir() { 0 } else { metadata.len() };
     index.update_metadata(path, size, mtime_of(&metadata))
+}
+
+/// Apply one event to a [`DeltaIndex`] overlay while the base image is evicted.
+///
+/// `by_path` is the resident path -> base-index map, and `records`/`paths` are
+/// the base image's arenas (used to confirm the map's hash matches). Returns
+/// whether the delta changed.
+pub fn apply_delta(
+    delta: &mut DeltaIndex,
+    by_path: &PathIndex,
+    records: &[FileRecord],
+    paths: &[u8],
+    event: &FsEvent,
+    config: &ScanConfig,
+) -> bool {
+    match event {
+        FsEvent::Created(path) => delta_created(delta, by_path, records, paths, path, config),
+        FsEvent::Removed(path) => delta_removed(delta, by_path, records, paths, path),
+        FsEvent::Renamed { from, to } => {
+            let changed = delta_removed(delta, by_path, records, paths, from);
+            delta_created(delta, by_path, records, paths, to, config) || changed
+        }
+        FsEvent::Modified(path) => delta_modified(delta, by_path, records, paths, path),
+    }
+}
+
+fn delta_created(
+    delta: &mut DeltaIndex,
+    by_path: &PathIndex,
+    records: &[FileRecord],
+    paths: &[u8],
+    path: &Path,
+    config: &ScanConfig,
+) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    let is_dir = metadata.is_dir();
+    let is_symlink = metadata.file_type().is_symlink();
+    let size = if is_dir { 0 } else { metadata.len() };
+    // A create over an existing base record is an update: drop the base record.
+    if let Some(idx) = by_path.get(&path.to_string_lossy(), records, paths) {
+        delta.remove(idx);
+    }
+    delta.insert(path, is_dir, is_symlink, size, mtime_of(&metadata));
+    if is_dir {
+        scan_subtree_into_delta(delta, path, config);
+    }
+    true
+}
+
+fn delta_removed(
+    delta: &mut DeltaIndex,
+    by_path: &PathIndex,
+    records: &[FileRecord],
+    paths: &[u8],
+    path: &Path,
+) -> bool {
+    let mut changed = false;
+    if let Some(idx) = by_path.get(&path.to_string_lossy(), records, paths) {
+        delta.remove(idx);
+        changed = true;
+    }
+    if delta.contains_path(path) {
+        delta.remove_path(path);
+        changed = true;
+    }
+    changed
+}
+
+fn delta_modified(
+    delta: &mut DeltaIndex,
+    by_path: &PathIndex,
+    records: &[FileRecord],
+    paths: &[u8],
+    path: &Path,
+) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    let size = if metadata.is_dir() { 0 } else { metadata.len() };
+    if let Some(idx) = by_path.get(&path.to_string_lossy(), records, paths) {
+        delta.remove(idx);
+    }
+    delta.insert(
+        path,
+        metadata.is_dir(),
+        metadata.file_type().is_symlink(),
+        size,
+        mtime_of(&metadata),
+    );
+    true
 }
 
 fn mtime_of(metadata: &std::fs::Metadata) -> i64 {

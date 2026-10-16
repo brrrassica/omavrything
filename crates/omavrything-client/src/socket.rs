@@ -108,6 +108,7 @@ mod tests {
                 total: 1,
                 took_ms: 1,
                 error: None,
+                state: None,
             };
             writeln!(stream, "{}", serde_json::to_string(&response).unwrap()).unwrap();
         });

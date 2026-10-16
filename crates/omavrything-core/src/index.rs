@@ -72,6 +72,7 @@ pub struct Root {
 /// Unix seconds (valid to 2106), `path_len` covers paths under 64 KiB, and
 /// `depth` saturates at 255.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
 pub struct FileRecord {
     /// Size in bytes, saturating at `u32::MAX` (4 GiB). Zero for directories.
     pub size: u32,
@@ -102,6 +103,11 @@ impl FileRecord {
         self.flags & FLAG_DELETED != 0
     }
 }
+
+/// The on-disk image casts the `RECORDS` section directly to `[FileRecord]`, so
+/// the layout must be exactly 20 bytes with no padding. `#[repr(C)]` fixes the
+/// field order; this assertion fails the build if the size ever drifts.
+const _: () = assert!(std::mem::size_of::<FileRecord>() == 20);
 
 /// A resolved search hit.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,7 +195,7 @@ impl SearchTiming {
 /// `HashMap<Box<str>, u32>`, which stored a second copy of every path and
 /// dominated the index's memory use.
 #[derive(Debug, Default, Clone)]
-struct PathIndex {
+pub struct PathIndex {
     main: HashMap<u32, u32>,
     collisions: HashMap<Box<str>, u32>,
 }
@@ -232,8 +238,32 @@ impl PathIndex {
 
     /// The record index for `key`, or `None`. `records`/`paths` are the index's
     /// arenas, used to confirm the hash match.
-    fn get(&self, key: &str, records: &[FileRecord], paths: &[u8]) -> Option<u32> {
+    pub fn get(&self, key: &str, records: &[FileRecord], paths: &[u8]) -> Option<u32> {
         self.get_bytes(key.as_bytes(), records, paths)
+    }
+
+    /// Build the map from a record/path arena (e.g. a snapshot image).
+    ///
+    /// Used by the daemon's evicted state to keep a resident path -> index map
+    /// alongside the mapping, so a live update can resolve a removed path to its
+    /// base-image record index.
+    pub fn build(records: &[FileRecord], paths: &[u8]) -> Self {
+        let mut map = Self::with_capacity(records.len());
+        let mut buf: Vec<u8> = Vec::new();
+        for (i, rec) in records.iter().enumerate() {
+            if rec.is_deleted() {
+                continue;
+            }
+            buf.clear();
+            write_full_path_bytes(rec, records, paths, &mut buf);
+            map.insert_bytes(&buf, i as u32, records, paths);
+        }
+        map
+    }
+
+    /// An estimate of the resident bytes held by the map.
+    pub fn memory_bytes(&self) -> u64 {
+        (self.len() * (std::mem::size_of::<u32>() + std::mem::size_of::<u32>() + 1)) as u64
     }
 
     /// Like [`PathIndex::get`], but takes the key as raw bytes so a bulk insert
@@ -409,6 +439,284 @@ fn record_path_eq(rec: &FileRecord, records: &[FileRecord], paths: &[u8], key: &
             && (sep == 0 || key[p.len()] == b'/')
             && &key[p.len() + sep..] == n
     }
+}
+
+/// The basename bytes of a record, derived from its stored bytes.
+///
+/// Storage-agnostic: reads only `rec` and `paths`, so both the owned [`Index`]
+/// and the borrowed [`IndexImage`] can use it.
+fn name_bytes<'a>(rec: &FileRecord, paths: &'a [u8]) -> &'a [u8] {
+    if stores_full_path(rec) {
+        let path = stored_bytes(rec, paths);
+        let start = path.iter().rposition(|&b| b == b'/').map_or(0, |p| p + 1);
+        &path[start..]
+    } else {
+        stored_bytes(rec, paths)
+    }
+}
+
+/// Score one record against the query using the original-case path, or `None`
+/// if it does not match.
+///
+/// This is the storage-agnostic matcher: it reads only `records` and `paths`,
+/// so both the owned [`Index`] and the borrowed [`IndexImage`] can use it. A
+/// file's full path is reconstructed from its parent link and basename.
+fn match_record_original(
+    records: &[FileRecord],
+    paths: &[u8],
+    rec: &FileRecord,
+    q: &Query,
+) -> Option<u64> {
+    if rec.is_deleted() {
+        return None;
+    }
+    let mut first_pos = u32::MAX;
+    let path_len = if stores_full_path(rec) {
+        let path = stored_bytes(rec, paths);
+        for term in q.terms() {
+            let pos = term.find(path)?;
+            first_pos = first_pos.min(pos as u32);
+        }
+        rec.path_len as u32
+    } else {
+        let parent = &records[rec.parent as usize];
+        let parent_path = stored_bytes(parent, paths);
+        let name = stored_bytes(rec, paths);
+        let sep: &[u8] = if parent_path.ends_with(b"/") {
+            b""
+        } else {
+            b"/"
+        };
+        for term in q.terms() {
+            let pos = term.find_in_file_path(parent_path, name, sep)?;
+            first_pos = first_pos.min(pos as u32);
+        }
+        parent.path_len as u32 + sep.len() as u32 + rec.path_len as u32
+    };
+    let name = name_bytes(rec, paths);
+    let name_match = q.terms().iter().all(|t| t.find(name).is_some());
+    Some(
+        Rank {
+            name_match,
+            first_pos,
+            path_len,
+            depth: rec.depth as u16,
+            mtime: rec.mtime as i64,
+        }
+        .key(),
+    )
+}
+
+/// A full linear scan over `records` using the original-case matcher.
+///
+/// This is the storage-agnostic scan core: the owned [`Index`] (with the
+/// candidate index disabled) and the borrowed [`IndexImage`] both delegate to
+/// it. Returns the total match count and the top-`want` collector.
+fn scan_image(records: &[FileRecord], paths: &[u8], q: &Query, want: usize) -> (usize, TopN) {
+    let mut top = TopN::new(want);
+    let mut total = 0usize;
+    for (i, rec) in records.iter().enumerate() {
+        if let Some(key) = match_record_original(records, paths, rec, q) {
+            total += 1;
+            top.push(i as u32, key);
+        }
+    }
+    (total, top)
+}
+
+/// Parallel variant of [`scan_image`].
+fn scan_image_parallel(
+    records: &[FileRecord],
+    paths: &[u8],
+    q: &Query,
+    want: usize,
+) -> (usize, TopN) {
+    records
+        .par_chunks(PARALLEL_CHUNK)
+        .enumerate()
+        .fold(
+            || (0usize, TopN::new(want)),
+            |(count, mut top), (chunk_i, chunk)| {
+                let base = chunk_i * PARALLEL_CHUNK;
+                let mut count = count;
+                for (j, rec) in chunk.iter().enumerate() {
+                    let i = (base + j) as u32;
+                    if let Some(key) = match_record_original(records, paths, rec, q) {
+                        top.push(i, key);
+                        count += 1;
+                    }
+                }
+                (count, top)
+            },
+        )
+        .reduce(
+            || (0usize, TopN::new(want)),
+            |(c1, mut t1), (c2, t2)| {
+                t1.merge(t2);
+                (c1 + c2, t1)
+            },
+        )
+}
+
+/// Run a query against a raw record/path arena, without a candidate index.
+///
+/// This is the storage-agnostic search entry point used by the snapshot
+/// [`IndexImage`](crate::snapshot::IndexImage): it parses the query, runs the
+/// linear scan (parallel above the threshold), and materializes the page of
+/// hits. Results are identical to the owned [`Index`] with the candidate index
+/// disabled.
+pub(crate) fn search_image(
+    records: &[FileRecord],
+    paths: &[u8],
+    query: &str,
+    limit: usize,
+    offset: usize,
+) -> SearchOutcome {
+    let q = Query::parse(query);
+    if q.is_empty() || limit == 0 {
+        return SearchOutcome::default();
+    }
+    let want = offset.saturating_add(limit);
+    let (total, top) = if records.len() >= PARALLEL_THRESHOLD {
+        scan_image_parallel(records, paths, &q, want)
+    } else {
+        scan_image(records, paths, &q, want)
+    };
+    let hits = top
+        .into_sorted()
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|i| hit_image(records, paths, i))
+        .collect();
+    SearchOutcome { hits, total }
+}
+
+/// Materialize a hit from a raw record/path arena.
+fn hit_image(records: &[FileRecord], paths: &[u8], idx: u32) -> Hit {
+    let rec = &records[idx as usize];
+    let mut buf: Vec<u8> = Vec::new();
+    write_full_path_bytes(rec, records, paths, &mut buf);
+    Hit {
+        path: String::from_utf8(buf).unwrap_or_default(),
+        name: String::from_utf8_lossy(name_bytes(rec, paths)).into_owned(),
+        size: rec.size as u64,
+        mtime: rec.mtime as i64,
+        is_dir: rec.is_dir(),
+    }
+}
+
+/// A full linear scan over `records`, skipping the indices in `skip`.
+///
+/// Used to merge a [`DeltaIndex`]'s removals into a base-image scan: a removed
+/// base record is neither matched nor counted.
+fn scan_image_filtered(
+    records: &[FileRecord],
+    paths: &[u8],
+    q: &Query,
+    want: usize,
+    skip: &HashSet<u32>,
+) -> (usize, TopN) {
+    let mut top = TopN::new(want);
+    let mut total = 0usize;
+    for (i, rec) in records.iter().enumerate() {
+        if skip.contains(&(i as u32)) {
+            continue;
+        }
+        if let Some(key) = match_record_original(records, paths, rec, q) {
+            total += 1;
+            top.push(i as u32, key);
+        }
+    }
+    (total, top)
+}
+
+/// Parallel variant of [`scan_image_filtered`].
+fn scan_image_filtered_parallel(
+    records: &[FileRecord],
+    paths: &[u8],
+    q: &Query,
+    want: usize,
+    skip: &HashSet<u32>,
+) -> (usize, TopN) {
+    records
+        .par_chunks(PARALLEL_CHUNK)
+        .enumerate()
+        .fold(
+            || (0usize, TopN::new(want)),
+            |(count, mut top), (chunk_i, chunk)| {
+                let base = chunk_i * PARALLEL_CHUNK;
+                let mut count = count;
+                for (j, rec) in chunk.iter().enumerate() {
+                    let i = (base + j) as u32;
+                    if skip.contains(&i) {
+                        continue;
+                    }
+                    if let Some(key) = match_record_original(records, paths, rec, q) {
+                        top.push(i, key);
+                        count += 1;
+                    }
+                }
+                (count, top)
+            },
+        )
+        .reduce(
+            || (0usize, TopN::new(want)),
+            |(c1, mut t1), (c2, t2)| {
+                t1.merge(t2);
+                (c1 + c2, t1)
+            },
+        )
+}
+
+/// Search a base image merged with a [`DeltaIndex`] overlay.
+///
+/// The base image is scanned (skipping removed records), the delta's inserts are
+/// scanned, and the two top-N sets are merged. Delta indices are shifted into
+/// the base's index space so a single collector can rank them together.
+pub fn search_image_with_delta(
+    records: &[FileRecord],
+    paths: &[u8],
+    delta: &DeltaIndex,
+    query: &str,
+    limit: usize,
+    offset: usize,
+) -> SearchOutcome {
+    if delta.is_empty() {
+        return search_image(records, paths, query, limit, offset);
+    }
+    let q = Query::parse(query);
+    if q.is_empty() || limit == 0 {
+        return SearchOutcome::default();
+    }
+    let want = offset.saturating_add(limit);
+    let base_len = records.len() as u32;
+
+    let (base_total, base_top) = if records.len() >= PARALLEL_THRESHOLD {
+        scan_image_filtered_parallel(records, paths, &q, want, delta.removes())
+    } else {
+        scan_image_filtered(records, paths, &q, want, delta.removes())
+    };
+    let (delta_total, delta_top) = scan_image(delta.records(), delta.paths(), &q, want);
+
+    let mut top = base_top;
+    top.merge(delta_top.shift(base_len));
+
+    let total = base_total + delta_total;
+    let hits = top
+        .into_sorted()
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|i| {
+            if i < base_len {
+                hit_image(records, paths, i)
+            } else {
+                hit_image(delta.records(), delta.paths(), i - base_len)
+            }
+        })
+        .collect();
+    SearchOutcome { hits, total }
 }
 
 /// The maximum number of memoized query results (F7).
@@ -913,6 +1221,49 @@ impl Index {
         inserted
     }
 
+    /// Apply a [`DeltaIndex`] overlay to the index: tombstone the removed base
+    /// records and insert the delta's records.
+    ///
+    /// Used when folding a delta into a new snapshot. The delta's inserts store
+    /// full paths, so each is re-inserted through the normal path (which
+    /// re-derives its parent link from the current index). A delta insert that
+    /// updates a path already in the base tombstones the old record first, so
+    /// the fold does not leave a duplicate.
+    pub fn apply_delta(&mut self, delta: &DeltaIndex) {
+        let mut buf: Vec<u8> = Vec::new();
+        for &idx in delta.removes() {
+            let i = idx as usize;
+            if i < self.records.len() && !self.records[i].is_deleted() {
+                buf.clear();
+                write_full_path_bytes(&self.records[i], &self.records, &self.paths, &mut buf);
+                let key = String::from_utf8_lossy(&buf).into_owned();
+                self.map_remove(&key);
+                self.records[i].flags |= FLAG_DELETED;
+                self.live -= 1;
+            }
+        }
+        for rec in delta.records() {
+            let bytes = stored_bytes(rec, delta.paths());
+            let path = Path::new(std::str::from_utf8(bytes).unwrap_or(""));
+            if let Some(existing) = self.find(path) {
+                let e = existing as usize;
+                if !self.records[e].is_deleted() {
+                    self.map_remove(&path.to_string_lossy());
+                    self.records[e].flags |= FLAG_DELETED;
+                    self.live -= 1;
+                }
+            }
+            self.insert_with_flags(
+                path,
+                rec.is_dir(),
+                rec.is_symlink(),
+                rec.size as u64,
+                rec.mtime as i64,
+            );
+        }
+        self.invalidate_cache();
+    }
+
     /// The record index for a path given as raw bytes, if present.
     pub(crate) fn find_bytes(&self, key: &[u8]) -> Option<u32> {
         self.by_path.get_bytes(key, &self.records, &self.paths)
@@ -1066,7 +1417,7 @@ impl Index {
     /// The basename of a record, derived from its full path.
     pub fn name(&self, idx: u32) -> &str {
         let rec = &self.records[idx as usize];
-        std::str::from_utf8(self.name_bytes(rec)).unwrap_or("")
+        std::str::from_utf8(name_bytes(rec, &self.paths)).unwrap_or("")
     }
 
     /// The full path of a record.
@@ -1098,17 +1449,6 @@ impl Index {
                 out.push('/');
             }
             out.push_str(std::str::from_utf8(stored_bytes(rec, &self.paths)).unwrap_or(""));
-        }
-    }
-
-    /// The basename bytes of a record.
-    fn name_bytes(&self, rec: &FileRecord) -> &[u8] {
-        if stores_full_path(rec) {
-            let path = stored_bytes(rec, &self.paths);
-            let start = path.iter().rposition(|&b| b == b'/').map_or(0, |p| p + 1);
-            &path[start..]
-        } else {
-            stored_bytes(rec, &self.paths)
         }
     }
 
@@ -1452,43 +1792,11 @@ impl Index {
     }
 
     fn scan_sequential(&self, q: &Query, want: usize) -> (usize, TopN) {
-        let mut top = TopN::new(want);
-        let mut total = 0usize;
-        for (i, rec) in self.records.iter().enumerate() {
-            if let Some(key) = self.match_record(i as u32, rec, q) {
-                total += 1;
-                top.push(i as u32, key);
-            }
-        }
-        (total, top)
+        scan_image(&self.records, &self.paths, q, want)
     }
 
     fn scan_parallel(&self, q: &Query, want: usize) -> (usize, TopN) {
-        self.records
-            .par_chunks(PARALLEL_CHUNK)
-            .enumerate()
-            .fold(
-                || (0usize, TopN::new(want)),
-                |(count, mut top), (chunk_i, chunk)| {
-                    let base = chunk_i * PARALLEL_CHUNK;
-                    let mut count = count;
-                    for (j, rec) in chunk.iter().enumerate() {
-                        let i = (base + j) as u32;
-                        if let Some(key) = self.match_record(i, rec, q) {
-                            top.push(i, key);
-                            count += 1;
-                        }
-                    }
-                    (count, top)
-                },
-            )
-            .reduce(
-                || (0usize, TopN::new(want)),
-                |(c1, mut t1), (c2, t2)| {
-                    t1.merge(t2);
-                    (c1 + c2, t1)
-                },
-            )
+        scan_image_parallel(&self.records, &self.paths, q, want)
     }
 
     /// Scan only the candidate records, verifying each with the exact matcher.
@@ -1544,46 +1852,10 @@ impl Index {
     /// The pre-M23 matcher: matches the original-case path via the parent/name
     /// split. Used as the test-only reference for the candidate index (F1) and
     /// the lowercased arena (F2), and as the production fallback when the
-    /// candidate index is disabled (F10).
+    /// candidate index is disabled (F10). Delegates to the storage-agnostic
+    /// [`match_record_original`] free function.
     fn match_record_original(&self, rec: &FileRecord, q: &Query) -> Option<u64> {
-        if rec.is_deleted() {
-            return None;
-        }
-        let mut first_pos = u32::MAX;
-        let path_len = if stores_full_path(rec) {
-            let path = stored_bytes(rec, &self.paths);
-            for term in q.terms() {
-                let pos = term.find(path)?;
-                first_pos = first_pos.min(pos as u32);
-            }
-            rec.path_len as u32
-        } else {
-            let parent = &self.records[rec.parent as usize];
-            let parent_path = stored_bytes(parent, &self.paths);
-            let name = stored_bytes(rec, &self.paths);
-            let sep: &[u8] = if parent_path.ends_with(b"/") {
-                b""
-            } else {
-                b"/"
-            };
-            for term in q.terms() {
-                let pos = term.find_in_file_path(parent_path, name, sep)?;
-                first_pos = first_pos.min(pos as u32);
-            }
-            parent.path_len as u32 + sep.len() as u32 + rec.path_len as u32
-        };
-        let name = self.name_bytes(rec);
-        let name_match = q.terms().iter().all(|t| t.find(name).is_some());
-        Some(
-            Rank {
-                name_match,
-                first_pos,
-                path_len,
-                depth: rec.depth as u16,
-                mtime: rec.mtime as i64,
-            }
-            .key(),
-        )
+        match_record_original(&self.records, &self.paths, rec, q)
     }
 
     /// A full linear scan using the pre-M23 matcher, for equivalence tests.
@@ -1610,6 +1882,128 @@ impl Index {
             .map(|i| self.hit(i))
             .collect();
         SearchOutcome { hits, total }
+    }
+}
+
+/// A bounded overlay of live updates applied on top of an evicted base image.
+///
+/// While the base image is evicted, inotify events cannot be applied to it, so
+/// they accumulate here. A query merges the base image with the delta (see
+/// [`search_image_with_delta`]). When the delta grows past a threshold the
+/// daemon folds it into a new snapshot and evicts again.
+///
+/// Inserts store their **full path** as a parentless record, so the delta's
+/// records can be scanned by the same storage-agnostic core as the base image.
+/// A rename is a remove plus an insert.
+#[derive(Debug, Default, Clone)]
+pub struct DeltaIndex {
+    records: Vec<FileRecord>,
+    paths: Vec<u8>,
+    removes: HashSet<u32>,
+    /// Full path -> index into `records`, so a repeated insert of the same path
+    /// replaces the earlier one instead of appending a duplicate.
+    index: HashMap<Box<str>, u32>,
+}
+
+impl DeltaIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record an insert (or an update) of `path`.
+    pub fn insert(&mut self, path: &Path, is_dir: bool, is_symlink: bool, size: u64, mtime: i64) {
+        let path_str = path.to_string_lossy();
+        let mut flags = 0u8;
+        if is_dir {
+            flags |= FLAG_DIR;
+        }
+        if is_symlink {
+            flags |= FLAG_SYMLINK;
+        }
+        // Replace an existing insert for the same path in place.
+        if let Some(&i) = self.index.get(path_str.as_ref()) {
+            let rec = &mut self.records[i as usize];
+            rec.size = size_to_u32(size);
+            rec.mtime = mtime_to_u32(mtime);
+            rec.flags = flags;
+            return;
+        }
+        let bytes = path_str.as_bytes();
+        let path_off = self.paths.len() as u32;
+        self.paths.extend_from_slice(bytes);
+        let depth = bytes
+            .iter()
+            .filter(|&&b| b == b'/')
+            .count()
+            .min(u8::MAX as usize) as u8;
+        let idx = self.records.len() as u32;
+        self.records.push(FileRecord {
+            size: size_to_u32(size),
+            mtime: mtime_to_u32(mtime),
+            parent: u32::MAX,
+            path_off,
+            path_len: bytes.len().min(u16::MAX as usize) as u16,
+            depth,
+            flags,
+        });
+        self.index
+            .insert(path_str.into_owned().into_boxed_str(), idx);
+    }
+
+    /// Record the removal of base-image record `idx`.
+    pub fn remove(&mut self, idx: u32) {
+        self.removes.insert(idx);
+    }
+
+    /// Drop a pending insert for `path`, if any. Used when a path created while
+    /// evicted is removed again before the delta is folded.
+    pub fn remove_path(&mut self, path: &Path) {
+        let key = path.to_string_lossy();
+        if let Some(i) = self.index.remove(key.as_ref()) {
+            self.records[i as usize].flags |= FLAG_DELETED;
+        }
+    }
+
+    /// Whether `path` has a pending insert.
+    pub fn contains_path(&self, path: &Path) -> bool {
+        self.index.contains_key(path.to_string_lossy().as_ref())
+    }
+
+    /// The number of pending changes (inserts + removes).
+    pub fn len(&self) -> usize {
+        self.records.len() + self.removes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty() && self.removes.is_empty()
+    }
+
+    /// Drop every pending change.
+    pub fn clear(&mut self) {
+        self.records.clear();
+        self.paths.clear();
+        self.removes.clear();
+        self.index.clear();
+    }
+
+    /// The inserted records (each storing its full path).
+    pub fn records(&self) -> &[FileRecord] {
+        &self.records
+    }
+
+    /// The path arena for the inserted records.
+    pub fn paths(&self) -> &[u8] {
+        &self.paths
+    }
+
+    /// The base-image record indices that have been removed.
+    pub fn removes(&self) -> &HashSet<u32> {
+        &self.removes
+    }
+
+    /// An estimate of the resident bytes held by the delta.
+    pub fn memory_bytes(&self) -> u64 {
+        (self.records.len() * std::mem::size_of::<FileRecord>() + self.paths.len()) as u64
     }
 }
 
@@ -1690,6 +2084,17 @@ impl TopN {
         // determinism.
         v.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         v.into_iter().map(|(_, idx)| idx).collect()
+    }
+
+    /// Add `offset` to every record index, so a delta's indices can be merged
+    /// into the base image's index space.
+    fn shift(mut self, offset: u32) -> TopN {
+        self.heap = self
+            .heap
+            .into_iter()
+            .map(|Reverse((key, Reverse(idx)))| Reverse((key, Reverse(idx + offset))))
+            .collect();
+        self
     }
 }
 
@@ -2418,5 +2823,78 @@ mod tests {
         assert_eq!(sorted.len(), 3);
         // Best three by earliest position: pos 1 (idx 3), 2 (idx 5), 3 (idx 1).
         assert_eq!(sorted, vec![3, 5, 1]);
+    }
+
+    #[test]
+    fn delta_search_matches_merged_owned_index() {
+        // A base image plus a delta overlay must rank identically to an owned
+        // index with the same delta folded in.
+        let mut base = Index::new();
+        base.add_root(Path::new("/"), FsKind::Other);
+        for i in 0..200 {
+            base.insert(
+                Path::new(&format!("/home/dir-{}/file-{i}.txt", i % 5)),
+                false,
+                i as u64,
+                i as i64,
+            );
+        }
+        base.set_candidate_enabled(false);
+        let bytes = crate::snapshot::encode(&base, &[]);
+        let image = crate::snapshot::IndexImage::from_bytes(&bytes).unwrap();
+
+        let mut delta = DeltaIndex::new();
+        let removed = base.find(Path::new("/home/dir-0/file-0.txt")).unwrap();
+        delta.remove(removed);
+        delta.insert(Path::new("/home/new/alpha.txt"), false, false, 10, 1);
+        delta.insert(Path::new("/home/new/beta.txt"), false, false, 20, 2);
+
+        let mut merged = base.clone();
+        merged.apply_delta(&delta);
+        merged.set_candidate_enabled(false);
+
+        for q in ["file-0", "alpha", "beta", "txt", "new", "dir-3"] {
+            let expected = merged.search(q, 20, 0);
+            let got = search_image_with_delta(image.records(), image.paths(), &delta, q, 20, 0);
+            assert_eq!(expected.total, got.total, "total mismatch for {q:?}");
+            assert_eq!(expected.hits, got.hits, "hits mismatch for {q:?}");
+        }
+    }
+
+    #[test]
+    fn apply_delta_folds_removes_and_inserts() {
+        let mut index = Index::new();
+        index.add_root(Path::new("/"), FsKind::Other);
+        index.insert(Path::new("/a.txt"), false, 1, 0);
+        index.insert(Path::new("/b.txt"), false, 2, 0);
+        let a = index.find(Path::new("/a.txt")).unwrap();
+
+        let mut delta = DeltaIndex::new();
+        delta.remove(a);
+        delta.insert(Path::new("/c.txt"), false, false, 3, 0);
+        index.apply_delta(&delta);
+
+        assert!(index.find(Path::new("/a.txt")).is_none());
+        assert!(index.find(Path::new("/b.txt")).is_some());
+        assert!(index.find(Path::new("/c.txt")).is_some());
+        // Live: the root, /b.txt, and /c.txt.
+        assert_eq!(index.len(), 3);
+    }
+
+    #[test]
+    fn apply_delta_updates_an_existing_path_without_duplicating() {
+        let mut index = Index::new();
+        index.add_root(Path::new("/"), FsKind::Other);
+        index.insert(Path::new("/a.txt"), false, 1, 0);
+
+        let mut delta = DeltaIndex::new();
+        delta.insert(Path::new("/a.txt"), false, false, 99, 7);
+        index.apply_delta(&delta);
+
+        // Live: the root and the updated /a.txt (the old record is tombstoned).
+        assert_eq!(index.len(), 2);
+        let idx = index.find(Path::new("/a.txt")).unwrap();
+        assert_eq!(index.record(idx).size, 99);
+        assert_eq!(index.record(idx).mtime, 7);
     }
 }

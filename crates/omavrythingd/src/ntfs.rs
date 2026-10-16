@@ -9,11 +9,13 @@ use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Mutex, RwLock};
+use std::sync::Mutex;
 
 use omavrything_core::index::{FsKind, Index};
 use omavrything_ntfs::{NtfsEntry, NtfsPartition, NtfsVolume};
 use tracing::{debug, info, warn};
+
+use crate::manager::IndexManager;
 
 /// The private mount root used when udisks2 is unavailable.
 const PRIVATE_MOUNT_ROOT: &str = "/run/omavrything/ntfs";
@@ -264,7 +266,7 @@ pub fn apply_entries(index: &mut Index, mount_point: &Path, entries: &[NtfsEntry
 /// The mount happens before the index lock is taken, so a slow mount does not
 /// block searches.
 pub fn mount_index_and_remember(
-    index: &RwLock<Index>,
+    index: &IndexManager,
     policy: &Mutex<NtfsPolicy>,
     partition: &NtfsPartition,
 ) -> Result<PathBuf, String> {
@@ -278,10 +280,7 @@ pub fn mount_index_and_remember(
     // volume this takes seconds, and holding the write lock for it would stall
     // every search for the duration.
     let entries = enumerate_device(&partition.device)?;
-    {
-        let mut idx = index.write().unwrap_or_else(|e| e.into_inner());
-        apply_entries(&mut idx, &mount_point, &entries);
-    }
+    index.with_index_mut(|idx| apply_entries(idx, &mount_point, &entries));
     if let Some(uuid) = &partition.uuid {
         let mut p = policy.lock().unwrap_or_else(|e| e.into_inner());
         let _ = p.remember(uuid);

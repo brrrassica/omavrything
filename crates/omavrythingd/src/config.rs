@@ -19,6 +19,8 @@ pub struct ConfigInit {
     pub scan: ScanConfig,
     pub scan_interval: u64,
     pub snapshot_interval: u64,
+    /// Idle period (seconds) after which the index is evicted (0 disables).
+    pub evict_idle_secs: u64,
     pub snapshot: Option<PathBuf>,
     pub watch: bool,
     pub ntfs: bool,
@@ -37,6 +39,8 @@ pub struct SharedConfig {
     scan: RwLock<ScanConfig>,
     scan_interval: AtomicU64,
     snapshot_interval: AtomicU64,
+    /// Idle period (seconds) after which the index is evicted (0 disables).
+    evict_idle_secs: AtomicU64,
     snapshot: Option<PathBuf>,
     watch: bool,
     /// Whether a scan/rescan is currently in progress.
@@ -57,6 +61,7 @@ impl SharedConfig {
             scan: RwLock::new(init.scan),
             scan_interval: AtomicU64::new(init.scan_interval),
             snapshot_interval: AtomicU64::new(init.snapshot_interval),
+            evict_idle_secs: AtomicU64::new(init.evict_idle_secs),
             snapshot: init.snapshot,
             watch: init.watch,
             scanning: AtomicBool::new(false),
@@ -90,6 +95,11 @@ impl SharedConfig {
 
     pub fn snapshot_interval(&self) -> u64 {
         self.snapshot_interval.load(Ordering::Relaxed)
+    }
+
+    /// The idle period (seconds) after which the index is evicted (0 disables).
+    pub fn evict_idle_secs(&self) -> u64 {
+        self.evict_idle_secs.load(Ordering::Relaxed)
     }
 
     pub fn snapshot_path(&self) -> Option<PathBuf> {
@@ -139,6 +149,12 @@ impl SharedConfig {
                     .parse()
                     .map_err(|_| format!("invalid snapshot_interval: {value}"))?;
                 self.snapshot_interval.store(v, Ordering::Relaxed);
+            }
+            "evict_idle_secs" => {
+                let v: u64 = value
+                    .parse()
+                    .map_err(|_| format!("invalid evict_idle_secs: {value}"))?;
+                self.evict_idle_secs.store(v, Ordering::Relaxed);
             }
             "ntfs" => {
                 let v = parse_bool(value)?;
@@ -197,6 +213,10 @@ impl SharedConfig {
             self.snapshot_interval().to_string(),
         );
         map.insert(
+            "evict_idle_secs".into(),
+            self.evict_idle_secs().to_string(),
+        );
+        map.insert(
             "snapshot".into(),
             self.snapshot_path()
                 .map(|p| p.display().to_string())
@@ -225,6 +245,7 @@ mod tests {
             scan: ScanConfig::default(),
             scan_interval: 900,
             snapshot_interval: 300,
+            evict_idle_secs: 120,
             snapshot: None,
             watch: true,
             ntfs: true,
@@ -278,6 +299,7 @@ mod tests {
             scan: ScanConfig::default(),
             scan_interval: 900,
             snapshot_interval: 300,
+            evict_idle_secs: 120,
             snapshot: None,
             watch: true,
             ntfs: true,

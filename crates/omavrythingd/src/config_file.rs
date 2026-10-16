@@ -49,6 +49,10 @@ pub struct FileConfig {
     /// Snapshot write interval, in seconds (0 disables).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot_interval: Option<u64>,
+    /// Idle period (seconds) after which the index is evicted to its snapshot
+    /// image (0 disables eviction).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evict_idle_secs: Option<u64>,
     /// Watch roots with inotify.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub watch: Option<bool>,
@@ -152,6 +156,13 @@ impl FileConfig {
                     value
                         .parse()
                         .map_err(|_| format!("invalid snapshot_interval: {value}"))?,
+                );
+            }
+            "evict_idle_secs" => {
+                self.evict_idle_secs = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("invalid evict_idle_secs: {value}"))?,
                 );
             }
             "ntfs" => {

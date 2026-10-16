@@ -578,6 +578,7 @@ name = "omavrythingd"
 version = "0.1.7"
 dependencies = [
  "libc",
+ "memmap2",
  "omavrything-client",
  "omavrything-core",
  "omavrything-ntfs",

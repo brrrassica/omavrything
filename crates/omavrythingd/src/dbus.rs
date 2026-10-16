@@ -6,10 +6,9 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use omavrything_core::index::Index;
 use omavrything_core::scan::{ScanConfig, apply_rescan, plan_rescan};
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{error, info, warn};
@@ -17,6 +16,7 @@ use zbus::interface;
 use zbus::object_server::SignalEmitter;
 
 use crate::config::SharedConfig;
+use crate::manager::IndexManager;
 use crate::ntfs::{self, NtfsPolicy};
 use crate::polkit;
 
@@ -36,7 +36,7 @@ pub enum IndexEvent {
 
 /// The `tech.alatcerdas.omavrything.Manager` interface.
 pub struct Manager {
-    index: Arc<RwLock<Index>>,
+    index: Arc<IndexManager>,
     config: Arc<SharedConfig>,
     started: Instant,
     events: UnboundedSender<IndexEvent>,
@@ -45,7 +45,7 @@ pub struct Manager {
 
 impl Manager {
     pub fn new(
-        index: Arc<RwLock<Index>>,
+        index: Arc<IndexManager>,
         config: Arc<SharedConfig>,
         started: Instant,
         events: UnboundedSender<IndexEvent>,
@@ -65,19 +65,18 @@ impl Manager {
 impl Manager {
     /// Daemon status: version, entries, roots, memory, scan state, uptime.
     async fn get_status(&self) -> HashMap<String, String> {
-        let index = self.index.read().unwrap_or_else(|e| e.into_inner());
         let mut map = HashMap::new();
         map.insert("version".into(), omavrything_core::VERSION.into());
-        map.insert("entries".into(), index.len().to_string());
-        map.insert("roots".into(), index.roots().len().to_string());
-        map.insert("memory_bytes".into(), index.memory_bytes().to_string());
+        map.insert("entries".into(), self.index.len().to_string());
+        map.insert("roots".into(), self.index.roots().len().to_string());
+        map.insert("memory_bytes".into(), self.index.memory_bytes().to_string());
         // rc7: the resident (capacity) figure, so the benchmark can attribute the
         // gap between the index accounting and RSS to reclaimable slack.
         map.insert(
             "memory_capacity_bytes".into(),
-            index.capacity_bytes().to_string(),
+            self.index.capacity_bytes().to_string(),
         );
-        let b = index.memory_breakdown();
+        let b = self.index.memory_breakdown();
         map.insert("records_len".into(), b.records_len.to_string());
         map.insert("records_cap".into(), b.records_cap.to_string());
         map.insert("paths_len".into(), b.paths_len.to_string());
@@ -201,22 +200,14 @@ impl Manager {
         if key == "candidate_index" {
             let enabled = self.config.candidate_index();
             self.index
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .set_candidate_enabled(enabled);
+                .with_index_mut(|index| index.set_candidate_enabled(enabled));
         }
         Ok(())
     }
 
     /// The indexed roots.
     async fn list_roots(&self) -> Vec<String> {
-        self.index
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .roots()
-            .iter()
-            .map(|r| r.path.clone())
-            .collect()
+        self.index.roots().iter().map(|r| r.path.clone()).collect()
     }
 
     /// Mount an NTFS partition by UUID and index it via the MFT. Returns the
@@ -244,7 +235,7 @@ impl Manager {
         .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
         .map_err(zbus::fdo::Error::Failed)?;
 
-        let entries = self.index.read().unwrap_or_else(|e| e.into_inner()).len() as u64;
+        let entries = self.index.len() as u64;
         let _ = self.events.send(IndexEvent::Changed { entries });
         Ok(mount_point.display().to_string())
     }
@@ -270,18 +261,13 @@ impl Manager {
 /// configured roots; otherwise the scan would inject records for an unmanaged
 /// root that the snapshot loader never validates or drops.
 async fn run_rescan(
-    index: Arc<RwLock<Index>>,
+    index: Arc<IndexManager>,
     config: Arc<SharedConfig>,
     events: UnboundedSender<IndexEvent>,
     root: &str,
 ) -> zbus::fdo::Result<u64> {
     if !root.is_empty() {
-        let known = index
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .roots()
-            .iter()
-            .any(|r| r.path == root);
+        let known = index.roots().iter().any(|r| r.path == root);
         if !known {
             return Err(zbus::fdo::Error::InvalidArgs(format!(
                 "unknown root: {root}"
@@ -314,17 +300,14 @@ async fn run_rescan(
             };
             plan_rescan(&sub)
         };
-        let report = {
-            let mut idx = task_index.write().unwrap_or_else(|e| e.into_inner());
-            apply_rescan(&mut idx, plan)
-        };
+        let report = task_index.with_index_mut(|idx| apply_rescan(idx, plan));
         report.entries as u64
     })
     .await
     .unwrap_or(0);
 
     config.set_scanning(false);
-    let entries = index.read().unwrap_or_else(|e| e.into_inner()).len() as u64;
+    let entries = index.len() as u64;
     let _ = events.send(IndexEvent::ScanProgress {
         phase: "done".into(),
         entries,
@@ -357,7 +340,7 @@ async fn authorize(
 /// If the system bus is unavailable the service logs and returns, leaving the
 /// socket search path unaffected.
 pub fn run(
-    index: Arc<RwLock<Index>>,
+    index: Arc<IndexManager>,
     config: Arc<SharedConfig>,
     started: Instant,
     mut events: tokio::sync::mpsc::UnboundedReceiver<IndexEvent>,
@@ -427,7 +410,7 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use omavrything_core::index::FsKind;
+    use omavrything_core::index::{FsKind, Index};
     use std::path::Path;
     use tokio::sync::mpsc::unbounded_channel;
 
@@ -435,11 +418,12 @@ mod tests {
     async fn rescan_rejects_an_unknown_root() {
         let mut index = Index::new();
         index.add_root(Path::new("/known"), FsKind::Other);
-        let index = Arc::new(RwLock::new(index));
+        let index = Arc::new(IndexManager::new(index, Vec::new(), None));
         let config = Arc::new(SharedConfig::new(crate::config::ConfigInit {
             scan: ScanConfig::default(),
             scan_interval: 900,
             snapshot_interval: 300,
+            evict_idle_secs: 120,
             snapshot: None,
             watch: true,
             ntfs: true,

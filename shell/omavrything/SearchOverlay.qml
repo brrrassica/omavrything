@@ -33,6 +33,9 @@ Item {
   property bool cursorActive: false
   property var results: []
   property bool daemonAvailable: false
+  // True while the daemon is mapping an evicted index; the empty state shows a
+  // "reloading" message and the query is retried.
+  property bool indexLoading: false
 
   // Column sorting: "" keeps the daemon's ranking; otherwise the results are
   // re-sorted client-side by the selected column.
@@ -59,6 +62,15 @@ Item {
   readonly property var snapshotOptions: {
     var opts = []
     for (var s = 30; s <= 300; s += 30) opts.push({ value: String(s), label: s + " s" })
+    return opts
+  }
+
+  // Eviction-cadence choices: 0 s (disables eviction) then 10 s to 60 s in 10 s
+  // steps. The daemon evicts the index to its snapshot image after this idle
+  // period, dropping RSS to the mapping plus a small delta; a query reloads it.
+  readonly property var evictionOptions: {
+    var opts = [{ value: "0", label: "0 s (disables eviction)" }]
+    for (var s = 10; s <= 60; s += 10) opts.push({ value: String(s), label: s + " s" })
     return opts
   }
 
@@ -216,6 +228,17 @@ Item {
     try { response = JSON.parse(line) } catch (e) { return }
     if (!response || !Array.isArray(response.results)) return
 
+    // The daemon evicts the index when idle; a query while evicted returns
+    // `state: "loading"` and starts the load. Retry shortly so the next
+    // response carries results.
+    root.indexLoading = response.state === "loading"
+    if (root.indexLoading) {
+      root.results = []
+      displayModel.clear()
+      reloadRetry.restart()
+      return
+    }
+
     root.results = response.results
     if (root.selectedIndex >= response.results.length)
       root.selectedIndex = Math.max(0, response.results.length - 1)
@@ -335,6 +358,16 @@ Item {
   Timer {
     id: searchDebounce
     interval: 40
+    repeat: false
+    onTriggered: root.sendQuery()
+  }
+
+  // Retries a query while the daemon is reloading an evicted index. The load is
+  // a background mmap, so a short delay is enough for the next response to
+  // carry results.
+  Timer {
+    id: reloadRetry
+    interval: 120
     repeat: false
     onTriggered: root.sendQuery()
   }
@@ -781,7 +814,9 @@ Item {
             visible: root.results.length === 0 && !root.settingsOpen
             text: !root.daemonAvailable
               ? "Search daemon unavailable"
-              : (root.filterText ? "No matches for “" + root.filterText + "”" : "Type to search files")
+              : (root.indexLoading
+                 ? "Reloading index…"
+                 : (root.filterText ? "No matches for “" + root.filterText + "”" : "Type to search files"))
             color: root.foreground
             opacity: 0.6
             font.family: root.fontFamily
@@ -925,6 +960,39 @@ Item {
                 accent: Color.accent
                 fontFamily: root.fontFamily
                 onChanged: function(v) { root.setSetting("snapshot_interval", v) }
+              }
+            }
+
+            // Eviction cadence: the idle period after which the index is evicted
+            // to its snapshot image (10-60 s in 10 s steps; default 20 s).
+            Item {
+              width: parent.width
+              height: root.rowHeight
+
+              Text {
+                width: root.nameWidth
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Index eviction timer"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+              }
+
+              Dropdown {
+                anchors.left: parent.left
+                anchors.leftMargin: root.nameWidth + root.columnGap
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                showLabel: false
+                value: root.settingValue("evict_idle_secs", "20")
+                options: root.evictionOptions
+                foreground: root.foreground
+                background: root.background
+                popupBorder: root.border
+                accent: Color.accent
+                fontFamily: root.fontFamily
+                onChanged: function(v) { root.setSetting("evict_idle_secs", v) }
               }
             }
 

@@ -315,3 +315,33 @@ changes; the docs site still publishes only from `main`.
 gate on the marketplace-tracked branch); a `release/*` branch per version
 (rejected: unnecessary for a single-package project); tagging on `develop`
 (rejected: the marketplace and docs site track `main`).
+
+---
+
+## ADR-017 — Evictable, image-backed index
+
+**Decision:** The snapshot format is a **directly-mappable image** (v5): a
+header, a section table, and four 8-byte aligned sections (`ROOTS`, `RECORDS`,
+`PATHS`, `ROOT_STRINGS`). The `RECORDS` section is a contiguous `#[repr(C)]`
+`FileRecord` array cast directly from the mapping, so loading is an `mmap` plus
+header validation — no decode, no rebuild. The daemon's `IndexManager` **evicts**
+the owned index to this image when idle; while evicted, only the mapping (file
+backed, reclaimable) and a resident path -> index map remain, and queries scan
+the image merged with a small `DeltaIndex` of live updates.
+
+**Rationale:** The v4 warm-start decode rebuilt `by_path` and the candidate index
+(~580 ms). A byte-identical image removes that cost and lets the daemon drop the
+owned record/path arenas and the candidate index when idle, cutting RSS. The
+linear scan over the image (~6 ms at 1.37 M) is well inside the query budget, so
+the candidate index is not persisted.
+
+**Consequences:** The snapshot format is versioned and v4 is rejected (a one-time
+cold scan after upgrade). Live updates while evicted accumulate in a bounded
+delta that is folded into a new snapshot past a threshold. The daemon keeps a
+resident path -> index map while evicted so the watcher can resolve a removed
+path to its base-image record index.
+
+**Alternatives considered:** Keeping the owned index resident (rejected: no RSS
+reduction); persisting the candidate index in the image (rejected: it is the
+largest component and the linear scan is fast enough); storing delta removals by
+path (rejected: the base scan would pay a per-match path check).

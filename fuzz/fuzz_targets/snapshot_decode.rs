@@ -10,8 +10,14 @@ use omavrything_core::snapshot;
 
 fuzz_target!(|data: &[u8]| {
     // The result is intentionally ignored: the contract is "no panic", not a
-    // particular outcome. A successful decode is also re-encoded to exercise the
+    // particular outcome. A successful parse is also re-encoded to exercise the
     // writer against attacker-influenced index contents.
+    //
+    // Exercise the v5 image parser directly (the daemon's evicted path), then
+    // the materializing decode.
+    if let Ok(image) = snapshot::IndexImage::from_bytes(data) {
+        let _ = snapshot::encode(&image.to_index(), image.identities());
+    }
     if let Ok((index, identities)) = snapshot::decode(data) {
         let _ = snapshot::encode(&index, &identities);
     }

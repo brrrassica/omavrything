@@ -18,7 +18,7 @@ use std::time::UNIX_EPOCH;
 use rayon::prelude::*;
 
 use crate::glob::GlobSet;
-use crate::index::{BatchEntry, FsKind, Index};
+use crate::index::{BatchEntry, DeltaIndex, FsKind, Index};
 use crate::mounts::{self, Mount};
 
 /// Scanner configuration.
@@ -230,6 +230,20 @@ pub fn scan_subtree(index: &mut Index, root: &Path, config: &ScanConfig) {
         size: e.size,
         mtime: e.mtime,
     }));
+}
+
+/// Walk `root` and record every entry into `delta`. Used for live updates when a
+/// new directory appears while the base image is evicted.
+pub fn scan_subtree_into_delta(delta: &mut DeltaIndex, root: &Path, config: &ScanConfig) {
+    let excludes = GlobSet::new(&config.excludes);
+    let root_dev = fs::metadata(root).map(|m| m.dev()).ok();
+    let errors = AtomicUsize::new(0);
+    let mut buffer = walk(root, root_dev, &excludes, config.metadata, &errors);
+    buffer.sort();
+    for e in &buffer.entries {
+        let path = Path::new(OsStr::from_bytes(buffer.path_bytes(e)));
+        delta.insert(path, e.is_dir, e.is_symlink, e.size, e.mtime);
+    }
 }
 
 /// A prepared rescan: the entries discovered by walking the roots, the roots

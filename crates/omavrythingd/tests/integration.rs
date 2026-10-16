@@ -106,3 +106,61 @@ fn daemon_indexes_and_answers_queries() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn daemon_evicts_when_idle_and_still_answers() {
+    let dir = temp_dir("evict");
+    let root = dir.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("report-2024.txt"), b"hello").unwrap();
+
+    let socket = dir.join("omavrything.sock");
+    let snapshot = dir.join("index.snapshot");
+    let config = dir.join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "roots = [\"{}\"]\nsocket = \"{}\"\nsnapshot = \"{}\"\n\
+             evict_idle_secs = 2\nsnapshot_interval = 0\nwatch = false\n\
+             dbus = false\nntfs = false\n",
+            root.display(),
+            socket.display(),
+            snapshot.display()
+        ),
+    )
+    .unwrap();
+
+    let child = Command::new(env!("CARGO_BIN_EXE_omavrythingd"))
+        .arg("--config")
+        .arg(&config)
+        .arg("--no-dbus")
+        .arg("--no-ntfs")
+        .arg("--no-watch")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn omavrythingd");
+    let _daemon = Daemon { child };
+    wait_for_socket(&socket);
+
+    // The first query is served from the owned index.
+    assert_eq!(search(&socket, "report").total, 1);
+
+    // The idle evictor writes the snapshot and evicts the owned index.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline && !snapshot.exists() {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        snapshot.exists(),
+        "the idle evictor should have written the snapshot"
+    );
+
+    // Queries still work after eviction (served from the mapped image).
+    let after = search(&socket, "report");
+    assert!(after.error.is_none(), "{:?}", after.error);
+    assert_eq!(after.total, 1);
+    assert!(after.results[0].path.ends_with("report-2024.txt"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

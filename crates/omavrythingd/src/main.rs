@@ -10,6 +10,7 @@ mod config;
 mod config_file;
 mod dbus;
 mod logging;
+mod manager;
 mod ntfs;
 mod peer;
 mod polkit;
@@ -23,16 +24,16 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use omavrything_core::VERSION;
 use omavrything_core::idle::{IdleMonitor, IdleThresholds, RescanScheduler};
 use omavrything_core::index::Index;
-use omavrything_core::live::{self, FsEvent};
-use omavrything_core::protocol::{Method, Response, ResultItem, parse_request};
+use omavrything_core::live::FsEvent;
+use omavrything_core::protocol::{IndexState, Method, Response, ResultItem, parse_request};
 use omavrything_core::scan::{ScanConfig, apply_rescan, plan_rescan, scan};
-use omavrything_core::snapshot::{self, RootIdentity, WarmStart};
+use omavrything_core::snapshot::{self, WarmStart};
 use omavrything_core::watch::Watcher;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, error, info, warn};
@@ -41,6 +42,7 @@ use config::{ConfigInit, SharedConfig};
 use config_file::{DEFAULT_CONFIG_PATH, FileConfig};
 use dbus::IndexEvent;
 use logging::LogLevel;
+use manager::IndexManager;
 
 /// Maximum number of concurrent client connections.
 const MAX_CONNECTIONS: usize = 64;
@@ -50,6 +52,9 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 const WATCH_POLL: Duration = Duration::from_millis(500);
 /// Default interval between periodic snapshot writes.
 const DEFAULT_SNAPSHOT_INTERVAL: u64 = 300;
+/// Idle period (seconds) after which the index is evicted to its snapshot image.
+/// The settings menu offers 10-60 s in 10 s steps; 20 s is the default.
+const EVICT_IDLE_SECS: u64 = 20;
 /// The group that may use the system socket.
 const SOCKET_GROUP: &str = "omavrything";
 
@@ -145,11 +150,12 @@ fn main() {
     trim_heap();
     log_memory(&index, "startup");
 
-    let index = Arc::new(RwLock::new(index));
+    let index = Arc::new(IndexManager::new(index, identities, args.snapshot.clone()));
     let config = Arc::new(SharedConfig::new(ConfigInit {
         scan: scan_config,
         scan_interval: args.scan_interval,
         snapshot_interval: args.snapshot_interval,
+        evict_idle_secs: args.evict_idle_secs,
         snapshot: args.snapshot.clone(),
         watch: args.watch,
         ntfs: args.ntfs,
@@ -159,7 +165,6 @@ fn main() {
         state: args.state.clone(),
         state_path: args.state_path.clone(),
     }));
-    let identities = Arc::new(RwLock::new(identities));
     let policy = Arc::new(Mutex::new(ntfs::NtfsPolicy::load(
         ntfs::default_policy_path(),
     )));
@@ -170,11 +175,7 @@ fn main() {
 
     // Block SIGTERM/SIGINT before spawning threads so they inherit the mask and
     // a dedicated thread can perform a clean snapshot write on shutdown.
-    install_shutdown_handler(
-        Arc::clone(&index),
-        Arc::clone(&identities),
-        args.snapshot.clone(),
-    );
+    install_shutdown_handler(Arc::clone(&index), args.snapshot.clone());
 
     if args.watch {
         let index = Arc::clone(&index);
@@ -197,13 +198,19 @@ fn main() {
     if let Some(path) = &args.snapshot {
         if args.snapshot_interval > 0 {
             let index = Arc::clone(&index);
-            let identities = Arc::clone(&identities);
             let config = Arc::clone(&config);
             let path = path.clone();
             spawn_thread("omavry-snap", CONTROL_STACK, move || {
-                run_snapshot(index, identities, config, path)
+                run_snapshot(index, config, path)
             });
         }
+        // Eviction needs a snapshot to map, so only run the evictor when one is
+        // configured.
+        let index = Arc::clone(&index);
+        let config = Arc::clone(&config);
+        spawn_thread("omavry-evict", CONTROL_STACK, move || {
+            run_evictor(index, config)
+        });
     }
 
     if args.dbus {
@@ -385,7 +392,7 @@ fn login1_idle_hint(rt: &tokio::runtime::Runtime) -> Option<bool> {
 
 /// Watch the indexed roots with inotify and apply events to the index.
 fn run_watcher(
-    index: Arc<RwLock<Index>>,
+    index: Arc<IndexManager>,
     config: Arc<SharedConfig>,
     events: UnboundedSender<IndexEvent>,
 ) {
@@ -397,11 +404,7 @@ fn run_watcher(
         }
     };
 
-    let roots: Vec<PathBuf> = read_index(&index)
-        .roots()
-        .iter()
-        .map(|r| PathBuf::from(&r.path))
-        .collect();
+    let roots: Vec<PathBuf> = index.roots().iter().map(|r| PathBuf::from(&r.path)).collect();
     for root in &roots {
         if let Err(err) = watcher.watch_dir(root) {
             warn!(path = %root.display(), error = %err, "watch failed");
@@ -424,21 +427,16 @@ fn run_watcher(
                     continue;
                 }
                 let scan = config.scan();
-                let shrank = {
-                    let mut idx = write_index(&index);
-                    for event in &batch {
-                        live::apply(&mut idx, event, &scan);
-                    }
-                    // Reclaim the doubling slack the inserts left, so a
-                    // long-running daemon does not hold 2x capacity forever
-                    // (rc6 RSS spike). A no-op when the slack is small.
-                    idx.shrink_if_slack()
-                };
-                if shrank {
+                for event in &batch {
+                    index.apply_event(event, &scan);
+                }
+                // Reclaim the doubling slack the inserts left, so a long-running
+                // daemon does not hold 2x capacity forever (rc6 RSS spike). A
+                // no-op when the index is evicted or the slack is small.
+                if index.shrink_if_owned() {
                     // The shrink freed pages; return them to the OS rather than
                     // leaving them in the glibc arena (rc6 RSS spike).
                     trim_heap();
-                    log_memory(&read_index(&index), "live-update");
                 }
                 // Watch newly created directories.
                 for event in &batch {
@@ -456,7 +454,7 @@ fn run_watcher(
                     );
                     reported_failed = failed;
                 }
-                let entries = read_index(&index).len() as u64;
+                let entries = index.len() as u64;
                 let _ = events.send(IndexEvent::Changed { entries });
             }
             Err(err) => {
@@ -469,7 +467,7 @@ fn run_watcher(
 
 /// Periodically rescan the roots when the system is idle.
 fn run_scheduler(
-    index: Arc<RwLock<Index>>,
+    index: Arc<IndexManager>,
     config: Arc<SharedConfig>,
     events: UnboundedSender<IndexEvent>,
 ) {
@@ -504,14 +502,13 @@ fn run_scheduler(
             // This keeps searches unblocked during the traversal without cloning
             // the whole index (which doubled peak memory).
             let plan = plan_rescan(&scan);
-            let (report, entries) = {
-                let mut idx = write_index(&index);
-                let report = apply_rescan(&mut idx, plan);
+            let (report, entries) = index.with_index_mut(|idx| {
+                let report = apply_rescan(idx, plan);
                 // A rescan appends the new entries and leaves the vectors at
                 // their doubled capacity; reclaim it (rc6 RSS spike).
                 idx.shrink();
                 (report, idx.len() as u64)
-            };
+            });
             config.set_scanning(false);
             trim_heap();
             info!(
@@ -537,7 +534,7 @@ fn contain_panic<T>(job: impl FnOnce() -> T) -> Result<T, ()> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).map_err(|_| ())
 }
 
-pub(crate) fn run_ntfs_startup(index: Arc<RwLock<Index>>, policy: Arc<Mutex<ntfs::NtfsPolicy>>) {
+pub(crate) fn run_ntfs_startup(index: Arc<IndexManager>, policy: Arc<Mutex<ntfs::NtfsPolicy>>) {
     {
         let p = policy.lock().unwrap_or_else(|e| e.into_inner());
         if !p.is_empty() {
@@ -587,8 +584,7 @@ pub(crate) fn run_ntfs_startup(index: Arc<RwLock<Index>>, policy: Arc<Mutex<ntfs
     // MFT parsing allocates large transient buffers and the re-index appends to
     // the arenas; compact, reclaim the doubling slack, and return the freed pages
     // before the daemon idles.
-    {
-        let mut idx = write_index(&index);
+    index.with_index_mut(|idx| {
         idx.compact();
         idx.shrink();
         let b = idx.memory_breakdown();
@@ -599,17 +595,28 @@ pub(crate) fn run_ntfs_startup(index: Arc<RwLock<Index>>, policy: Arc<Mutex<ntfs
             paths_cap = b.paths_cap,
             "index shrunk after NTFS indexing"
         );
-    }
+    });
     trim_heap();
 }
 
 /// Periodically write a snapshot of the index.
-fn run_snapshot(
-    index: Arc<RwLock<Index>>,
-    identities: Arc<RwLock<Vec<RootIdentity>>>,
-    config: Arc<SharedConfig>,
-    path: PathBuf,
-) {
+/// Evict the index to its snapshot image after a period with no queries or
+/// mutations, so the daemon's resident set falls to the mapping plus the delta.
+fn run_evictor(index: Arc<IndexManager>, config: Arc<SharedConfig>) {
+    loop {
+        let idle = config.evict_idle_secs();
+        // Poll at most every 30 s, and at least as often as the idle period, so
+        // a short configured period is honoured without a busy loop.
+        let poll = if idle == 0 { 30 } else { idle.clamp(1, 30) };
+        std::thread::sleep(Duration::from_secs(poll));
+        if index.evict_if_idle(idle) {
+            info!(idle_secs = idle, "index evicted (idle)");
+            trim_heap();
+        }
+    }
+}
+
+fn run_snapshot(index: Arc<IndexManager>, config: Arc<SharedConfig>, path: PathBuf) {
     loop {
         let interval = config.snapshot_interval();
         if interval == 0 {
@@ -617,14 +624,18 @@ fn run_snapshot(
             continue;
         }
         std::thread::sleep(Duration::from_secs(interval));
+        // When evicted with no pending delta, the on-disk snapshot is already
+        // current (eviction wrote it), so there is nothing to persist.
+        if index.is_evicted() && !index.has_pending_delta() {
+            continue;
+        }
         // Compact and encode under the lock, then write outside it so the
         // inotify writer is not blocked on disk I/O.
-        let bytes = {
-            let mut idx = write_index(&index);
+        let ids = index.identities();
+        let bytes = index.with_index_mut(|idx| {
             idx.compact();
-            let ids = read_identities(&identities);
-            snapshot::encode(&idx, &ids)
-        };
+            snapshot::encode(idx, &ids)
+        });
         let _guard = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         if let Err(e) = snapshot::write_atomic(&bytes, &path) {
             error!(error = %e, "snapshot save failed");
@@ -656,11 +667,7 @@ extern "C" fn handle_shutdown_signal(_sig: libc::c_int) {
 /// A self-pipe is used: the signal handler (which must be async-signal-safe)
 /// only writes a byte, and a dedicated thread performs the snapshot write. The
 /// handler is installed process-wide; it does not block the signals.
-fn install_shutdown_handler(
-    index: Arc<RwLock<Index>>,
-    identities: Arc<RwLock<Vec<RootIdentity>>>,
-    snapshot: Option<PathBuf>,
-) {
+fn install_shutdown_handler(index: Arc<IndexManager>, snapshot: Option<PathBuf>) {
     let mut fds = [0i32; 2];
     // SAFETY: `fds` is a valid 2-element array for `pipe`.
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
@@ -697,11 +704,7 @@ fn install_shutdown_handler(
         }
         info!("shutdown signal received");
         if let Some(path) = &snapshot {
-            let bytes = {
-                let idx = read_index(&index);
-                let ids = read_identities(&identities);
-                snapshot::encode(&idx, &ids)
-            };
+            let bytes = index.encode();
             let _guard = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             match snapshot::write_atomic(&bytes, path) {
                 Ok(()) => info!(path = %path.display(), "snapshot written"),
@@ -726,7 +729,7 @@ fn install_shutdown_handler(
 ///
 /// When `profile` is set, each search logs a stage-by-stage timing breakdown to
 /// stderr (see `OMAVRYTHING_PROFILE`).
-fn serve(stream: UnixStream, index: Arc<RwLock<Index>>, profile: bool) {
+fn serve(stream: UnixStream, index: Arc<IndexManager>, profile: bool) {
     let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
     let read_half = match stream.try_clone() {
         Ok(clone) => clone,
@@ -760,16 +763,12 @@ fn serve(stream: UnixStream, index: Arc<RwLock<Index>>, profile: bool) {
         let response = match request.method {
             Method::Search => {
                 let started = Instant::now();
-                let guard = read_index(&index);
                 let limit = request.effective_limit();
                 let offset = request.effective_offset();
-                let outcome = if profile {
-                    let (outcome, timing) = guard.search_profiled(&request.q, limit, offset);
-                    debug!(query = %request.q, timing = %timing.summary(), "search");
-                    outcome
-                } else {
-                    guard.search(&request.q, limit, offset)
-                };
+                let (outcome, loading) = index.search(&request.q, limit, offset);
+                if profile {
+                    debug!(query = %request.q, hits = outcome.hits.len(), "search");
+                }
                 let results: Vec<ResultItem> = outcome
                     .hits
                     .iter()
@@ -786,6 +785,11 @@ fn serve(stream: UnixStream, index: Arc<RwLock<Index>>, profile: bool) {
                     total: outcome.total,
                     took_ms: started.elapsed().as_millis() as u64,
                     error: None,
+                    state: if loading {
+                        Some(IndexState::Loading)
+                    } else {
+                        None
+                    },
                 }
             }
         };
@@ -842,21 +846,6 @@ fn read_line_bounded<R: BufRead>(
         }
     }
     Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
-}
-
-/// Acquire a read lock, recovering from a poisoned lock rather than panicking.
-fn read_index(index: &RwLock<Index>) -> RwLockReadGuard<'_, Index> {
-    index.read().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Acquire a write lock, recovering from a poisoned lock rather than panicking.
-fn write_index(index: &RwLock<Index>) -> RwLockWriteGuard<'_, Index> {
-    index.write().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Clone the current root identities.
-fn read_identities(identities: &RwLock<Vec<RootIdentity>>) -> Vec<RootIdentity> {
-    identities.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// Log the index's used and resident (capacity) memory, so the benchmark can
@@ -963,6 +952,7 @@ struct Args {
     scan_interval: u64,
     snapshot: Option<PathBuf>,
     snapshot_interval: u64,
+    evict_idle_secs: u64,
     dbus: bool,
     ntfs: bool,
     metadata: bool,
@@ -1067,6 +1057,10 @@ impl Args {
             .or(state.snapshot_interval)
             .or(base.snapshot_interval)
             .unwrap_or(DEFAULT_SNAPSHOT_INTERVAL);
+        let evict_idle_secs = state
+            .evict_idle_secs
+            .or(base.evict_idle_secs)
+            .unwrap_or(EVICT_IDLE_SECS);
         let watch = raw.watch.or(state.watch).or(base.watch).unwrap_or(true);
         let dbus = raw.dbus.or(state.dbus).or(base.dbus).unwrap_or(true);
         let ntfs = raw.ntfs.or(state.ntfs).or(base.ntfs).unwrap_or(true);
@@ -1095,6 +1089,7 @@ impl Args {
             scan_interval,
             snapshot,
             snapshot_interval,
+            evict_idle_secs,
             dbus,
             ntfs,
             metadata,

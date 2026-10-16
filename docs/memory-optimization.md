@@ -224,3 +224,28 @@ allocator and **rejected** (315 MiB vs 49 MiB at 500 k).
 The live index itself is ~128 B/record (longer real paths, the `by_path` map),
 so RSS/record under 100 B at 1.4 M still needs the live index to approach the
 synthetic 81.2 B/record; that is a separate lever from the overhead.
+
+## 9. Evictable, image-backed index (v5)
+
+The snapshot format v5 ([`snapshot.rs`](../crates/omavrything-core/src/snapshot.rs))
+is a **directly-mappable image**: a header, a section table, and four 8-byte
+aligned sections (`ROOTS`, `RECORDS`, `PATHS`, `ROOT_STRINGS`). The `RECORDS`
+section is a contiguous `#[repr(C)]` `FileRecord` array, so it is cast directly
+from the mapping — loading is an `mmap` plus header validation, with no decode
+and no rebuild (the v4 warm-start decode was ~580 ms).
+
+The daemon's [`IndexManager`](../crates/omavrythingd/src/manager.rs) can **evict**
+the owned index to this image when idle. While evicted, only the mapping (file
+backed, reclaimable) and a resident path -> index map (~9 B/record) remain; the
+owned record/path arenas and the candidate index are dropped. Queries scan the
+image with the storage-agnostic linear scan
+([`search_image`](../crates/omavrything-core/src/index.rs)), merged with a small
+[`DeltaIndex`](../crates/omavrything-core/src/index.rs) of live updates. The
+watcher records changes in the delta; a mutation that needs the owned index
+materializes it (folding the delta) and the idle timer evicts again.
+
+The candidate index is **not** persisted: the evicted path uses the linear scan
+(~6 ms at 1.37 M), which is well inside the query budget. The candidate index
+remains available only in the owned (indexing) form. See
+[`plans/evictable-image-index.md`](../plans/evictable-image-index.md) and
+[ADR-017](decisions.md).

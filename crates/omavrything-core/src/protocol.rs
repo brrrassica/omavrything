@@ -47,6 +47,17 @@ pub struct ResultItem {
     pub is_dir: bool,
 }
 
+/// The daemon's index readiness, surfaced to clients so a UI can show a
+/// "reloading index" state while an evicted image is being mapped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexState {
+    /// The index is resident and queries are served directly.
+    Ready,
+    /// The index is being loaded; the query returned no results.
+    Loading,
+}
+
 /// A search response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Response {
@@ -57,6 +68,9 @@ pub struct Response {
     /// on success.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The index readiness. Absent (treated as `ready`) on older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<IndexState>,
 }
 
 impl Response {
@@ -67,7 +81,14 @@ impl Response {
             total: 0,
             took_ms: 0,
             error: Some(message.into()),
+            state: None,
         }
+    }
+
+    /// Whether the daemon is still loading the index. The query returned no
+    /// results and should be retried once the load completes.
+    pub fn is_loading(&self) -> bool {
+        self.state == Some(IndexState::Loading)
     }
 }
 
@@ -136,6 +157,7 @@ mod tests {
             total: 0,
             took_ms: 0,
             error: None,
+            state: None,
         };
         let json = serde_json::to_string(&ok).unwrap();
         assert!(!json.contains("error"));
@@ -190,6 +212,7 @@ mod tests {
             total: 1,
             took_ms: 3,
             error: None,
+            state: Some(IndexState::Loading),
         };
         let json = serde_json::to_string(&resp).unwrap();
         let back: Response = serde_json::from_str(&json).unwrap();
@@ -197,5 +220,22 @@ mod tests {
         assert_eq!(back.results[0].name, "a");
         assert_eq!(back.results[0].size, 10);
         assert_eq!(back.results[0].mtime, 42);
+        assert_eq!(back.state, Some(IndexState::Loading));
+    }
+
+    #[test]
+    fn state_is_omitted_when_absent() {
+        let resp = Response {
+            results: Vec::new(),
+            total: 0,
+            took_ms: 0,
+            error: None,
+            state: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(!json.contains("state"));
+        // An older daemon's response (no `state`) deserializes to `None`.
+        let back: Response = serde_json::from_str(r#"{"results":[],"total":0,"took_ms":0}"#).unwrap();
+        assert_eq!(back.state, None);
     }
 }
