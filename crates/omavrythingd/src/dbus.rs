@@ -193,7 +193,9 @@ impl Manager {
         if key == "ntfs" && self.config.ntfs() {
             let index = Arc::clone(&self.index);
             let policy = Arc::clone(&self.policy);
-            std::thread::spawn(move || crate::run_ntfs_startup(index, policy));
+            crate::spawn_thread("ntfs-startup", move || {
+                crate::run_ntfs_startup(index, policy)
+            });
         }
         // F10: apply the candidate-index preference to the running index so the
         // change takes effect without a restart (disabling reclaims its memory).

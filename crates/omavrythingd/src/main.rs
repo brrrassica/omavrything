@@ -44,8 +44,14 @@ use dbus::IndexEvent;
 use logging::LogLevel;
 use manager::IndexManager;
 
-/// Maximum number of concurrent client connections.
-const MAX_CONNECTIONS: usize = 64;
+/// Maximum number of concurrent client-connection threads.
+///
+/// Deliberately small: the systemd service runs with `TasksMax=64`, which must
+/// also cover the daemon's own threads (watcher, scheduler, snapshot writer,
+/// D-Bus, shutdown handler, plus tokio/zbus workers). A local search-group
+/// member opening idle connections must not be able to exhaust that budget, so
+/// clients are capped well below it.
+const MAX_CONNECTIONS: usize = 8;
 /// Per-connection read timeout.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the watcher blocks waiting for events before checking pending moves.
@@ -61,6 +67,27 @@ const SOCKET_GROUP: &str = "omavrything";
 /// Serializes snapshot writes between the periodic writer and the shutdown
 /// handler, which share a fixed temp path.
 static SNAPSHOT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Spawn a named daemon thread with a bounded stack, logging instead of
+/// panicking on failure.
+///
+/// `std::thread::spawn` aborts the whole daemon if the OS refuses the spawn
+/// (e.g. under a tight `TasksMax` cgroup budget); background tasks like the
+/// watcher or D-Bus loop should degrade gracefully rather than take the
+/// service down. The explicit stack size keeps per-thread RSS bounded (rc6).
+pub(crate) fn spawn_thread<F>(name: &str, stack: usize, f: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    match std::thread::Builder::new()
+        .name(name.to_owned())
+        .stack_size(stack)
+        .spawn(f)
+    {
+        Ok(_join) => {}
+        Err(err) => error!(thread = name, error = %err, "failed to spawn thread"),
+    }
+}
 
 fn main() {
     // Constrain the allocator before any thread spawns so the scan's transient
@@ -236,10 +263,22 @@ fn main() {
                 active.fetch_add(1, Ordering::Relaxed);
                 let index = Arc::clone(&index);
                 let active = Arc::clone(&active);
-                spawn_thread("omavry-conn", CONNECTION_STACK, move || {
-                    serve(stream, index, profile);
-                    active.fetch_sub(1, Ordering::Relaxed);
-                });
+                let active_err = Arc::clone(&active);
+                // A failed spawn must not panic the accept loop: decrement the
+                // counter and drop the stream so the daemon keeps serving.
+                match std::thread::Builder::new()
+                    .name("omavry-conn".to_owned())
+                    .stack_size(CONNECTION_STACK)
+                    .spawn(move || {
+                        serve(stream, index, profile);
+                        active.fetch_sub(1, Ordering::Relaxed);
+                    }) {
+                    Ok(_join) => {}
+                    Err(err) => {
+                        active_err.fetch_sub(1, Ordering::Relaxed);
+                        warn!(error = %err, "failed to spawn client thread; dropping client");
+                    }
+                }
             }
             Err(err) => warn!(error = %err, "accept error"),
         }
@@ -995,15 +1034,6 @@ fn tune_allocator() {
 const CONTROL_STACK: usize = 1 << 20;
 /// Stack size for a per-connection thread.
 const CONNECTION_STACK: usize = 512 << 10;
-
-/// Spawn a named thread with an explicit stack size. A spawn failure is ignored
-/// (the daemon degrades rather than aborting).
-fn spawn_thread<F: FnOnce() + Send + 'static>(name: &str, stack: usize, f: F) {
-    let _ = std::thread::Builder::new()
-        .name(name.to_string())
-        .stack_size(stack)
-        .spawn(f);
-}
 
 /// Bound the rayon global pool used by the scan and the parallel search.
 ///

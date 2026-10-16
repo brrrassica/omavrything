@@ -58,6 +58,24 @@ Measured: the empty-index baseline is 5 MiB; the 500 k hermetic tree fell from
   error reporting, non-btrfs snapshot staleness, mount ownership and hotplug,
   install/uninstall hardening, and a single copyable setup command.
 
+## [0.1.9] — 2026-10-16
+
+### Fixed
+
+- **A local group member could crash the system daemon via connection
+  exhaustion.** The daemon admitted 64 concurrent client threads while the
+  shipped systemd service runs with `TasksMax=64`, which must also cover the
+  daemon's own threads (watcher, scheduler, snapshot writer, D-Bus, shutdown
+  handler, tokio/zbus workers). A member of the search group could hold idle
+  connections until the task budget was exhausted; the then-failing
+  `thread::spawn` panicked the accept loop and terminated the service, and
+  every reconnect after the automatic restart repeated the outage. Client
+  threads are now conservatively capped at 8, and every thread spawn in the
+  daemon (client connections, background tasks, the shutdown handler, and the
+  D-Bus NTFS startup path) logs a spawn failure instead of panicking, so a
+  tight task budget degrades gracefully rather than taking the service down.
+
+
 ## [0.1.8] — 2026-10-14
 
 A security-hardening release for the `omarchy-shell` QML integration, closing
@@ -391,6 +409,7 @@ Then install 0.1.1, run `omavrything-install-plugin`, and enable
 First release: the `omavrythingd` index daemon, the `omavry` CLI, and the
 `omarchy-shell` search plugin (bar widget, overlay, service).
 
+[0.1.9]: https://github.com/brrrassica/omavrything/releases/tag/v0.1.9
 [0.1.8]: https://github.com/brrrassica/omavrything/releases/tag/v0.1.8
 [0.1.7]: https://github.com/brrrassica/omavrything/releases/tag/v0.1.7
 [0.1.6]: https://github.com/brrrassica/omavrything/releases/tag/v0.1.6
