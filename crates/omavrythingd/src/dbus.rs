@@ -71,6 +71,12 @@ impl Manager {
         map.insert("entries".into(), index.len().to_string());
         map.insert("roots".into(), index.roots().len().to_string());
         map.insert("memory_bytes".into(), index.memory_bytes().to_string());
+        // rc7: the resident (capacity) figure, so the benchmark can attribute the
+        // gap between the index accounting and RSS to reclaimable slack.
+        map.insert(
+            "memory_capacity_bytes".into(),
+            index.capacity_bytes().to_string(),
+        );
         let b = index.memory_breakdown();
         map.insert("records_len".into(), b.records_len.to_string());
         map.insert("records_cap".into(), b.records_cap.to_string());
@@ -79,16 +85,47 @@ impl Manager {
         map.insert("map_len".into(), b.map_len.to_string());
         map.insert("map_cap_bytes".into(), b.map_cap_bytes.to_string());
         map.insert("candidate_bytes".into(), b.candidate_bytes.to_string());
+        map.insert(
+            "candidate_capacity_bytes".into(),
+            b.candidate_capacity_bytes.to_string(),
+        );
         // Per-component candidate-index breakdown (F11).
         map.insert("candidate_lower".into(), b.candidate.lower.to_string());
         map.insert("candidate_off".into(), b.candidate.off.to_string());
         map.insert("candidate_len".into(), b.candidate.len.to_string());
+        map.insert("candidate_parent".into(), b.candidate.parent.to_string());
         map.insert(
             "candidate_postings".into(),
             b.candidate.postings.to_string(),
         );
         map.insert("candidate_map".into(), b.candidate.map.to_string());
+        map.insert("candidate_subtree".into(), b.candidate.subtree.to_string());
         map.insert("candidate_stop".into(), b.candidate.stop.to_string());
+        // rc7: per-component capacity, so the slack in each arena is visible.
+        map.insert(
+            "candidate_lower_cap".into(),
+            b.candidate.lower_cap.to_string(),
+        );
+        map.insert("candidate_off_cap".into(), b.candidate.off_cap.to_string());
+        map.insert("candidate_len_cap".into(), b.candidate.len_cap.to_string());
+        map.insert(
+            "candidate_parent_cap".into(),
+            b.candidate.parent_cap.to_string(),
+        );
+        map.insert(
+            "candidate_postings_cap".into(),
+            b.candidate.postings_cap.to_string(),
+        );
+        map.insert("candidate_map_cap".into(), b.candidate.map_cap.to_string());
+        map.insert(
+            "candidate_subtree_cap".into(),
+            b.candidate.subtree_cap.to_string(),
+        );
+        map.insert("candidate_stop_cap".into(), b.candidate.stop_cap.to_string());
+        map.insert(
+            "candidate_stack_cap".into(),
+            b.candidate.stack_cap.to_string(),
+        );
         map.insert("scanning".into(), self.config.scanning().to_string());
         map.insert(
             "uptime_secs".into(),

@@ -143,6 +143,7 @@ fn main() {
     // the scan's freed transient pages to the OS before the daemon idles.
     index.shrink();
     trim_heap();
+    log_memory(&index, "startup");
 
     let index = Arc::new(RwLock::new(index));
     let config = Arc::new(SharedConfig::new(ConfigInit {
@@ -437,6 +438,7 @@ fn run_watcher(
                     // The shrink freed pages; return them to the OS rather than
                     // leaving them in the glibc arena (rc6 RSS spike).
                     trim_heap();
+                    log_memory(&read_index(&index), "live-update");
                 }
                 // Watch newly created directories.
                 for event in &batch {
@@ -855,6 +857,27 @@ fn write_index(index: &RwLock<Index>) -> RwLockWriteGuard<'_, Index> {
 /// Clone the current root identities.
 fn read_identities(identities: &RwLock<Vec<RootIdentity>>) -> Vec<RootIdentity> {
     identities.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Log the index's used and resident (capacity) memory, so the benchmark can
+/// attribute the gap between the accounting and RSS (rc7).
+fn log_memory(index: &Index, phase: &str) {
+    let b = index.memory_breakdown();
+    info!(
+        phase,
+        entries = index.len(),
+        memory_bytes = index.memory_bytes(),
+        capacity_bytes = index.capacity_bytes(),
+        records_len = b.records_len,
+        records_cap = b.records_cap,
+        paths_len = b.paths_len,
+        paths_cap = b.paths_cap,
+        map_len = b.map_len,
+        map_cap_bytes = b.map_cap_bytes,
+        candidate_bytes = b.candidate_bytes,
+        candidate_capacity_bytes = b.candidate_capacity_bytes,
+        "index memory"
+    );
 }
 
 /// Ask the allocator to return freed heap pages to the OS.

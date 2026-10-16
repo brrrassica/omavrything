@@ -143,6 +143,9 @@ fn report_memory(index: &Index, requested: usize) {
     let live = index.len().max(1) as f64;
     let records_bytes = (b.records_len * std::mem::size_of::<FileRecord>()) as u64;
     let index_bytes = index.memory_bytes();
+    // rc7: the resident (capacity) figure, so the gap to the used accounting —
+    // the reclaimable slack — is visible.
+    let index_capacity = index.capacity_bytes();
     let per = |bytes: u64| bytes as f64 / live;
     println!(
         "memory breakdown ({} live records, requested {requested}):",
@@ -196,12 +199,28 @@ fn report_memory(index: &Index, requested: usize) {
         per(index_bytes)
     );
     println!(
+        "  {:<10} {:>12} B  {:>7.1} B/record",
+        "capacity",
+        index_capacity,
+        per(index_capacity)
+    );
+    println!(
+        "  {:<10} {:>12} B  {:>7.1} B/record",
+        "slack",
+        index_capacity.saturating_sub(index_bytes),
+        per(index_capacity.saturating_sub(index_bytes))
+    );
+    println!(
         "MEMORY index_bytes={index_bytes} index_bytes_per_record={:.1} \
+         index_capacity_bytes={index_capacity} index_capacity_bytes_per_record={:.1} \
          candidate_bytes={} candidate_bytes_per_record={:.1} \
+         candidate_capacity_bytes={} \
          lower={} off={} len={} parent={} postings={} map={} subtree={} stop={}",
         per(index_bytes),
+        per(index_capacity),
         b.candidate_bytes,
         per(b.candidate_bytes),
+        b.candidate_capacity_bytes,
         c.lower,
         c.off,
         c.len,

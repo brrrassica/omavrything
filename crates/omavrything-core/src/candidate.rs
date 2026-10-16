@@ -220,6 +220,26 @@ pub struct CandidateMemory {
     pub subtree: u64,
     /// Stop-list set bytes.
     pub stop: u64,
+    /// Lowercased path arena **capacity** (rc7). The gap to `lower` is
+    /// reclaimable slack that RSS still pays for.
+    pub lower_cap: u64,
+    /// Per-record offset array capacity.
+    pub off_cap: u64,
+    /// Per-record length array capacity.
+    pub len_cap: u64,
+    /// Per-record parent array capacity.
+    pub parent_cap: u64,
+    /// Trigram posting capacity (the CSR arenas plus any delta postings).
+    pub postings_cap: u64,
+    /// Trigram map capacity (keys, slot values, offsets, control bytes).
+    pub map_cap: u64,
+    /// Subtree-range array capacity.
+    pub subtree_cap: u64,
+    /// Stop-list set capacity.
+    pub stop_cap: u64,
+    /// Bulk-build stack capacity (empty after `finish_bulk`, but its capacity is
+    /// retained until `shrink`).
+    pub stack_cap: u64,
 }
 
 /// A trigram whose posting list covers more than `1 / STOP_LIST_DIVISOR` of the
@@ -685,6 +705,9 @@ impl CandidateIndex {
     }
 
     /// A per-component breakdown of the candidate index's heap memory (F11).
+    ///
+    /// The `*_cap` fields are the **capacity** (resident) bytes; the used fields
+    /// are the bytes actually in use. The gap is reclaimable slack (rc7).
     pub fn memory_breakdown(&self) -> CandidateMemory {
         let lower = self.lower.len() as u64;
         let off = (self.off.len() * std::mem::size_of::<u32>()) as u64;
@@ -706,6 +729,29 @@ impl CandidateIndex {
         let subtree = (self.subtree_end.len() * std::mem::size_of::<(u32, u32)>()) as u64;
         // A stop-list entry is a `u32` key plus a control byte.
         let stop = (self.stop.len() * (4 + 1)) as u64;
+
+        // Capacity (rc7): the resident bytes a `Vec`/`HashMap` actually holds,
+        // which is what RSS pays for. The gap to the used figure is reclaimable
+        // slack that `shrink` releases.
+        let lower_cap = self.lower.capacity() as u64;
+        let off_cap = (self.off.capacity() * std::mem::size_of::<u32>()) as u64;
+        let len_cap = (self.len.capacity() * std::mem::size_of::<u16>()) as u64;
+        let parent_cap = (self.parent.capacity() * std::mem::size_of::<u32>()) as u64;
+        let delta_cap: u64 = self.delta.values().map(|v| (v.capacity() * 4) as u64).sum();
+        let dir_delta_cap: u64 = self.dir_delta.values().map(|v| (v.capacity() * 4) as u64).sum();
+        let postings_cap = self.csr.data.capacity() as u64
+            + self.dir_csr.data.capacity() as u64
+            + delta_cap
+            + dir_delta_cap;
+        let map_cap = (self.csr.keys.capacity() + self.dir_csr.keys.capacity()) as u64
+            * std::mem::size_of::<u32>() as u64
+            + (self.csr.offsets.capacity() + self.dir_csr.offsets.capacity()) as u64
+                * std::mem::size_of::<u32>() as u64
+            + (self.delta.capacity() + self.dir_delta.capacity()) as u64 * (4 + 24 + 1);
+        let subtree_cap = (self.subtree_end.capacity() * std::mem::size_of::<(u32, u32)>()) as u64;
+        let stop_cap = (self.stop.capacity() * (4 + 1)) as u64;
+        let stack_cap = (self.stack.capacity() * std::mem::size_of::<(u32, u32, u32)>()) as u64;
+
         CandidateMemory {
             lower,
             off,
@@ -715,6 +761,15 @@ impl CandidateIndex {
             map,
             subtree,
             stop,
+            lower_cap,
+            off_cap,
+            len_cap,
+            parent_cap,
+            postings_cap,
+            map_cap,
+            subtree_cap,
+            stop_cap,
+            stack_cap,
         }
     }
 
@@ -722,6 +777,22 @@ impl CandidateIndex {
     pub fn memory_bytes(&self) -> u64 {
         let b = self.memory_breakdown();
         b.lower + b.off + b.len + b.parent + b.postings + b.map + b.subtree + b.stop
+    }
+
+    /// The resident (capacity) bytes held by the candidate index, including the
+    /// reclaimable slack. This is what RSS pays for, versus [`Self::memory_bytes`]
+    /// which counts used bytes (rc7).
+    pub fn capacity_bytes(&self) -> u64 {
+        let b = self.memory_breakdown();
+        b.lower_cap
+            + b.off_cap
+            + b.len_cap
+            + b.parent_cap
+            + b.postings_cap
+            + b.map_cap
+            + b.subtree_cap
+            + b.stop_cap
+            + b.stack_cap
     }
 
     /// Release excess capacity in the arenas and posting lists.
@@ -746,6 +817,42 @@ impl CandidateIndex {
         }
         self.dir_delta.shrink_to_fit();
         self.stop.shrink_to_fit();
+    }
+
+    /// Reclaim the doubling slack in the candidate index's **`Vec`** arenas
+    /// (rc7). A `Vec::shrink_to_fit` is a memcpy, so this is cheap enough for the
+    /// live-update path; the `HashMap`/`HashSet` fields (the `delta` overlay and
+    /// the stop-list) are left to the full [`Self::shrink`], which rehashes.
+    ///
+    /// Returns whether any arena was shrunk, so the caller can trim the allocator.
+    pub fn shrink_arenas_if_slack(&mut self) -> bool {
+        let mut shrank = false;
+        shrank |= shrink_vec_if_slack(&mut self.lower);
+        shrank |= shrink_vec_if_slack(&mut self.off);
+        shrank |= shrink_vec_if_slack(&mut self.len);
+        shrank |= shrink_vec_if_slack(&mut self.parent);
+        shrank |= shrink_vec_if_slack(&mut self.subtree_end);
+        shrank |= shrink_vec_if_slack(&mut self.csr.keys);
+        shrank |= shrink_vec_if_slack(&mut self.csr.offsets);
+        shrank |= shrink_vec_if_slack(&mut self.csr.data);
+        shrank |= shrink_vec_if_slack(&mut self.dir_csr.keys);
+        shrank |= shrink_vec_if_slack(&mut self.dir_csr.offsets);
+        shrank |= shrink_vec_if_slack(&mut self.dir_csr.data);
+        shrank |= shrink_vec_if_slack(&mut self.stack);
+        shrank
+    }
+}
+
+/// Shrink a `Vec` when its spare capacity is at least a quarter of its length
+/// (rc7). A no-op when the slack is small, so a small live-update batch does not
+/// trigger a reallocation on every event.
+fn shrink_vec_if_slack<T>(v: &mut Vec<T>) -> bool {
+    let slack = v.capacity().saturating_sub(v.len());
+    if slack * 4 >= v.len().max(1) {
+        v.shrink_to_fit();
+        true
+    } else {
+        false
     }
 }
 

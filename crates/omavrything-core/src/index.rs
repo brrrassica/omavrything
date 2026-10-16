@@ -535,6 +535,9 @@ pub struct MemoryBreakdown {
     /// Candidate-index estimated bytes (trigram postings, lowercased arena, and
     /// token table).
     pub candidate_bytes: u64,
+    /// Candidate-index resident (capacity) bytes, including reclaimable slack
+    /// (rc7).
+    pub candidate_capacity_bytes: u64,
     /// Per-component breakdown of the candidate index (F11).
     pub candidate: CandidateMemory,
 }
@@ -617,6 +620,17 @@ impl Index {
         (records + arenas + map) as u64 + self.candidate.memory_bytes()
     }
 
+    /// An estimate of the **resident** (capacity) heap memory held by the index,
+    /// including the reclaimable slack that [`Index::memory_bytes`] omits. This
+    /// is what RSS pays for; the gap to `memory_bytes` is the slack that
+    /// [`Index::shrink`] releases (rc7).
+    pub fn capacity_bytes(&self) -> u64 {
+        let records = self.records.capacity() * std::mem::size_of::<FileRecord>();
+        let arenas = self.paths.capacity();
+        let map = self.by_path.capacity_bytes();
+        (records + arenas + map) as u64 + self.candidate.capacity_bytes()
+    }
+
     /// A per-component breakdown of the index's memory, for diagnostics.
     pub fn memory_breakdown(&self) -> MemoryBreakdown {
         MemoryBreakdown {
@@ -627,6 +641,7 @@ impl Index {
             map_len: self.by_path.len(),
             map_cap_bytes: self.by_path.capacity_bytes(),
             candidate_bytes: self.candidate.memory_bytes(),
+            candidate_capacity_bytes: self.candidate.capacity_bytes(),
             candidate: self.candidate.memory_breakdown(),
         }
     }
@@ -751,14 +766,22 @@ impl Index {
         // Reclaim when the spare capacity is at least a quarter of the used size.
         let records_used = self.records.len().max(1);
         let paths_used = self.paths.len().max(1);
+        let mut shrank = false;
         if records_slack * 4 >= records_used || paths_slack * 4 >= paths_used {
             self.invalidate_cache();
             self.records.shrink_to_fit();
             self.paths.shrink_to_fit();
-            true
-        } else {
-            false
+            shrank = true;
         }
+        // rc7: also reclaim the candidate index's `Vec` arenas. A `Vec` shrink is
+        // a memcpy, so it is cheap enough for the live-update path; the candidate
+        // `HashMap`s (the delta overlay and the stop-list) are left to the full
+        // `shrink`, which rehashes.
+        if self.candidate.shrink_arenas_if_slack() {
+            self.invalidate_cache();
+            shrank = true;
+        }
+        shrank
     }
 
     /// The path arena, for snapshot serialization.

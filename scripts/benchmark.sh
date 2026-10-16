@@ -182,7 +182,7 @@ find_daemon_pid() {
 # (`RssAnon`), and the thread count, so the fixed daemon overhead can be
 # separated from the index itself.
 record_memory() {
-  local key="$1" pid="$2" title="${3:-daemon}" entries="${4:-}" index_bytes="${5:-}"
+  local key="$1" pid="$2" title="${3:-daemon}" entries="${4:-}" index_bytes="${5:-}" index_capacity="${6:-}"
   [[ "$do_memory" == 1 && -n "$pid" ]] || return 0
   local rss hwm
   rss="$(read_mem_kb "$pid" VmRSS)"
@@ -212,6 +212,20 @@ record_memory() {
     idx_bpr="$(awk -v b="$index_bytes" -v n="$entries" 'BEGIN { printf "%.1f", b / n }')"
     msg+="  index/record=${idx_bpr}B"
     jobj+=", \"index_bytes\": $index_bytes, \"index_bytes_per_record\": $idx_bpr"
+    # rc7: the overhead is RSS minus the index accounting; this is the figure the
+    # <100 B/record target must drive down alongside the index itself.
+    local overhead_bpr
+    overhead_bpr="$(awk -v r="$rss" -v b="$index_bytes" -v n="$entries" 'BEGIN { printf "%.1f", (r * 1024 - b) / n }')"
+    msg+="  overhead/record=${overhead_bpr}B"
+    jobj+=", \"overhead_bytes_per_record\": $overhead_bpr"
+  fi
+  # rc7: the index's resident (capacity) figure. The gap to the used accounting
+  # is reclaimable slack that RSS still pays for.
+  if [[ -n "$index_capacity" && "$index_capacity" -gt 0 && -n "$index_bytes" && "$index_bytes" -gt 0 && -n "$entries" && "$entries" -gt 0 ]]; then
+    local slack_bpr
+    slack_bpr="$(awk -v c="$index_capacity" -v b="$index_bytes" -v n="$entries" 'BEGIN { printf "%.1f", (c - b) / n }')"
+    msg+="  slack/record=${slack_bpr}B"
+    jobj+=", \"index_capacity_bytes\": $index_capacity, \"index_slack_bytes_per_record\": $slack_bpr"
   fi
   jobj+="}"
   say "$msg"
@@ -589,14 +603,26 @@ if [[ "$run_live" == "yes" ]]; then
   section "live daemon ($live_socket)"
   live_entries=""
   live_index_bytes=""
+  live_index_capacity=""
   live_candidate=""
+  live_candidate_capacity=""
   live_candidate_postings=""
   live_candidate_lower=""
   live_candidate_tokens=""
   live_candidate_map=""
   live_candidate_off=""
   live_candidate_len=""
+  live_candidate_parent=""
+  live_candidate_subtree=""
   live_candidate_stop=""
+  live_candidate_lower_cap=""
+  live_candidate_postings_cap=""
+  live_candidate_map_cap=""
+  live_candidate_off_cap=""
+  live_candidate_len_cap=""
+  live_candidate_parent_cap=""
+  live_candidate_subtree_cap=""
+  live_candidate_stack_cap=""
   live_records_cap=""
   live_paths_cap=""
   live_map_cap_bytes=""
@@ -604,17 +630,29 @@ if [[ "$run_live" == "yes" ]]; then
     live_status="$("$cli_bin" status 2>/dev/null || true)"
     live_entries="$(sed -n 's/^entries: //p' <<<"$live_status")"
     live_index_bytes="$(sed -n 's/^memory_bytes: //p' <<<"$live_status")"
+    live_index_capacity="$(sed -n 's/^memory_capacity_bytes: //p' <<<"$live_status")"
     live_records_cap="$(sed -n 's/^records_cap: //p' <<<"$live_status")"
     live_paths_cap="$(sed -n 's/^paths_cap: //p' <<<"$live_status")"
     live_map_cap_bytes="$(sed -n 's/^map_cap_bytes: //p' <<<"$live_status")"
     live_candidate="$(sed -n 's/^candidate_bytes: //p' <<<"$live_status")"
+    live_candidate_capacity="$(sed -n 's/^candidate_capacity_bytes: //p' <<<"$live_status")"
     live_candidate_postings="$(sed -n 's/^candidate_postings: //p' <<<"$live_status")"
     live_candidate_lower="$(sed -n 's/^candidate_lower: //p' <<<"$live_status")"
     live_candidate_tokens="$(sed -n 's/^candidate_tokens: //p' <<<"$live_status")"
     live_candidate_map="$(sed -n 's/^candidate_map: //p' <<<"$live_status")"
     live_candidate_off="$(sed -n 's/^candidate_off: //p' <<<"$live_status")"
     live_candidate_len="$(sed -n 's/^candidate_len: //p' <<<"$live_status")"
+    live_candidate_parent="$(sed -n 's/^candidate_parent: //p' <<<"$live_status")"
+    live_candidate_subtree="$(sed -n 's/^candidate_subtree: //p' <<<"$live_status")"
     live_candidate_stop="$(sed -n 's/^candidate_stop: //p' <<<"$live_status")"
+    live_candidate_lower_cap="$(sed -n 's/^candidate_lower_cap: //p' <<<"$live_status")"
+    live_candidate_postings_cap="$(sed -n 's/^candidate_postings_cap: //p' <<<"$live_status")"
+    live_candidate_map_cap="$(sed -n 's/^candidate_map_cap: //p' <<<"$live_status")"
+    live_candidate_off_cap="$(sed -n 's/^candidate_off_cap: //p' <<<"$live_status")"
+    live_candidate_len_cap="$(sed -n 's/^candidate_len_cap: //p' <<<"$live_status")"
+    live_candidate_parent_cap="$(sed -n 's/^candidate_parent_cap: //p' <<<"$live_status")"
+    live_candidate_subtree_cap="$(sed -n 's/^candidate_subtree_cap: //p' <<<"$live_status")"
+    live_candidate_stack_cap="$(sed -n 's/^candidate_stack_cap: //p' <<<"$live_status")"
   fi
   if [[ -n "$live_entries" ]]; then
     say "index entries: $live_entries"
@@ -629,7 +667,7 @@ if [[ "$run_live" == "yes" ]]; then
     live_pid="$(find_daemon_pid "$live_socket" || true)"
     if [[ -n "$live_pid" ]]; then
       say "daemon pid: $live_pid"
-      record_memory "memory:live" "$live_pid" "live" "$live_entries" "$live_index_bytes"
+      record_memory "memory:live" "$live_pid" "live" "$live_entries" "$live_index_bytes" "$live_index_capacity"
     else
       say "memory: could not resolve the live daemon pid for $live_socket"
     fi
@@ -638,8 +676,14 @@ if [[ "$run_live" == "yes" ]]; then
   # used bytes, so any gap between capacity and length is resident slack that the
   # per-record figure does not capture.
   if [[ -n "$live_records_cap" && -n "$live_entries" && "$live_entries" -gt 0 ]]; then
-    say "index capacity: records_cap=${live_records_cap} paths_cap=${live_paths_cap} map_cap_bytes=${live_map_cap_bytes}"
-    add_result "capacity:live" "$(python3 -c 'import json,sys; i=lambda x: int(x) if x else 0; print(json.dumps({"records_cap": i(sys.argv[1]), "paths_cap": i(sys.argv[2]), "map_cap_bytes": i(sys.argv[3])}))' "$live_records_cap" "$live_paths_cap" "$live_map_cap_bytes")"
+    say "index capacity: records_cap=${live_records_cap} paths_cap=${live_paths_cap} map_cap_bytes=${live_map_cap_bytes} index_capacity_bytes=${live_index_capacity}"
+    add_result "capacity:live" "$(python3 -c 'import json,sys; i=lambda x: int(x) if x else 0; print(json.dumps({"records_cap": i(sys.argv[1]), "paths_cap": i(sys.argv[2]), "map_cap_bytes": i(sys.argv[3]), "index_capacity_bytes": i(sys.argv[4])}))' "$live_records_cap" "$live_paths_cap" "$live_map_cap_bytes" "$live_index_capacity")"
+  fi
+  # rc7: the candidate-index capacity breakdown, so the reclaimable slack in each
+  # arena is visible next to its used size.
+  if [[ -n "$live_candidate_capacity" && "$live_candidate_capacity" -gt 0 && -n "$live_entries" && "$live_entries" -gt 0 ]]; then
+    say "candidate capacity: total=${live_candidate_capacity} lower_cap=${live_candidate_lower_cap} postings_cap=${live_candidate_postings_cap} map_cap=${live_candidate_map_cap} off_cap=${live_candidate_off_cap} len_cap=${live_candidate_len_cap} parent_cap=${live_candidate_parent_cap} subtree_cap=${live_candidate_subtree_cap} stack_cap=${live_candidate_stack_cap}"
+    add_result "candidate_capacity:live" "$(python3 -c 'import json,sys; i=lambda x: int(x) if x else 0; print(json.dumps({"bytes": i(sys.argv[1]), "lower_cap": i(sys.argv[2]), "postings_cap": i(sys.argv[3]), "map_cap": i(sys.argv[4]), "off_cap": i(sys.argv[5]), "len_cap": i(sys.argv[6]), "parent_cap": i(sys.argv[7]), "subtree_cap": i(sys.argv[8]), "stack_cap": i(sys.argv[9])}))' "$live_candidate_capacity" "$live_candidate_lower_cap" "$live_candidate_postings_cap" "$live_candidate_map_cap" "$live_candidate_off_cap" "$live_candidate_len_cap" "$live_candidate_parent_cap" "$live_candidate_subtree_cap" "$live_candidate_stack_cap")"
   fi
   # Per-component candidate-index breakdown (F11), from the daemon's own
   # accounting. This is the memory the n-gram index costs, split by component.
