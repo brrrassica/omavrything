@@ -4,6 +4,52 @@ Notable changes to `omavrything`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.9] — 2026-10-16
+
+### Fixed
+
+- **A local group member could crash the system daemon via connection
+  exhaustion.** The daemon admitted 64 concurrent client threads while the
+  shipped systemd service runs with `TasksMax=64`, which must also cover the
+  daemon's own threads (watcher, scheduler, snapshot writer, D-Bus, shutdown
+  handler, tokio/zbus workers). A member of the search group could hold idle
+  connections until the task budget was exhausted; the then-failing
+  `thread::spawn` panicked the accept loop and terminated the service, and
+  every reconnect after the automatic restart repeated the outage. Client
+  threads are now conservatively capped at 8, and every thread spawn in the
+  daemon (client connections, background tasks, the shutdown handler, and the
+  D-Bus NTFS startup path) logs a spawn failure instead of panicking, so a
+  tight task budget degrades gracefully rather than taking the service down.
+
+
+## [0.1.8] — 2026-10-14
+
+A security-hardening release for the `omarchy-shell` QML integration, closing
+the findings that blocked marketplace verification.
+
+### Security
+
+- **Index-derived text is rendered as plain text.** `Text` defaults to
+  `AutoText`, so a file name or parent path that "looks like" HTML was handed to
+  Qt's rich-text engine; an `<img src="...">` in a directory name (any local user
+  can create one) would load and decode an attacker-chosen local file
+  (PNG/JPG/SVG/PDF/…) or fetch a remote URL during a search — a
+  memory-exhaustion vector in the shared shell. Every `Text` that renders
+  index- or query-derived data now sets `textFormat: Text.PlainText`.
+- **The query mirror no longer falls back to `/tmp`.** The overlay writes the
+  query to a runtime file the bar watches. With `XDG_RUNTIME_DIR` unset the path
+  was `/tmp/omavrything-query`, world-writable: another local user could
+  pre-create it as a symlink (the overlay would overwrite the link target with
+  the query) or feed the bar arbitrary content. The mirror now uses
+  `$XDG_RUNTIME_DIR` (0700) and is disabled when it is unset.
+- **The socket response is bounded.** `handleResponse` trusted the daemon's
+  result count; a spoofed socket or a compromised daemon could make the shell
+  allocate an unbounded result set. The page is now sliced to `maxResults`.
+- **`xdg-open` only receives an absolute path.** A spoofed daemon could return a
+  URL or an option-like string (`--help`); the overlay now rejects anything that
+  is not an absolute path.
+
+
 ## [0.1.7] — 2026-10-13
 
 ### Security
@@ -295,6 +341,8 @@ Then install 0.1.1, run `omavrything-install-plugin`, and enable
 First release: the `omavrythingd` index daemon, the `omavry` CLI, and the
 `omarchy-shell` search plugin (bar widget, overlay, service).
 
+[0.1.9]: https://github.com/brrrassica/omavrything/releases/tag/v0.1.9
+[0.1.8]: https://github.com/brrrassica/omavrything/releases/tag/v0.1.8
 [0.1.7]: https://github.com/brrrassica/omavrything/releases/tag/v0.1.7
 [0.1.6]: https://github.com/brrrassica/omavrything/releases/tag/v0.1.6
 [0.1.5]: https://github.com/brrrassica/omavrything/releases/tag/v0.1.5

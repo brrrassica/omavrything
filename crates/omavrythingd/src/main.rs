@@ -42,8 +42,14 @@ use config_file::{DEFAULT_CONFIG_PATH, FileConfig};
 use dbus::IndexEvent;
 use logging::LogLevel;
 
-/// Maximum number of concurrent client connections.
-const MAX_CONNECTIONS: usize = 64;
+/// Maximum number of concurrent client-connection threads.
+///
+/// Deliberately small: the systemd service runs with `TasksMax=64`, which must
+/// also cover the daemon's own threads (watcher, scheduler, snapshot writer,
+/// D-Bus, shutdown handler, plus tokio/zbus workers). A local search-group
+/// member opening idle connections must not be able to exhaust that budget, so
+/// clients are capped well below it.
+const MAX_CONNECTIONS: usize = 8;
 /// Per-connection read timeout.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the watcher blocks waiting for events before checking pending moves.
@@ -56,6 +62,22 @@ const SOCKET_GROUP: &str = "omavrything";
 /// Serializes snapshot writes between the periodic writer and the shutdown
 /// handler, which share a fixed temp path.
 static SNAPSHOT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Spawn a named daemon thread, logging instead of panicking on failure.
+///
+/// `std::thread::spawn` aborts the whole daemon if the OS refuses the spawn
+/// (e.g. under a tight `TasksMax` cgroup budget); background tasks like the
+/// watcher or D-Bus loop should degrade gracefully rather than take the
+/// service down.
+pub(crate) fn spawn_thread<F>(name: &str, f: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    match std::thread::Builder::new().name(name.to_owned()).spawn(f) {
+        Ok(_join) => {}
+        Err(err) => error!(thread = name, error = %err, "failed to spawn thread"),
+    }
+}
 
 fn main() {
     // Constrain the allocator before any thread spawns so the scan's transient
@@ -163,14 +185,14 @@ fn main() {
         let index = Arc::clone(&index);
         let config = Arc::clone(&config);
         let events = event_tx.clone();
-        std::thread::spawn(move || run_watcher(index, config, events));
+        spawn_thread("watcher", move || run_watcher(index, config, events));
     }
 
     if args.scan_interval > 0 {
         let index = Arc::clone(&index);
         let config = Arc::clone(&config);
         let events = event_tx.clone();
-        std::thread::spawn(move || run_scheduler(index, config, events));
+        spawn_thread("scheduler", move || run_scheduler(index, config, events));
     }
 
     if let Some(path) = &args.snapshot {
@@ -179,7 +201,9 @@ fn main() {
             let identities = Arc::clone(&identities);
             let config = Arc::clone(&config);
             let path = path.clone();
-            std::thread::spawn(move || run_snapshot(index, identities, config, path));
+            spawn_thread("snapshot", move || {
+                run_snapshot(index, identities, config, path)
+            });
         }
     }
 
@@ -188,13 +212,15 @@ fn main() {
         let config = Arc::clone(&config);
         let events = event_tx.clone();
         let policy = Arc::clone(&policy);
-        std::thread::spawn(move || dbus::run(index, config, started, event_rx, events, policy));
+        spawn_thread("dbus", move || {
+            dbus::run(index, config, started, event_rx, events, policy)
+        });
     }
 
     if args.ntfs {
         let index = Arc::clone(&index);
         let policy = Arc::clone(&policy);
-        std::thread::spawn(move || run_ntfs_startup(index, policy));
+        spawn_thread("ntfs-startup", move || run_ntfs_startup(index, policy));
     }
 
     // A stale socket from a previous run would make bind() fail.
@@ -274,10 +300,21 @@ fn main() {
                 active.fetch_add(1, Ordering::Relaxed);
                 let index = Arc::clone(&index);
                 let active = Arc::clone(&active);
-                std::thread::spawn(move || {
-                    serve(stream, index, profile);
-                    active.fetch_sub(1, Ordering::Relaxed);
-                });
+                let active_err = Arc::clone(&active);
+                // A failed spawn must not panic the accept loop: decrement the
+                // counter and drop the stream so the daemon keeps serving.
+                match std::thread::Builder::new()
+                    .name("client".to_owned())
+                    .spawn(move || {
+                        serve(stream, index, profile);
+                        active.fetch_sub(1, Ordering::Relaxed);
+                    }) {
+                    Ok(_join) => {}
+                    Err(err) => {
+                        active_err.fetch_sub(1, Ordering::Relaxed);
+                        warn!(error = %err, "failed to spawn client thread; dropping client");
+                    }
+                }
             }
             Err(err) => warn!(error = %err, "accept error"),
         }
@@ -639,7 +676,7 @@ fn install_shutdown_handler(
     }
 
     let read_fd = fds[0];
-    std::thread::spawn(move || {
+    spawn_thread("shutdown", move || {
         let mut byte = [0u8; 1];
         loop {
             // SAFETY: `read_fd` is a valid pipe read end and `byte` is 1 byte.

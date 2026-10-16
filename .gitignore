@@ -21,6 +21,7 @@ _site/
 # Planning documents (kept local, not published)
 /plans
 /obsolete-plans
+/old-rc
 
 # Editor / OS noise
 .DS_Store
