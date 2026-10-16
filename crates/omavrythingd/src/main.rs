@@ -82,75 +82,29 @@ fn main() {
     let scan_config = args.scan_config();
     let started = Instant::now();
 
-    let (mut index, report, identities, outcome) = match &args.snapshot {
-        Some(path) => {
-            // Load the snapshot through an mmap (F6): it avoids the intermediate
-            // read buffer, and falls back to a plain read if mapping fails.
-            let warm = snapshot::warm_start_with(&scan_config, path, snapshot::SnapshotLoad::Mmap);
-            (warm.index, warm.report, warm.identities, Some(warm.outcome))
+    // Diagnostics: log the roots the scan will walk, so a slow startup can be
+    // attributed to a specific (e.g. large NTFS) mount.
+    {
+        let roots = omavrything_core::scan::resolve_roots(&scan_config);
+        info!(count = roots.len(), "scan: resolved roots");
+        for (root, kind) in &roots {
+            info!(path = %root.display(), fs_kind = ?kind, "scan: root");
         }
-        None => {
-            let (index, report) = scan(&scan_config);
-            let identities = index
-                .roots()
-                .iter()
-                .filter_map(|r| snapshot::root_identity(Path::new(&r.path)))
-                .collect();
-            (index, report, identities, None)
-        }
-    };
-
-    let elapsed_ms = started.elapsed().as_millis() as u64;
-    match outcome {
-        Some(WarmStart::Snapshot) => info!(
-            entries = %index.len(),
-            elapsed_ms,
-            "warm-started from snapshot"
-        ),
-        Some(WarmStart::Partial { rescanned }) => info!(
-            entries = %index.len(),
-            rescanned,
-            elapsed_ms,
-            "warm-started from snapshot"
-        ),
-        Some(WarmStart::ColdScan) => info!(
-            entries = %report.entries,
-            roots = %report.roots,
-            skipped = %report.skipped,
-            unreadable = %report.errors,
-            elapsed_ms,
-            "no usable snapshot; cold scan"
-        ),
-        None => info!(
-            entries = %report.entries,
-            roots = %report.roots,
-            skipped = %report.skipped,
-            unreadable = %report.errors,
-            elapsed_ms,
-            "indexed"
-        ),
-    }
-    for root in index.roots() {
-        info!(path = %root.path, fs_kind = ?root.fs_kind, "root");
     }
 
-    // F10: honour the candidate-index preference before the index settles, so a
-    // disabled index is not consulted (and its memory is reclaimed).
-    if !args.candidate_index {
-        index.set_candidate_enabled(false);
-    }
-    // F7: the benchmark disables the query cache to measure the cold path.
-    if !args.query_cache {
-        index.set_query_cache(false);
-    }
-
-    // Reclaim the doubling slack left by the scan or snapshot load, then return
-    // the scan's freed transient pages to the OS before the daemon idles.
-    index.shrink();
-    trim_heap();
-    log_memory(&index, "startup");
-
-    let index = Arc::new(IndexManager::new(index, identities, args.snapshot.clone()));
+    // Non-blocking startup: the manager starts with an empty index and a
+    // `loading` flag, the socket and D-Bus are served immediately, and the scan
+    // (or snapshot warm start) runs in a background thread that swaps the real
+    // index in when it lands. A cold scan of large NTFS mounts can take minutes;
+    // building it synchronously here used to delay the socket bind and the D-Bus
+    // name registration past the install script's 30 s wait, which reported the
+    // daemon as dead while it was merely still scanning.
+    let index = Arc::new(IndexManager::new(
+        Index::new(),
+        Vec::new(),
+        args.snapshot.clone(),
+    ));
+    index.set_loading(true);
     let config = Arc::new(SharedConfig::new(ConfigInit {
         scan: scan_config,
         scan_interval: args.scan_interval,
@@ -177,42 +131,6 @@ fn main() {
     // a dedicated thread can perform a clean snapshot write on shutdown.
     install_shutdown_handler(Arc::clone(&index), args.snapshot.clone());
 
-    if args.watch {
-        let index = Arc::clone(&index);
-        let config = Arc::clone(&config);
-        let events = event_tx.clone();
-        spawn_thread("omavry-watch", CONTROL_STACK, move || {
-            run_watcher(index, config, events)
-        });
-    }
-
-    if args.scan_interval > 0 {
-        let index = Arc::clone(&index);
-        let config = Arc::clone(&config);
-        let events = event_tx.clone();
-        spawn_thread("omavry-sched", CONTROL_STACK, move || {
-            run_scheduler(index, config, events)
-        });
-    }
-
-    if let Some(path) = &args.snapshot {
-        if args.snapshot_interval > 0 {
-            let index = Arc::clone(&index);
-            let config = Arc::clone(&config);
-            let path = path.clone();
-            spawn_thread("omavry-snap", CONTROL_STACK, move || {
-                run_snapshot(index, config, path)
-            });
-        }
-        // Eviction needs a snapshot to map, so only run the evictor when one is
-        // configured.
-        let index = Arc::clone(&index);
-        let config = Arc::clone(&config);
-        spawn_thread("omavry-evict", CONTROL_STACK, move || {
-            run_evictor(index, config)
-        });
-    }
-
     if args.dbus {
         let index = Arc::clone(&index);
         let config = Arc::clone(&config);
@@ -223,11 +141,21 @@ fn main() {
         });
     }
 
-    if args.ntfs {
+    // Build the index in the background; `run_startup` swaps it in and then
+    // starts the watch/schedule/snapshot/evict/NTFS threads.
+    {
         let index = Arc::clone(&index);
+        let config = Arc::clone(&config);
         let policy = Arc::clone(&policy);
-        spawn_thread("omavry-ntfs", CONTROL_STACK, move || {
-            run_ntfs_startup(index, policy)
+        let events = event_tx.clone();
+        let opts = StartupOpts {
+            snapshot: args.snapshot.clone(),
+            watch: args.watch,
+            query_cache: args.query_cache,
+            started,
+        };
+        spawn_thread("omavry-startup", CONTROL_STACK, move || {
+            run_startup(index, config, policy, events, opts)
         });
     }
 
@@ -315,6 +243,157 @@ fn main() {
             }
             Err(err) => warn!(error = %err, "accept error"),
         }
+    }
+}
+
+/// Build the index in the background and swap it into the manager, then start
+/// the watch/schedule/snapshot/evict/NTFS threads.
+///
+/// The socket and D-Bus are already serving while this runs: searches return an
+/// empty page with the `loading` flag set until the index lands. The background
+/// services start only after the swap: the watcher would otherwise apply events
+/// to an index the swap replaces, and the snapshot writer would persist the
+/// empty warming index over a good snapshot.
+///
+/// Everything the startup needs that is not shared state, bundled so the
+/// function signature stays readable.
+struct StartupOpts {
+    snapshot: Option<PathBuf>,
+    watch: bool,
+    query_cache: bool,
+    started: Instant,
+}
+
+fn run_startup(
+    index: Arc<IndexManager>,
+    config: Arc<SharedConfig>,
+    policy: Arc<Mutex<ntfs::NtfsPolicy>>,
+    events: UnboundedSender<IndexEvent>,
+    opts: StartupOpts,
+) {
+    let StartupOpts {
+        snapshot,
+        watch,
+        query_cache,
+        started,
+    } = opts;
+    let scan_config = config.scan();
+    let (mut built, report, identities, outcome) = match &snapshot {
+        Some(path) => {
+            // Load the snapshot through an mmap (F6): it avoids the intermediate
+            // read buffer, and falls back to a plain read if mapping fails.
+            let warm = snapshot::warm_start_with(&scan_config, path, snapshot::SnapshotLoad::Mmap);
+            (warm.index, warm.report, warm.identities, Some(warm.outcome))
+        }
+        None => {
+            let (index, report) = scan(&scan_config);
+            let identities = index
+                .roots()
+                .iter()
+                .filter_map(|r| snapshot::root_identity(Path::new(&r.path)))
+                .collect();
+            (index, report, identities, None)
+        }
+    };
+
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    match outcome {
+        Some(WarmStart::Snapshot) => info!(
+            entries = %built.len(),
+            elapsed_ms,
+            "warm-started from snapshot"
+        ),
+        Some(WarmStart::Partial { rescanned }) => info!(
+            entries = %built.len(),
+            rescanned,
+            elapsed_ms,
+            "warm-started from snapshot"
+        ),
+        Some(WarmStart::ColdScan) => info!(
+            entries = %report.entries,
+            roots = %report.roots,
+            skipped = %report.skipped,
+            unreadable = %report.errors,
+            elapsed_ms,
+            "no usable snapshot; cold scan"
+        ),
+        None => info!(
+            entries = %report.entries,
+            roots = %report.roots,
+            skipped = %report.skipped,
+            unreadable = %report.errors,
+            elapsed_ms,
+            "indexed"
+        ),
+    }
+    for root in built.roots() {
+        info!(path = %root.path, fs_kind = ?root.fs_kind, "root");
+    }
+
+    // F10: honour the candidate-index preference before the index settles, so a
+    // disabled index is not consulted (and its memory is reclaimed).
+    if !config.candidate_index() {
+        built.set_candidate_enabled(false);
+    }
+    // F7: the benchmark disables the query cache to measure the cold path.
+    if !query_cache {
+        built.set_query_cache(false);
+    }
+
+    // Reclaim the doubling slack left by the scan or snapshot load, then return
+    // the scan's freed transient pages to the OS before the daemon idles.
+    built.shrink();
+    trim_heap();
+    log_memory(&built, "startup");
+
+    // Hand the built index to the manager; every subsequent query sees it.
+    let entries = built.len() as u64;
+    index.replace_index(built, identities);
+    info!(entries, elapsed_ms, "index ready; daemon serving");
+    let _ = events.send(IndexEvent::Changed { entries });
+
+    if watch {
+        let index = Arc::clone(&index);
+        let config = Arc::clone(&config);
+        let events = events.clone();
+        spawn_thread("omavry-watch", CONTROL_STACK, move || {
+            run_watcher(index, config, events)
+        });
+    }
+
+    if config.scan_interval() > 0 {
+        let index = Arc::clone(&index);
+        let config = Arc::clone(&config);
+        let events = events.clone();
+        spawn_thread("omavry-sched", CONTROL_STACK, move || {
+            run_scheduler(index, config, events)
+        });
+    }
+
+    if let Some(path) = &snapshot {
+        if config.snapshot_interval() > 0 {
+            let index = Arc::clone(&index);
+            let config = Arc::clone(&config);
+            let path = path.clone();
+            spawn_thread("omavry-snap", CONTROL_STACK, move || {
+                run_snapshot(index, config, path)
+            });
+        }
+        // Eviction needs a snapshot to map, so only run the evictor when one is
+        // configured.
+        let index = Arc::clone(&index);
+        let config = Arc::clone(&config);
+        spawn_thread("omavry-evict", CONTROL_STACK, move || {
+            run_evictor(index, config)
+        });
+    }
+
+    if config.ntfs() {
+        let index = Arc::clone(&index);
+        let policy = Arc::clone(&policy);
+        spawn_thread("omavry-ntfs", CONTROL_STACK, move || {
+            run_ntfs_startup(index, policy)
+        });
     }
 }
 
@@ -704,11 +783,18 @@ fn install_shutdown_handler(index: Arc<IndexManager>, snapshot: Option<PathBuf>)
         }
         info!("shutdown signal received");
         if let Some(path) = &snapshot {
-            let bytes = index.encode();
-            let _guard = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            match snapshot::write_atomic(&bytes, path) {
-                Ok(()) => info!(path = %path.display(), "snapshot written"),
-                Err(e) => error!(error = %e, "snapshot save failed"),
+            // A shutdown while the background startup is still building the
+            // index would persist the empty warming index over a possibly good
+            // snapshot; skip the write.
+            if index.is_loading() {
+                warn!("shutdown during startup; snapshot not written");
+            } else {
+                let bytes = index.encode();
+                let _guard = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                match snapshot::write_atomic(&bytes, path) {
+                    Ok(()) => info!(path = %path.display(), "snapshot written"),
+                    Err(e) => error!(error = %e, "snapshot save failed"),
+                }
             }
         }
         // Diagnostics: the daemon does not unmount the private NTFS mounts it

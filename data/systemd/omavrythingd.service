@@ -30,14 +30,14 @@ CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_SYS_ADMIN
 AmbientCapabilities=CAP_DAC_READ_SEARCH CAP_SYS_ADMIN
 
 # Resource limits.
-# Set from measurement, not guesswork: the daemon settles below 300 MB RSS at
-# idle with the index loaded, and a cold initial index of ~3M files never
-# exceeded 900 MB (the NTFS MFT read is the largest transient at ~836 MB).
-# MemoryHigh sits above that measured peak so ordinary indexing is never
-# throttled; MemoryMax is the hard ceiling that OOM-kills the cgroup if the
-# index grows well beyond the tested size.
-MemoryHigh=1200M
-MemoryMax=1536M
+# The ceiling is generous on purpose: a cold initial scan that includes several
+# large NTFS mounts peaks well above 1 GB, and the idle evictor brings the RSS
+# back down to the snapshot mapping plus a small delta afterwards, so a high
+# transient peak is not a high steady state. MemoryHigh sits above the measured
+# peak so ordinary indexing is never throttled; MemoryMax is the hard ceiling
+# that OOM-kills the cgroup if the index grows well beyond the tested size.
+MemoryHigh=3G
+MemoryMax=4G
 CPUQuota=50%
 TasksMax=64
 LimitNOFILE=65536

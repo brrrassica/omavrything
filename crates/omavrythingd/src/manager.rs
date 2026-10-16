@@ -8,7 +8,7 @@
 
 use std::fs::File;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -42,6 +42,10 @@ pub struct IndexManager {
     identities: RwLock<Vec<RootIdentity>>,
     /// Millis since `start` of the last query or mutation, for idle eviction.
     last_activity: AtomicU64,
+    /// Whether the initial index is still being built in the background. While
+    /// set, searches return an empty page with the `loading` flag so clients
+    /// can show a warming-up state instead of a silently empty index.
+    loading: AtomicBool,
     start: Instant,
 }
 
@@ -57,8 +61,32 @@ impl IndexManager {
             snapshot_path,
             identities: RwLock::new(identities),
             last_activity: AtomicU64::new(0),
+            loading: AtomicBool::new(false),
             start: Instant::now(),
         }
+    }
+
+    /// Set the initial-load flag.
+    pub fn set_loading(&self, loading: bool) {
+        self.loading.store(loading, Ordering::Relaxed);
+    }
+
+    /// Whether the initial index is still being built in the background.
+    pub fn is_loading(&self) -> bool {
+        self.loading.load(Ordering::Relaxed)
+    }
+
+    /// Swap a fully built index into the manager, replacing the (empty)
+    /// warming-up index, and clear the loading flag.
+    ///
+    /// This is the hand-off point of the non-blocking startup: the socket and
+    /// D-Bus serve an empty index while the scan runs; when it lands, every
+    /// subsequent query sees the real index.
+    pub fn replace_index(&self, index: Index, identities: Vec<RootIdentity>) {
+        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+        *state = State::Owned(Box::new(index));
+        *self.identities.write().unwrap_or_else(|e| e.into_inner()) = identities;
+        self.loading.store(false, Ordering::Relaxed);
     }
 
     /// Record activity, resetting the idle-eviction timer.
@@ -70,9 +98,10 @@ impl IndexManager {
     /// Run a query. Returns the outcome and whether the index is still loading.
     pub fn search(&self, query: &str, limit: usize, offset: usize) -> (SearchOutcome, bool) {
         self.touch();
+        let loading = self.is_loading();
         let state = self.state.read().unwrap_or_else(|e| e.into_inner());
         match &*state {
-            State::Owned(index) => (index.search(query, limit, offset), false),
+            State::Owned(index) => (index.search(query, limit, offset), loading),
             State::Image { mmap, .. } => {
                 let Ok(image) = IndexImage::from_bytes(&mmap[..]) else {
                     return (SearchOutcome::default(), false);
@@ -86,7 +115,7 @@ impl IndexManager {
                     limit,
                     offset,
                 );
-                (outcome, false)
+                (outcome, loading)
             }
         }
     }
