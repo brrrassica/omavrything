@@ -379,8 +379,7 @@ impl<'a> IndexImage<'a> {
         for i in 0..section_count {
             let base = HEADER_FIXED + i * SECTION_ENTRY;
             let kind = u32::from_le_bytes(body[base..base + 4].try_into().unwrap());
-            let offset =
-                u64::from_le_bytes(body[base + 8..base + 16].try_into().unwrap()) as usize;
+            let offset = u64::from_le_bytes(body[base + 8..base + 16].try_into().unwrap()) as usize;
             let len = u64::from_le_bytes(body[base + 16..base + 24].try_into().unwrap()) as usize;
             let end = offset.checked_add(len).ok_or(SnapshotError::Truncated)?;
             if offset % 8 != 0 || end > body.len() {
@@ -1262,7 +1261,12 @@ mod tests {
                 i as i64,
             );
         }
-        index.insert(Path::new("/home/sam/Documents/report-2024.pdf"), false, 1, 0);
+        index.insert(
+            Path::new("/home/sam/Documents/report-2024.pdf"),
+            false,
+            1,
+            0,
+        );
         // The image has no candidate index, so compare against the owned index
         // with the candidate index disabled (the linear-scan path).
         index.set_candidate_enabled(false);
@@ -1270,7 +1274,14 @@ mod tests {
         let bytes = encode(&index, &[]);
         let image = IndexImage::from_bytes(&bytes).unwrap();
 
-        for q in ["report", "file-1", "dir-3", "txt", "documents", "nomatch-xyz"] {
+        for q in [
+            "report",
+            "file-1",
+            "dir-3",
+            "txt",
+            "documents",
+            "nomatch-xyz",
+        ] {
             let owned = index.search(q, 20, 0);
             let viewed = image.search(q, 20, 0);
             assert_eq!(owned.total, viewed.total, "total mismatch for {q:?}");

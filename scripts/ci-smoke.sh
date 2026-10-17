@@ -519,6 +519,54 @@ expect "a second daemon on the same socket refuses to start" 1 \
 kill "$daemon_pid" 2>/dev/null || true
 wait "$daemon_pid" 2>/dev/null || true
 
+# 4b. Idle eviction: with a snapshot and a short idle period the daemon must
+# evict the owned index (the candidate arenas drop to zero) and still serve
+# searches from the snapshot image. Regression guard for the twelfth E2E run,
+# where ignored inotify events kept resetting the idle timer so the index
+# never evicted at the default 20 s.
+evict_snap="$tmp/evict.snapshot"
+rm -f "$evict_snap"
+/usr/bin/omavrythingd \
+  --no-config --root "$root_dir" --socket "$run_dir/omavrything.sock" \
+  --snapshot "$evict_snap" --evict-idle-secs 2 \
+  --no-dbus --no-ntfs --no-watch --log-level info \
+  >"$tmp/daemon-evict.log" 2>&1 &
+evict_pid=$!
+for _ in $(seq 1 100); do
+  [[ -S "$run_dir/omavrything.sock" ]] && break
+  sleep 0.1
+done
+if [[ -S "$run_dir/omavrything.sock" ]]; then
+  ok "eviction-test daemon created its socket"
+else
+  fail "eviction-test daemon created its socket"
+  cat "$tmp/daemon-evict.log" >&2 || true
+fi
+# One search so the index is warm and the timer starts from a known touch.
+expect "search works before eviction" 0 \
+  --grep "omavrything-smoke-marker" -- as_smoke /usr/bin/omavry search omavrything-smoke-marker
+# Wait past the 2 s idle period (the evictor polls every 2 s) with no queries
+# and no watch events, so nothing can reset the timer. The daemon logs
+# "index evicted (idle)" at info when it evicts.
+evicted_line=""
+for _ in $(seq 1 50); do
+  if grep -q "index evicted (idle)" "$tmp/daemon-evict.log" 2>/dev/null; then
+    evicted_line=yes
+    break
+  fi
+  sleep 0.3
+done
+if [[ -n "$evicted_line" ]]; then
+  ok "the index evicted after the idle period"
+else
+  fail "the index evicted after the idle period"
+  cat "$tmp/daemon-evict.log" >&2 || true
+fi
+expect "search still works from the evicted image" 0 \
+  --grep "omavrything-smoke-marker" -- as_smoke /usr/bin/omavry search omavrything-smoke-marker
+kill "$evict_pid" 2>/dev/null || true
+wait "$evict_pid" 2>/dev/null || true
+
 # 5. D-Bus status, only where systemd is available (the CI container has none).
 if [[ "$(ps -p 1 -o comm= 2>/dev/null || true)" == "systemd" ]]; then
   expect "systemctl start omavrythingd" 0 -- systemctl start omavrythingd

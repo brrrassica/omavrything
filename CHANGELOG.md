@@ -58,6 +58,25 @@ Measured: the empty-index baseline is 5 MiB; the 500 k hermetic tree fell from
   error reporting, non-btrfs snapshot staleness, mount ownership and hotplug,
   install/uninstall hardening, and a single copyable setup command.
 
+## [Unreleased]
+
+### Fixed
+
+- **The idle evictor could be starved by filesystem activity, so the index
+  never evicted and the daemon's resident set stayed at its peak.** Every
+  inotify event reset the idle-eviction timer, and a desktop fires events
+  (real changes, excluded paths, metadata noise) far more often than the
+  default 20 s idle period. Filesystem events no longer count as activity:
+  "idle" means no queries and no user-driven mutations (config changes,
+  rescans), which is when the memory should be released. While evicted,
+  events accumulate in the delta as before. The evictor also now sleeps
+  until the idle deadline instead of polling at fixed intervals, so eviction
+  happens within about one idle period of the last query rather than up to
+  two poll intervals late.
+- **Added `--evict-idle-secs <secs>`** to `omavrythingd` (the idle period was
+  previously configurable only through the config file), so tests and
+  hermetic setups can exercise eviction directly.
+
 ## [0.1.11] — 2026-10-17
 
 ### Fixed

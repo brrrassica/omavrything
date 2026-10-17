@@ -235,7 +235,8 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.contains("state"));
         // An older daemon's response (no `state`) deserializes to `None`.
-        let back: Response = serde_json::from_str(r#"{"results":[],"total":0,"took_ms":0}"#).unwrap();
+        let back: Response =
+            serde_json::from_str(r#"{"results":[],"total":0,"took_ms":0}"#).unwrap();
         assert_eq!(back.state, None);
     }
 }

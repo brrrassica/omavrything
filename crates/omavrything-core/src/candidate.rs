@@ -738,7 +738,11 @@ impl CandidateIndex {
         let len_cap = (self.len.capacity() * std::mem::size_of::<u16>()) as u64;
         let parent_cap = (self.parent.capacity() * std::mem::size_of::<u32>()) as u64;
         let delta_cap: u64 = self.delta.values().map(|v| (v.capacity() * 4) as u64).sum();
-        let dir_delta_cap: u64 = self.dir_delta.values().map(|v| (v.capacity() * 4) as u64).sum();
+        let dir_delta_cap: u64 = self
+            .dir_delta
+            .values()
+            .map(|v| (v.capacity() * 4) as u64)
+            .sum();
         let postings_cap = self.csr.data.capacity() as u64
             + self.dir_csr.data.capacity() as u64
             + delta_cap

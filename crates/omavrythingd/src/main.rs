@@ -527,7 +527,11 @@ fn run_watcher(
         }
     };
 
-    let roots: Vec<PathBuf> = index.roots().iter().map(|r| PathBuf::from(&r.path)).collect();
+    let roots: Vec<PathBuf> = index
+        .roots()
+        .iter()
+        .map(|r| PathBuf::from(&r.path))
+        .collect();
     for root in &roots {
         if let Err(err) = watcher.watch_dir(root) {
             warn!(path = %root.display(), error = %err, "watch failed");
@@ -728,10 +732,18 @@ pub(crate) fn run_ntfs_startup(index: Arc<IndexManager>, policy: Arc<Mutex<ntfs:
 fn run_evictor(index: Arc<IndexManager>, config: Arc<SharedConfig>) {
     loop {
         let idle = config.evict_idle_secs();
-        // Poll at most every 30 s, and at least as often as the idle period, so
-        // a short configured period is honoured without a busy loop.
-        let poll = if idle == 0 { 30 } else { idle.clamp(1, 30) };
-        std::thread::sleep(Duration::from_secs(poll));
+        if idle == 0 {
+            // Eviction is disabled; just idle without spinning.
+            std::thread::sleep(Duration::from_secs(30));
+            continue;
+        }
+        // Sleep until the idle deadline would actually be reached (capped at
+        // 30 s so a runtime `evict_idle_secs` change is picked up promptly),
+        // so eviction happens within ~one poll of the configured period rather
+        // than up to two poll intervals late.
+        let elapsed = index.idle_secs(idle);
+        let remaining = idle.saturating_sub(elapsed).max(1);
+        std::thread::sleep(Duration::from_secs(remaining.min(30)));
         if index.evict_if_idle(idle) {
             info!(idle_secs = idle, "index evicted (idle)");
             trim_heap();
@@ -1111,6 +1123,7 @@ struct RawArgs {
     snapshot: Option<PathBuf>,
     no_snapshot: bool,
     snapshot_interval: Option<u64>,
+    evict_idle_secs: Option<u64>,
     dbus: Option<bool>,
     ntfs: Option<bool>,
     no_metadata: bool,
@@ -1187,8 +1200,9 @@ impl Args {
             .or(state.snapshot_interval)
             .or(base.snapshot_interval)
             .unwrap_or(DEFAULT_SNAPSHOT_INTERVAL);
-        let evict_idle_secs = state
+        let evict_idle_secs = raw
             .evict_idle_secs
+            .or(state.evict_idle_secs)
             .or(base.evict_idle_secs)
             .unwrap_or(EVICT_IDLE_SECS);
         let watch = raw.watch.or(state.watch).or(base.watch).unwrap_or(true);
@@ -1300,6 +1314,15 @@ impl RawArgs {
                             value
                                 .parse()
                                 .map_err(|_| format!("invalid --snapshot-interval: {value}"))?,
+                        );
+                    }
+                }
+                "--evict-idle-secs" => {
+                    if let Some(value) = args.next() {
+                        raw.evict_idle_secs = Some(
+                            value
+                                .parse()
+                                .map_err(|_| format!("invalid --evict-idle-secs: {value}"))?,
                         );
                     }
                 }
@@ -1434,6 +1457,7 @@ fn print_help() {
          Usage: omavrythingd [--config <path>] [--root <dir>]... [--auto] [--exclude <glob>]...\n\
          \x20                  [--no-watch] [--scan-interval <secs>] [--socket <path>]\n\
          \x20                  [--snapshot <path>] [--no-snapshot] [--snapshot-interval <secs>]\n\
+         \x20                  [--evict-idle-secs <secs>]\n\
          \x20                  [--no-dbus] [--no-ntfs] [--no-metadata] [--log-level <level>]\n\
          \x20                  [--no-candidate-index] [--no-query-cache]\n\
          \n\
@@ -1451,6 +1475,8 @@ fn print_help() {
          \x20                       else $XDG_STATE_HOME/omavrything/index.snapshot)\n\
            --no-snapshot         Disable snapshot persistence\n\
            --snapshot-interval <s>  Snapshot write interval in seconds (0 disables; default 300)\n\
+           --evict-idle-secs <s> Idle period before the index is evicted to its\n\
+          \x20                       snapshot image in seconds (0 disables; default 20)\n\
            --no-dbus             Disable the D-Bus control interface\n\
            --no-ntfs             Disable NTFS partition detection and indexing\n\
            --no-metadata         Skip per-file size/mtime stats (names-only; faster scan)\n\

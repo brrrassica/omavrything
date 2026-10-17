@@ -70,6 +70,12 @@ Disable snapshot persistence.
 .B \-\-snapshot-interval \fIsecs\fR
 Snapshot write interval in seconds (0 disables; default 300).
 .TP
+.B \-\-evict-idle-secs \fIsecs\fR
+Idle period in seconds after which the index is evicted to its snapshot
+image, falling back to a small resident delta (0 disables; default 20).
+Idle means no queries and no user-driven mutations; filesystem events
+never reset the timer.
+.TP
 .B \-\-no-dbus
 Disable the D-Bus control interface.
 .TP

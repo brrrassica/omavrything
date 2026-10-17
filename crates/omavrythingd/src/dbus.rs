@@ -120,7 +120,10 @@ impl Manager {
             "candidate_subtree_cap".into(),
             b.candidate.subtree_cap.to_string(),
         );
-        map.insert("candidate_stop_cap".into(), b.candidate.stop_cap.to_string());
+        map.insert(
+            "candidate_stop_cap".into(),
+            b.candidate.stop_cap.to_string(),
+        );
         map.insert(
             "candidate_stack_cap".into(),
             b.candidate.stack_cap.to_string(),

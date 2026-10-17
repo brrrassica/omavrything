@@ -28,10 +28,7 @@ enum State {
     /// (the `Image` variant is a mapping plus a map).
     Owned(Box<Index>),
     /// The index is evicted: only the mapping and the resident path map remain.
-    Image {
-        mmap: Arc<Mmap>,
-        by_path: PathIndex,
-    },
+    Image { mmap: Arc<Mmap>, by_path: PathIndex },
 }
 
 /// Owns the index and its eviction lifecycle.
@@ -121,8 +118,16 @@ impl IndexManager {
     }
 
     /// Apply a filesystem event to the index (owned) or the delta (evicted).
+    ///
+    /// Filesystem events never count as activity: "idle" means the user is
+    /// not searching, not that the filesystem is quiet. A desktop fires
+    /// inotify events (real changes, excluded paths, metadata noise) far more
+    /// often than the default 20 s idle period, and touching on any of them
+    /// starves the idle evictor so the index never evicts and the resident
+    /// set never falls. While evicted, events accumulate in the delta (folded
+    /// back when it grows past [`DELTA_FOLD_THRESHOLD`]), so eviction under
+    /// churn is safe.
     pub fn apply_event(&self, event: &FsEvent, config: &ScanConfig) -> bool {
-        self.touch();
         let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
         let (changed, fold) = match &mut *state {
             State::Owned(index) => (live::apply(index, event, config), false),
@@ -141,11 +146,7 @@ impl IndexManager {
                         config,
                     )
                 };
-                let fold = self
-                    .delta
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .len()
+                let fold = self.delta.read().unwrap_or_else(|e| e.into_inner()).len()
                     >= DELTA_FOLD_THRESHOLD;
                 (changed, fold)
             }
@@ -226,6 +227,14 @@ impl IndexManager {
             mmap: Arc::new(mmap),
             by_path,
         };
+    }
+
+    /// Seconds since the last query or mutation, capped at `cap`. Used by the
+    /// evictor to sleep until the idle deadline instead of polling blindly.
+    pub fn idle_secs(&self, cap: u64) -> u64 {
+        let last = self.last_activity.load(Ordering::Relaxed);
+        let now = self.start.elapsed().as_millis() as u64;
+        now.saturating_sub(last).min(cap.saturating_mul(1000)) / 1000
     }
 
     /// Evict the index if no query or mutation has occurred for `idle_secs`.
@@ -402,7 +411,42 @@ mod tests {
         let len = manager.with_index_mut(|index| index.len());
         assert!(!manager.is_evicted());
         assert_eq!(len, 2); // root + report.pdf
-        assert!(manager.with_index_mut(|index| index.find(Path::new("/home/notes.md"))).is_none());
+        assert!(
+            manager
+                .with_index_mut(|index| index.find(Path::new("/home/notes.md")))
+                .is_none()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_filesystem_event_never_resets_the_idle_timer() {
+        // "Idle" means the user is not searching, not that the filesystem is
+        // quiet: the desktop fires inotify events far more often than the
+        // idle period, and touching on any of them starves the evictor
+        // (twelfth E2E run).
+        let dir = temp_dir("event-touch");
+        let snap = dir.join("index.snapshot");
+        let manager = IndexManager::new(sample(), Vec::new(), Some(snap));
+        let config = ScanConfig::with_roots(vec![PathBuf::from("/")]);
+
+        // An ignored event (the path does not exist).
+        assert!(!manager.apply_event(
+            &FsEvent::Modified(PathBuf::from("/home/does-not-exist")),
+            &config
+        ));
+
+        // A real change.
+        let file = dir.join("real.txt");
+        std::fs::write(&file, b"contents").unwrap();
+        assert!(manager.apply_event(&FsEvent::Created(file), &config));
+
+        assert_eq!(
+            manager.last_activity.load(Ordering::Relaxed),
+            0,
+            "a filesystem event must not count as activity"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -212,10 +212,7 @@ impl SharedConfig {
             "snapshot_interval".into(),
             self.snapshot_interval().to_string(),
         );
-        map.insert(
-            "evict_idle_secs".into(),
-            self.evict_idle_secs().to_string(),
-        );
+        map.insert("evict_idle_secs".into(), self.evict_idle_secs().to_string());
         map.insert(
             "snapshot".into(),
             self.snapshot_path()
