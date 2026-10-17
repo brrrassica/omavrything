@@ -16,6 +16,9 @@ impl SocketClient {
     /// Connect to the daemon at `path`.
     pub fn connect(path: &Path) -> std::io::Result<Self> {
         let stream = UnixStream::connect(path)?;
+        // Bound blocking reads so a wedged daemon cannot hang the caller
+        // forever (same class as the daemon's per-connection deadlines).
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
         let reader = BufReader::new(stream.try_clone()?);
         Ok(Self { stream, reader })
     }
