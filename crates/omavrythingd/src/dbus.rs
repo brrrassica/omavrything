@@ -196,7 +196,7 @@ impl Manager {
         if key == "ntfs" && self.config.ntfs() {
             let index = Arc::clone(&self.index);
             let policy = Arc::clone(&self.policy);
-            crate::spawn_thread("ntfs-startup", move || {
+            crate::spawn_thread("ntfs-startup", crate::CONTROL_STACK, move || {
                 crate::run_ntfs_startup(index, policy)
             });
         }

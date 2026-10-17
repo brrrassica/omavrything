@@ -1057,7 +1057,7 @@ fn tune_allocator() {
 /// Stack size for the daemon's long-lived control threads. The default 8 MiB is
 /// virtual and mostly untouched, but an explicit smaller size keeps the resident
 /// stack pages bounded (rc6 RSS spike).
-const CONTROL_STACK: usize = 1 << 20;
+pub(crate) const CONTROL_STACK: usize = 1 << 20;
 /// Stack size for a per-connection thread.
 const CONNECTION_STACK: usize = 512 << 10;
 
