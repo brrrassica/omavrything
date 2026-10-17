@@ -52,6 +52,11 @@ use logging::LogLevel;
 const MAX_CONNECTIONS: usize = 8;
 /// Per-connection read timeout.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Per-connection write timeout. Without it, a client that stops reading
+/// replies (while still sending requests) blocks its serving thread forever
+/// in a blocking `write`, holding one of the limited client slots and denying
+/// socket search to other users.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the watcher blocks waiting for events before checking pending moves.
 const WATCH_POLL: Duration = Duration::from_millis(500);
 /// Default interval between periodic snapshot writes.
@@ -725,6 +730,9 @@ fn install_shutdown_handler(
 /// stderr (see `OMAVRYTHING_PROFILE`).
 fn serve(stream: UnixStream, index: Arc<RwLock<Index>>, profile: bool) {
     let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
+    // The write timeout applies to the socket itself, so it also covers the
+    // `try_clone`d read half; a stalled reader cannot wedge the reply write.
+    let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
     let read_half = match stream.try_clone() {
         Ok(clone) => clone,
         Err(_) => return,
