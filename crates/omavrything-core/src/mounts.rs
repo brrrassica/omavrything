@@ -158,6 +158,31 @@ pub fn is_pseudo_fs(fs_type: &str) -> bool {
     )
 }
 
+/// Whether a filesystem type is a network/remote filesystem (A6). Traversal of
+/// these is time-boxed so a stalled mount cannot block a scan.
+pub fn is_network_fs(fs_type: &str) -> bool {
+    matches!(
+        fs_type,
+        "nfs"
+            | "nfs4"
+            | "cifs"
+            | "smb3"
+            | "smbfs"
+            | "9p"
+            | "ceph"
+            | "cephfs"
+            | "glusterfs"
+            | "afs"
+            | "davfs"
+            | "davfs2"
+            | "ncpfs"
+            | "fuse.sshfs"
+            | "fuse.rclone"
+            | "fuse.smbnetfs"
+            | "fuse.gocryptfs"
+    )
+}
+
 /// Whether a mount point is a pseudo path that should not be indexed.
 pub fn is_pseudo_mount_point(path: &Path) -> bool {
     // `/run` is deliberately *not* excluded: udisks2 mounts removable media
@@ -234,6 +259,12 @@ tmpfs /run tmpfs rw,nosuid,nodev,relatime,size=3276800k 0 0
         assert!(is_pseudo_fs("cgroup2"));
         assert!(is_pseudo_fs("nfs"));
         assert!(is_pseudo_fs("cifs"));
+        assert!(is_network_fs("nfs4"));
+        assert!(is_network_fs("cifs"));
+        assert!(is_network_fs("fuse.sshfs"));
+        assert!(!is_network_fs("ext4"));
+        assert!(!is_network_fs("btrfs"));
+        assert!(!is_network_fs("ntfs3"));
         assert!(!is_pseudo_fs("btrfs"));
         assert!(!is_pseudo_fs("ntfs3"));
         assert!(!is_pseudo_fs("zfs"));

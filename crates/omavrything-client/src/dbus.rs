@@ -29,7 +29,7 @@ pub trait Manager {
     fn index_changed(&self, entries: u64) -> zbus::Result<()>;
     /// Emitted during a scan.
     #[zbus(signal)]
-    fn scan_progress(&self, phase: &str, entries: u64) -> zbus::Result<()>;
+    fn scan_progress(&self, phase: &str, entries: u64, errors: u64) -> zbus::Result<()>;
 }
 
 /// A client for the D-Bus control interface.

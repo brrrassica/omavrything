@@ -32,7 +32,9 @@ use omavrything_core::idle::{IdleMonitor, IdleThresholds, RescanScheduler};
 use omavrything_core::index::Index;
 use omavrything_core::live::FsEvent;
 use omavrything_core::protocol::{IndexState, Method, Response, ResultItem, parse_request};
-use omavrything_core::scan::{ScanConfig, apply_rescan, plan_rescan, scan};
+use omavrything_core::scan::{
+    ScanCancel, ScanConfig, ScanReport, apply_rescan, plan_rescan_cancellable, scan, scan_subtree,
+};
 use omavrything_core::snapshot::{self, WarmStart};
 use omavrything_core::watch::Watcher;
 use tokio::sync::mpsc::UnboundedSender;
@@ -161,7 +163,11 @@ fn main() {
 
     // Block SIGTERM/SIGINT before spawning threads so they inherit the mask and
     // a dedicated thread can perform a clean snapshot write on shutdown.
-    install_shutdown_handler(Arc::clone(&index), args.snapshot.clone());
+    install_shutdown_handler(
+        Arc::clone(&index),
+        Arc::clone(&config),
+        args.snapshot.clone(),
+    );
 
     if args.dbus {
         let index = Arc::clone(&index);
@@ -544,6 +550,9 @@ fn run_watcher(
             "directories could not be watched (max_user_watches exhausted?)"
         );
     }
+    // A5: publish the unwatched subtrees so the scheduler can rescan them on a
+    // targeted cadence and GetStatus can surface the count.
+    config.set_unwatched(watcher.failed().to_vec());
     info!(directories = watcher.watch_count(), "watching");
 
     let mut buffer = [0u8; 8192];
@@ -580,6 +589,7 @@ fn run_watcher(
                         "more directories could not be watched (max_user_watches exhausted?)"
                     );
                     reported_failed = failed;
+                    config.set_unwatched(watcher.failed().to_vec());
                 }
                 let entries = index.len() as u64;
                 let _ = events.send(IndexEvent::Changed { entries });
@@ -600,6 +610,10 @@ fn run_scheduler(
 ) {
     let mut monitor = IdleMonitor::new(IdleThresholds::default());
     let mut scheduler = RescanScheduler::new(Duration::from_secs(config.scan_interval().max(1)));
+    // A5: the targeted-rescan cadence for unwatched subtrees: one pass every
+    // 60 polls (5 minutes at the 5 s poll interval).
+    const TARGETED_RESCAN_POLLS: u32 = 60;
+    let mut polls = 0u32;
     // A current-thread runtime for the login1 idle-hint query. If it cannot be
     // built, the hint is simply unavailable.
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -622,22 +636,39 @@ fn run_scheduler(
             let _ = events.send(IndexEvent::ScanProgress {
                 phase: "start".into(),
                 entries: 0,
+                errors: 0,
             });
             config.set_scanning(true);
             let scan = config.scan();
+            // A3: the walk stops promptly on shutdown or when a newer rescan
+            // supersedes this one.
+            let cancel = ScanCancel::new(config.generation_cell(), config.shutdown_cell());
             // Walk the filesystem outside the lock, then reconcile under it.
             // This keeps searches unblocked during the traversal without cloning
             // the whole index (which doubled peak memory).
-            let plan = plan_rescan(&scan);
-            let (report, entries) = index.with_index_mut(|idx| {
-                let report = apply_rescan(idx, plan);
-                // A rescan appends the new entries and leaves the vectors at
-                // their doubled capacity; reclaim it (rc6 RSS spike).
-                idx.shrink();
-                (report, idx.len() as u64)
-            });
+            let plan = plan_rescan_cancellable(&scan, Some(&cancel));
+            let cancelled = cancel.cancelled();
+            let (report, entries) = if cancelled {
+                warn!("rescan superseded or shutting down; discarding the partial plan");
+                (ScanReport::default(), index.len() as u64)
+            } else {
+                index.with_index_mut(|idx| {
+                    let report = apply_rescan(idx, plan);
+                    // A rescan appends the new entries and leaves the vectors at
+                    // their doubled capacity; reclaim it (rc6 RSS spike).
+                    idx.shrink();
+                    (report, idx.len() as u64)
+                })
+            };
             config.set_scanning(false);
+            config.set_last_scan_errors(report.errors, report.error_paths.clone());
             trim_heap();
+            if !report.error_paths.is_empty() {
+                warn!(
+                    paths = ?report.error_paths,
+                    "rescan: directories could not be read"
+                );
+            }
             info!(
                 added = %report.entries,
                 stale = %report.skipped,
@@ -647,8 +678,31 @@ fn run_scheduler(
             let _ = events.send(IndexEvent::ScanProgress {
                 phase: "done".into(),
                 entries,
+                errors: report.errors as u64,
             });
             let _ = events.send(IndexEvent::Changed { entries });
+        }
+        // A5: targeted rescan of the subtrees that could not be watched, on
+        // their own cadence, so watch-limit exhaustion does not leave those
+        // subtrees permanently stale.
+        polls += 1;
+        if polls >= TARGETED_RESCAN_POLLS {
+            polls = 0;
+            let unwatched = config.unwatched();
+            if !unwatched.is_empty() && !config.shutting_down() {
+                let scan = config.scan();
+                let entries = index.with_index_mut(|idx| {
+                    for path in &unwatched {
+                        scan_subtree(idx, path, &scan);
+                    }
+                    idx.len() as u64
+                });
+                info!(
+                    subtrees = unwatched.len(),
+                    "targeted rescan of unwatched subtrees"
+                );
+                let _ = events.send(IndexEvent::Changed { entries });
+            }
         }
     }
 }
@@ -662,6 +716,12 @@ fn contain_panic<T>(job: impl FnOnce() -> T) -> Result<T, ()> {
 }
 
 pub(crate) fn run_ntfs_startup(index: Arc<IndexManager>, policy: Arc<Mutex<ntfs::NtfsPolicy>>) {
+    // B10: reconcile the ownership state left by a SIGKILL or crash — unmount
+    // stale daemon-created private mounts before indexing. This runs on the
+    // NTFS startup thread, so it does not block the rest of startup, and a
+    // failed unmount is non-fatal (B14): a stuck mount cannot put the daemon
+    // into a restart loop.
+    ntfs::reconcile_stale_mounts();
     {
         let p = policy.lock().unwrap_or_else(|e| e.into_inner());
         if !p.is_empty() {
@@ -802,7 +862,11 @@ extern "C" fn handle_shutdown_signal(_sig: libc::c_int) {
 /// A self-pipe is used: the signal handler (which must be async-signal-safe)
 /// only writes a byte, and a dedicated thread performs the snapshot write. The
 /// handler is installed process-wide; it does not block the signals.
-fn install_shutdown_handler(index: Arc<IndexManager>, snapshot: Option<PathBuf>) {
+fn install_shutdown_handler(
+    index: Arc<IndexManager>,
+    config: Arc<SharedConfig>,
+    snapshot: Option<PathBuf>,
+) {
     let mut fds = [0i32; 2];
     // SAFETY: `fds` is a valid 2-element array for `pipe`.
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
@@ -838,6 +902,9 @@ fn install_shutdown_handler(index: Arc<IndexManager>, snapshot: Option<PathBuf>)
             }
         }
         info!("shutdown signal received");
+        // A3: running scans stop promptly so the shutdown snapshot is written
+        // without waiting for a long traversal to finish.
+        config.set_shutting_down(true);
         if let Some(path) = &snapshot {
             // A shutdown while the background startup is still building the
             // index would persist the empty warming index over a possibly good
@@ -853,16 +920,12 @@ fn install_shutdown_handler(index: Arc<IndexManager>, snapshot: Option<PathBuf>)
                 }
             }
         }
-        // Diagnostics: the daemon does not unmount the private NTFS mounts it
-        // created (a known defect, see plans/risks.md R13). Log what leaks so
-        // the mount-lifecycle question can be answered from logs.
-        let leaked = ntfs::private_mounts();
-        if !leaked.is_empty() {
-            warn!(
-                mounts = ?leaked,
-                "ntfs: daemon-created mounts are NOT unmounted on shutdown (known defect; plans/risks.md R13)"
-            );
-        }
+        // B9: unmount every daemon-created private mount before exiting. Each
+        // unmount is bounded by per-mount retries and a lazy (`umount -l`)
+        // fallback (B13); a mount that cannot be released is logged and left
+        // in place rather than blocking shutdown (B14). The signal handler
+        // itself stays async-signal-safe: all work happens on this thread.
+        ntfs::unmount_all_private();
         std::process::exit(0);
     });
 }

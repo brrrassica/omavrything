@@ -14,8 +14,16 @@ Type=simple
 ExecStart=/usr/bin/omavrythingd --socket /run/omavrything/omavrything.sock --snapshot /var/lib/omavrything/index.snapshot --state-config /var/lib/omavrything/config.toml
 Restart=on-failure
 RestartSec=5s
-# Allow the clean snapshot write on SIGTERM before the process is killed.
+# Allow the clean snapshot write and the private-mount unmounts on SIGTERM
+# before the process is killed.
 TimeoutStopSec=30s
+# B11: the daemon unmounts its private NTFS mounts on SIGTERM (B9). These
+# settings make `systemctl stop`, reboot, and poweroff send SIGTERM (never
+# SIGKILL first) and sweep any mount the daemon could not release before the
+# local filesystems are unmounted, so a forced close cannot leave the NTFS
+# volume dirty.
+KillSignal=SIGTERM
+ExecStopPost=+/bin/sh -c 'umount -l /run/omavrything/ntfs/* 2>/dev/null; true'
 
 # Run as a dedicated unprivileged user. The daemon reads raw block devices (the
 # NTFS MFT) and, as a fallback, mounts them read-only, so it keeps only those

@@ -7,13 +7,15 @@
 //! Collected entries are held in a compact arena ([`WalkBuffer`]) and sorted by
 //! path so parents are inserted before children.
 
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::UNIX_EPOCH;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use rayon::prelude::*;
 
@@ -151,14 +153,95 @@ impl WalkBuffer {
     }
 }
 
+/// How many failing paths are kept as a sample (A2). The count is exact; only
+/// the path list is bounded, so a tree with thousands of unreadable
+/// directories cannot balloon the report.
+const MAX_ERROR_PATHS: usize = 32;
+
+/// Traversal failures recorded during a walk (A2): an exact count plus a
+/// bounded sample of failing paths, so an unreadable or stuck subtree is
+/// visible without unbounded memory.
+pub struct ScanErrors {
+    count: AtomicUsize,
+    paths: Mutex<Vec<String>>,
+}
+
+impl ScanErrors {
+    fn new() -> Self {
+        Self {
+            count: AtomicUsize::new(0),
+            paths: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn record(&self, path: &Path) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut paths) = self.paths.lock() {
+            if paths.len() < MAX_ERROR_PATHS {
+                paths.push(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+
+    /// The failure count and a bounded sample of failing paths.
+    pub fn report(&self) -> (usize, Vec<String>) {
+        (
+            self.count.load(Ordering::Relaxed),
+            self.paths.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        )
+    }
+}
+
+/// Cancellation for a scan (A3): the walk is abandoned when a newer scan
+/// supersedes it (the generation moves past `token`) or when the daemon is
+/// shutting down. Checked once per directory, so a cancellation stops the walk
+/// within one directory's readdir rather than mid-recursion unbounded.
+pub struct ScanCancel<'a> {
+    generation: &'a AtomicU64,
+    shutdown: &'a AtomicBool,
+    token: u64,
+}
+
+impl<'a> ScanCancel<'a> {
+    /// Take a token from the current generation. A later `fetch_add` on
+    /// `generation` (a superseding scan) makes this cancel fire.
+    pub fn new(generation: &'a AtomicU64, shutdown: &'a AtomicBool) -> Self {
+        Self {
+            generation,
+            shutdown,
+            token: generation.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn cancelled(&self) -> bool {
+        self.shutdown.load(Ordering::Relaxed)
+            || self.generation.load(Ordering::Relaxed) != self.token
+    }
+}
+
+/// A6: how long a network-filesystem root may be traversed before the walk
+/// gives up, so a stalled mount cannot block a scan indefinitely.
+const NETWORK_TRAVERSAL_BUDGET: Duration = Duration::from_secs(30);
+
+/// The traversal deadline for `root`, if any: a root on a network filesystem
+/// is time-boxed (A6).
+fn root_deadline(mounts: &[Mount], root: &Path) -> Option<Instant> {
+    let network = mounts
+        .iter()
+        .any(|m| root.starts_with(&m.mount_point) && mounts::is_network_fs(&m.fs_type));
+    network.then(|| Instant::now() + NETWORK_TRAVERSAL_BUDGET)
+}
+
 /// A summary of a scan.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct ScanReport {
     pub roots: usize,
     pub entries: usize,
     pub skipped: usize,
     /// Directories that could not be read during traversal.
     pub errors: usize,
+    /// A bounded sample of the failing paths (A2).
+    pub error_paths: Vec<String>,
 }
 
 /// Build a fresh index by scanning the configured roots.
@@ -181,18 +264,34 @@ pub fn scan_into_index(index: &mut Index, config: &ScanConfig) -> ScanReport {
 
     // Walk every root in parallel, each subtree producing one buffer that is
     // merged exactly once (F5), then insert the whole batch at once.
-    let errors = AtomicUsize::new(0);
+    let errors = ScanErrors::new();
+    let boundaries = mount_boundaries();
+    let mount_table = mounts::read_mounts().unwrap_or_default();
     let mut buffer = roots
         .par_iter()
         .map(|(root, _)| {
             let root_dev = fs::metadata(root).map(|m| m.dev()).ok();
-            walk(root, root_dev, &excludes, config.metadata, &errors)
+            let visited = Mutex::new(HashSet::new());
+            let ctx = WalkCtx {
+                root,
+                root_dev,
+                boundaries: &boundaries,
+                visited: &visited,
+                excludes: &excludes,
+                collect_metadata: config.metadata,
+                errors: &errors,
+                cancel: None,
+                deadline: root_deadline(&mount_table, root),
+            };
+            walk(root, &ctx)
         })
         .reduce(WalkBuffer::default, |mut a, b| {
             a.merge(b);
             a
         });
-    report.errors = errors.load(Ordering::Relaxed);
+    let (error_count, error_paths) = errors.report();
+    report.errors = error_count;
+    report.error_paths = error_paths;
 
     // A parent path is always a strict prefix of its children, so sorting by
     // path guarantees parents are inserted before children.
@@ -218,8 +317,22 @@ pub fn scan_into_index(index: &mut Index, config: &ScanConfig) -> ScanReport {
 pub fn scan_subtree(index: &mut Index, root: &Path, config: &ScanConfig) {
     let excludes = GlobSet::new(&config.excludes);
     let root_dev = fs::metadata(root).map(|m| m.dev()).ok();
-    let errors = AtomicUsize::new(0);
-    let mut buffer = walk(root, root_dev, &excludes, config.metadata, &errors);
+    let errors = ScanErrors::new();
+    let boundaries = mount_boundaries();
+    let visited = Mutex::new(HashSet::new());
+    let mount_table = mounts::read_mounts().unwrap_or_default();
+    let ctx = WalkCtx {
+        root,
+        root_dev,
+        boundaries: &boundaries,
+        visited: &visited,
+        excludes: &excludes,
+        collect_metadata: config.metadata,
+        errors: &errors,
+        cancel: None,
+        deadline: root_deadline(&mount_table, root),
+    };
+    let mut buffer = walk(root, &ctx);
 
     buffer.sort();
     index.reserve(buffer.entries.len(), buffer.arena.len());
@@ -237,8 +350,22 @@ pub fn scan_subtree(index: &mut Index, root: &Path, config: &ScanConfig) {
 pub fn scan_subtree_into_delta(delta: &mut DeltaIndex, root: &Path, config: &ScanConfig) {
     let excludes = GlobSet::new(&config.excludes);
     let root_dev = fs::metadata(root).map(|m| m.dev()).ok();
-    let errors = AtomicUsize::new(0);
-    let mut buffer = walk(root, root_dev, &excludes, config.metadata, &errors);
+    let errors = ScanErrors::new();
+    let boundaries = mount_boundaries();
+    let visited = Mutex::new(HashSet::new());
+    let mount_table = mounts::read_mounts().unwrap_or_default();
+    let ctx = WalkCtx {
+        root,
+        root_dev,
+        boundaries: &boundaries,
+        visited: &visited,
+        excludes: &excludes,
+        collect_metadata: config.metadata,
+        errors: &errors,
+        cancel: None,
+        deadline: root_deadline(&mount_table, root),
+    };
+    let mut buffer = walk(root, &ctx);
     buffer.sort();
     for e in &buffer.entries {
         let path = Path::new(OsStr::from_bytes(buffer.path_bytes(e)));
@@ -258,29 +385,53 @@ pub struct RescanPlan {
     entries: WalkBuffer,
     roots: Vec<(PathBuf, FsKind)>,
     errors: usize,
+    /// A bounded sample of the failing paths (A2).
+    pub error_paths: Vec<String>,
 }
 
 /// Walk the configured roots and collect the entries, without touching any
 /// index. This is the expensive half of a rescan; run it outside the index lock.
 pub fn plan_rescan(config: &ScanConfig) -> RescanPlan {
+    plan_rescan_cancellable(config, None)
+}
+
+/// Like [`plan_rescan`], but the walk stops promptly when `cancel` fires (A3):
+/// on shutdown or when a newer rescan supersedes this one.
+pub fn plan_rescan_cancellable(config: &ScanConfig, cancel: Option<&ScanCancel>) -> RescanPlan {
     let excludes = GlobSet::new(&config.excludes);
     let roots = resolve_roots(config);
-    let errors = AtomicUsize::new(0);
+    let errors = ScanErrors::new();
+    let boundaries = mount_boundaries();
+    let mount_table = mounts::read_mounts().unwrap_or_default();
     let mut entries = roots
         .par_iter()
         .map(|(root, _)| {
             let root_dev = fs::metadata(root).map(|m| m.dev()).ok();
-            walk(root, root_dev, &excludes, config.metadata, &errors)
+            let visited = Mutex::new(HashSet::new());
+            let ctx = WalkCtx {
+                root,
+                root_dev,
+                boundaries: &boundaries,
+                visited: &visited,
+                excludes: &excludes,
+                collect_metadata: config.metadata,
+                errors: &errors,
+                cancel,
+                deadline: root_deadline(&mount_table, root),
+            };
+            walk(root, &ctx)
         })
         .reduce(WalkBuffer::default, |mut a, b| {
             a.merge(b);
             a
         });
     entries.sort();
+    let (errors, error_paths) = errors.report();
     RescanPlan {
         entries,
         roots,
-        errors: errors.load(Ordering::Relaxed),
+        errors,
+        error_paths,
     }
 }
 
@@ -292,9 +443,11 @@ pub fn apply_rescan(index: &mut Index, plan: RescanPlan) -> ScanReport {
         entries,
         roots,
         errors,
+        error_paths,
     } = plan;
     let mut report = ScanReport {
         errors,
+        error_paths,
         ..ScanReport::default()
     };
 
@@ -395,19 +548,70 @@ fn fs_kind_for_path(mounts: &[Mount], path: &Path) -> FsKind {
         .unwrap_or(FsKind::Other)
 }
 
-/// Recursively walk `dir`, appending entries to `out`. Directories on a
-/// different device than `root_dev` are not crossed, and excluded paths are
-/// pruned.
-fn walk(
-    dir: &Path,
+/// Shared context for one root's walk.
+struct WalkCtx<'a> {
+    /// The top-level root this walk started from; the root itself is always
+    /// entered even though it is usually a mount point.
+    root: &'a Path,
     root_dev: Option<u64>,
-    excludes: &GlobSet,
+    /// Mount points from `/proc/self/mountinfo`; never crossed (A1).
+    boundaries: &'a HashSet<PathBuf>,
+    /// Visited `(dev, inode)` directories, preventing traversal cycles (A1).
+    visited: &'a Mutex<HashSet<(u64, u64)>>,
+    excludes: &'a GlobSet,
     collect_metadata: bool,
-    errors: &AtomicUsize,
-) -> WalkBuffer {
+    errors: &'a ScanErrors,
+    /// Cancellation (A3): checked once per directory.
+    cancel: Option<&'a ScanCancel<'a>>,
+    /// Traversal deadline (A6): a network-filesystem root is time-boxed.
+    deadline: Option<Instant>,
+}
+
+/// The set of mount points from `/proc/self/mountinfo`, used to prune nested
+/// mounts even when they share the root's device (bind mounts, btrfs
+/// subvolumes). Read once per scan: the mount table can change between scans
+/// (hotplug), and one file read per scan is negligible next to the walk.
+fn mount_boundaries() -> HashSet<PathBuf> {
+    mounts::read_mountinfo()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| m.mount_point)
+        .collect()
+}
+
+/// Recursively walk `dir`, appending entries to `out`. Directories on a
+/// different device than the root are not crossed, directories that are mount
+/// points (other than the walk root itself) are not crossed even when they
+/// share the device, excluded paths are pruned, and the visited `(dev, inode)`
+/// set prevents traversal cycles.
+fn walk(dir: &Path, ctx: &WalkCtx) -> WalkBuffer {
     let mut subdirs: Vec<PathBuf> = Vec::new();
     let mut batch = WalkBuffer::default();
 
+    // A3/A6: stop promptly on cancellation or when the traversal deadline for
+    // a network root has passed. Checked once per directory, so the walk stops
+    // within one readdir rather than recursing unboundedly.
+    if let Some(cancel) = ctx.cancel {
+        if cancel.cancelled() {
+            return batch;
+        }
+    }
+    if let Some(deadline) = ctx.deadline {
+        if Instant::now() >= deadline {
+            return batch;
+        }
+    }
+
+    let WalkCtx {
+        root,
+        root_dev,
+        boundaries,
+        visited,
+        excludes,
+        collect_metadata,
+        errors,
+        ..
+    } = *ctx;
     if let Ok(rd) = fs::read_dir(dir) {
         for entry in rd.flatten() {
             let path = entry.path();
@@ -433,12 +637,31 @@ fn walk(
                 None
             };
 
-            // Do not cross into another filesystem (a nested mount).
+            // Do not cross into another filesystem (a nested mount). A1: the
+            // mountinfo boundary set also prunes nested mounts that share the
+            // root's device (bind mounts, btrfs subvolumes), which the `dev`
+            // check alone cannot see. The walk root itself is, of course,
+            // entered.
             if is_dir {
+                if boundaries.contains(&path) && path != root {
+                    continue;
+                }
                 if let (Some(dev), Some(root_dev)) = (metadata.as_ref().map(|m| m.dev()), root_dev)
                 {
                     if dev != root_dev {
                         continue;
+                    }
+                }
+                // A1: track visited `(dev, inode)` so a traversal cycle (only
+                // possible through mounts, which the boundary check above
+                // already prunes) cannot loop the walk. Requires the metadata
+                // this directory was stat'd for anyway.
+                if let Some(m) = metadata.as_ref() {
+                    let key = (m.dev(), m.ino());
+                    if let Ok(mut seen) = visited.lock() {
+                        if !seen.insert(key) {
+                            continue;
+                        }
                     }
                 }
             }
@@ -461,18 +684,19 @@ fn walk(
             }
         }
     } else {
-        errors.fetch_add(1, Ordering::Relaxed);
+        errors.record(dir);
     }
 
     // Recurse in parallel and merge each subtree's buffer exactly once, so the
     // walk never contends on a shared lock (F5).
-    let children = subdirs
-        .into_par_iter()
-        .map(|d| walk(&d, root_dev, excludes, collect_metadata, errors))
-        .reduce(WalkBuffer::default, |mut a, b| {
-            a.merge(b);
-            a
-        });
+    let children =
+        subdirs
+            .into_par_iter()
+            .map(|d| walk(&d, ctx))
+            .reduce(WalkBuffer::default, |mut a, b| {
+                a.merge(b);
+                a
+            });
     batch.merge(children);
     batch
 }
@@ -481,6 +705,7 @@ fn walk(
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+    use std::process::Command;
 
     fn temp_dir(tag: &str) -> PathBuf {
         let base = std::env::temp_dir().join(format!("omavrything-{tag}-{}", std::process::id()));
@@ -512,6 +737,91 @@ mod tests {
             .iter()
             .map(|(i, _)| index.path(i).to_string())
             .collect()
+    }
+
+    #[test]
+    fn unreadable_directories_are_counted_and_sampled() {
+        // A mode-000 directory cannot be read by an unprivileged user; as root
+        // every directory is readable, so the check cannot be exercised.
+        if unsafe { libc::geteuid() } == 0 {
+            println!("skip - unreadable-directory test (running as root)");
+            return;
+        }
+        let base = temp_dir("scan-errors");
+        fs::create_dir_all(base.join("locked")).unwrap();
+        fs::write(base.join("ok.txt"), b"x").unwrap();
+        let locked = base.join("locked");
+        let mut perms = fs::metadata(&locked).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o000);
+        fs::set_permissions(&locked, perms).unwrap();
+
+        let config = ScanConfig::with_roots(vec![base.clone()]);
+        let (_, report) = scan(&config);
+
+        assert_eq!(report.errors, 1);
+        assert_eq!(report.error_paths.len(), 1);
+        assert_eq!(Path::new(&report.error_paths[0]), locked);
+
+        // Restore so remove_dir_all succeeds.
+        let mut perms = fs::metadata(&locked).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&locked, perms).unwrap();
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_cancelled_scan_returns_no_entries() {
+        let base = temp_dir("scan-cancel");
+        fs::create_dir_all(base.join("sub/deep")).unwrap();
+        fs::write(base.join("a.txt"), b"x").unwrap();
+        fs::write(base.join("sub/b.txt"), b"y").unwrap();
+        fs::write(base.join("sub/deep/c.txt"), b"z").unwrap();
+
+        // A3: a stale generation token (a superseding scan bumped it after
+        // this scan took its token) makes the walk return immediately.
+        let generation = std::sync::atomic::AtomicU64::new(0);
+        let shutdown = std::sync::atomic::AtomicBool::new(false);
+        let cancel = ScanCancel::new(&generation, &shutdown);
+        generation.fetch_add(1, Ordering::Relaxed);
+        let config = ScanConfig::with_roots(vec![base.clone()]);
+        let plan = plan_rescan_cancellable(&config, Some(&cancel));
+        assert_eq!(plan.entries.entries.len(), 0);
+
+        // A3: the shutdown flag also cancels the walk.
+        let generation = std::sync::atomic::AtomicU64::new(0);
+        let shutdown = std::sync::atomic::AtomicBool::new(true);
+        let cancel = ScanCancel::new(&generation, &shutdown);
+        let plan = plan_rescan_cancellable(&config, Some(&cancel));
+        assert_eq!(plan.entries.entries.len(), 0);
+
+        // Without a cancel the same tree is fully walked (the root itself is
+        // not part of the plan; its five descendants are).
+        let plan = plan_rescan(&config);
+        assert_eq!(plan.entries.entries.len(), 5);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn network_roots_are_time_boxed_and_local_roots_are_not() {
+        let table = vec![
+            Mount {
+                source: "server:/share".into(),
+                mount_point: PathBuf::from("/mnt/net"),
+                fs_type: "nfs4".into(),
+                options: String::new(),
+            },
+            Mount {
+                source: "/dev/sda1".into(),
+                mount_point: PathBuf::from("/mnt/local"),
+                fs_type: "ext4".into(),
+                options: String::new(),
+            },
+        ];
+        assert!(root_deadline(&table, Path::new("/mnt/net/data")).is_some());
+        assert!(root_deadline(&table, Path::new("/mnt/local/data")).is_none());
+        assert!(root_deadline(&table, Path::new("/elsewhere")).is_none());
     }
 
     #[test]
@@ -601,6 +911,68 @@ mod tests {
         assert_eq!(report.skipped, 1); // sub/b.txt
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A bind mount shares the root's device, so only the mountinfo boundary
+    /// set can prune it. Mounting a directory onto its own descendant creates
+    /// a traversal loop. Both need mount privileges; when they are unavailable
+    /// (an unprivileged test run) the check is skipped rather than failed.
+    #[test]
+    fn a_bind_mount_and_a_synthetic_loop_are_not_crossed() {
+        let base = temp_dir("scan-bind");
+        fs::create_dir_all(base.join("sub/deeper")).unwrap();
+        fs::write(base.join("sub/a.txt"), b"x").unwrap();
+        fs::write(base.join("sub/deeper/b.txt"), b"y").unwrap();
+
+        // Bind `sub` onto `sub_bind` (same device, a real mount point) and, if
+        // the kernel allows it, onto `sub/deeper` (a loop).
+        let mounted_bind = mount_bind(&base.join("sub"), &base.join("sub_bind"));
+        let mounted_loop = mount_bind(&base.join("sub"), &base.join("sub/deeper"));
+
+        if !mounted_bind && !mounted_loop {
+            let _ = fs::remove_dir_all(&base);
+            println!("skip - bind-mount boundary test (no mount privileges)");
+            return;
+        }
+
+        let config = ScanConfig::with_roots(vec![base.clone()]);
+        let (index, _) = scan(&config);
+        let paths = indexed_paths(&index);
+
+        // The real subtree is indexed once.
+        assert!(paths.iter().any(|p| p.ends_with("/sub/a.txt")));
+        assert!(paths.iter().any(|p| p.ends_with("/sub/deeper/b.txt")));
+        // The bind-mount copy is never crossed, despite sharing the device.
+        assert!(!paths.iter().any(|p| p.contains("sub_bind")));
+        // The loop target is never entered, so the walk terminates and
+        // `deeper/b.txt` appears exactly once.
+        assert_eq!(
+            paths
+                .iter()
+                .filter(|p| p.ends_with("/deeper/b.txt"))
+                .count(),
+            1
+        );
+
+        if mounted_bind {
+            let _ = Command::new("umount").arg(base.join("sub_bind")).status();
+        }
+        if mounted_loop {
+            let _ = Command::new("umount").arg(base.join("sub/deeper")).status();
+        }
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Bind-mount `src` onto `target`, returning whether it succeeded.
+    fn mount_bind(src: &Path, target: &Path) -> bool {
+        let _ = fs::create_dir_all(target);
+        Command::new("mount")
+            .args(["--bind"])
+            .arg(src)
+            .arg(target)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
     }
 
     #[test]

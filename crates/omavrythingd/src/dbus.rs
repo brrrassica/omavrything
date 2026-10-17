@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use omavrything_core::scan::{ScanConfig, apply_rescan, plan_rescan};
+use omavrything_core::scan::{ScanCancel, ScanConfig, apply_rescan, plan_rescan_cancellable};
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{error, info, warn};
 use zbus::interface;
@@ -30,8 +30,12 @@ pub const OBJECT_PATH: &str = "/tech/alatcerdas/omavrything";
 pub enum IndexEvent {
     /// The index changed; carries the new live entry count.
     Changed { entries: u64 },
-    /// A scan is in progress.
-    ScanProgress { phase: String, entries: u64 },
+    /// A scan is in progress. `errors` is the traversal failure count (A2).
+    ScanProgress {
+        phase: String,
+        entries: u64,
+        errors: u64,
+    },
 }
 
 /// The `tech.alatcerdas.omavrything.Manager` interface.
@@ -129,6 +133,15 @@ impl Manager {
             b.candidate.stack_cap.to_string(),
         );
         map.insert("scanning".into(), self.config.scanning().to_string());
+        // A2: the last scan's traversal failures, with a bounded path sample.
+        let (scan_errors, scan_error_paths) = self.config.last_scan_errors();
+        map.insert("scan_errors".into(), scan_errors.to_string());
+        map.insert("scan_error_paths".into(), scan_error_paths.join(";"));
+        // A5: how many subtrees could not be watched (watch-limit exhaustion).
+        map.insert(
+            "unwatched_dirs".into(),
+            self.config.unwatched().len().to_string(),
+        );
         map.insert(
             "uptime_secs".into(),
             self.started.elapsed().as_secs().to_string(),
@@ -255,6 +268,7 @@ impl Manager {
         emitter: &SignalEmitter<'_>,
         phase: String,
         entries: u64,
+        errors: u64,
     ) -> zbus::Result<()>;
 }
 
@@ -283,19 +297,25 @@ async fn run_rescan(
     let _ = events.send(IndexEvent::ScanProgress {
         phase: "start".into(),
         entries: 0,
+        errors: 0,
     });
+    // A3: supersede any running scan before starting this one.
+    config.bump_scan_generation();
     config.set_scanning(true);
 
     let root = root.to_string();
     let task_index = Arc::clone(&index);
     let task_config = Arc::clone(&config);
-    let added = tokio::task::spawn_blocking(move || {
+    let (added, errors) = tokio::task::spawn_blocking(move || {
         let scan = task_config.scan();
+        // A3: this walk stops promptly on shutdown or when a newer rescan
+        // supersedes it.
+        let cancel = ScanCancel::new(task_config.generation_cell(), task_config.shutdown_cell());
         // Walk outside the lock, then reconcile under it. This avoids cloning the
         // whole index (which doubled peak memory) while keeping searches
         // unblocked during the filesystem traversal.
         let plan = if root.is_empty() {
-            plan_rescan(&scan)
+            plan_rescan_cancellable(&scan, Some(&cancel))
         } else {
             let sub = ScanConfig {
                 roots: vec![PathBuf::from(&root)],
@@ -303,19 +323,25 @@ async fn run_rescan(
                 skip_pseudo: scan.skip_pseudo,
                 metadata: scan.metadata,
             };
-            plan_rescan(&sub)
+            plan_rescan_cancellable(&sub, Some(&cancel))
         };
+        if cancel.cancelled() {
+            // Superseded or shutting down: discard the partial plan.
+            return (0u64, 0u64);
+        }
         let report = task_index.with_index_mut(|idx| apply_rescan(idx, plan));
-        report.entries as u64
+        task_config.set_last_scan_errors(report.errors, report.error_paths.clone());
+        (report.entries as u64, report.errors as u64)
     })
     .await
-    .unwrap_or(0);
+    .unwrap_or((0, 0));
 
     config.set_scanning(false);
     let entries = index.len() as u64;
     let _ = events.send(IndexEvent::ScanProgress {
         phase: "done".into(),
         entries,
+        errors,
     });
     let _ = events.send(IndexEvent::Changed { entries });
     Ok(added)
@@ -404,8 +430,13 @@ pub fn run(
                 IndexEvent::Changed { entries } => {
                     let _ = Manager::index_changed(iface.signal_emitter(), entries).await;
                 }
-                IndexEvent::ScanProgress { phase, entries } => {
-                    let _ = Manager::scan_progress(iface.signal_emitter(), phase, entries).await;
+                IndexEvent::ScanProgress {
+                    phase,
+                    entries,
+                    errors,
+                } => {
+                    let _ = Manager::scan_progress(iface.signal_emitter(), phase, entries, errors)
+                        .await;
                 }
             }
         }

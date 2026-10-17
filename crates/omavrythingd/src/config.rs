@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -45,6 +46,14 @@ pub struct SharedConfig {
     watch: bool,
     /// Whether a scan/rescan is currently in progress.
     scanning: AtomicBool,
+    /// Scan generation (A3): bumped when a new rescan supersedes a running one.
+    scan_generation: AtomicU64,
+    /// Set on shutdown (A3): running scans stop promptly.
+    shutting_down: AtomicBool,
+    /// Subtrees that could not be watched (A5), bounded.
+    unwatched: Mutex<Vec<PathBuf>>,
+    /// The last scan's traversal failures (A2): count and bounded path sample.
+    last_scan_errors: Mutex<(usize, Vec<String>)>,
     ntfs: AtomicBool,
     log_level: RwLock<LogLevel>,
     /// `f64` bits, so the value can live in an atomic.
@@ -65,6 +74,10 @@ impl SharedConfig {
             snapshot: init.snapshot,
             watch: init.watch,
             scanning: AtomicBool::new(false),
+            scan_generation: AtomicU64::new(0),
+            shutting_down: AtomicBool::new(false),
+            unwatched: Mutex::new(Vec::new()),
+            last_scan_errors: Mutex::new((0, Vec::new())),
             ntfs: AtomicBool::new(init.ntfs),
             log_level: RwLock::new(init.log_level),
             background_opacity: AtomicU64::new(init.background_opacity.to_bits()),
@@ -82,6 +95,63 @@ impl SharedConfig {
     /// Mark a scan as started or finished.
     pub fn set_scanning(&self, value: bool) {
         self.scanning.store(value, Ordering::Relaxed);
+    }
+
+    /// The scan-generation cell (A3), for building a [`ScanCancel`].
+    pub fn generation_cell(&self) -> &AtomicU64 {
+        &self.scan_generation
+    }
+
+    /// The shutdown-flag cell (A3), for building a [`ScanCancel`].
+    pub fn shutdown_cell(&self) -> &AtomicBool {
+        &self.shutting_down
+    }
+
+    /// Supersede any running scan (A3): a new rescan bumps the generation, so
+    /// the previous scan's cancel token goes stale and its walk stops.
+    pub fn bump_scan_generation(&self) -> u64 {
+        self.scan_generation.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Mark the daemon as shutting down (A3): running scans stop promptly.
+    pub fn set_shutting_down(&self, value: bool) {
+        self.shutting_down.store(value, Ordering::Relaxed);
+    }
+
+    pub fn shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::Relaxed)
+    }
+
+    /// Record the subtrees that could not be watched (A5), bounded to 256.
+    pub fn set_unwatched(&self, paths: Vec<PathBuf>) {
+        let mut unwatched = self.unwatched.lock().unwrap_or_else(|e| e.into_inner());
+        unwatched.clear();
+        unwatched.extend(paths.into_iter().take(256));
+    }
+
+    /// The subtrees that could not be watched (A5).
+    pub fn unwatched(&self) -> Vec<PathBuf> {
+        self.unwatched
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Record the last scan's traversal failures (A2).
+    pub fn set_last_scan_errors(&self, count: usize, paths: Vec<String>) {
+        let mut last = self
+            .last_scan_errors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *last = (count, paths);
+    }
+
+    /// The last scan's traversal failures (A2): count and bounded path sample.
+    pub fn last_scan_errors(&self) -> (usize, Vec<String>) {
+        self.last_scan_errors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// A snapshot of the current scan configuration.
@@ -346,5 +416,31 @@ mod tests {
         assert_eq!(c.as_map().get("scanning").map(String::as_str), Some("true"));
         c.set_scanning(false);
         assert!(!c.scanning());
+    }
+
+    #[test]
+    fn unwatched_and_scan_error_reporting_are_bounded() {
+        let c = cfg();
+        // A5: the unwatched list is bounded.
+        let many: Vec<PathBuf> = (0..1000).map(|i| PathBuf::from(format!("/d{i}"))).collect();
+        c.set_unwatched(many);
+        assert_eq!(c.unwatched().len(), 256);
+        c.set_unwatched(vec![PathBuf::from("/one")]);
+        assert_eq!(c.unwatched(), vec![PathBuf::from("/one")]);
+
+        // A2: the last scan's failures are recorded and reported.
+        c.set_last_scan_errors(7, vec!["/a".into(), "/b".into()]);
+        let (count, paths) = c.last_scan_errors();
+        assert_eq!(count, 7);
+        assert_eq!(paths, vec!["/a".to_string(), "/b".to_string()]);
+
+        // A3: the generation bumps monotonically.
+        let g0 = c.bump_scan_generation();
+        let g1 = c.bump_scan_generation();
+        assert!(g1 > g0);
+        assert!(!c.shutting_down());
+        c.set_shutting_down(true);
+        assert!(c.shutting_down());
+        c.set_shutting_down(false);
     }
 }

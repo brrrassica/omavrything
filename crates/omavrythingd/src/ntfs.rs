@@ -10,6 +10,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use omavrything_core::index::{FsKind, Index};
 use omavrything_ntfs::{NtfsEntry, NtfsPartition, NtfsVolume};
@@ -66,9 +67,6 @@ fn mount_state(device: &Path) -> Option<(String, String)> {
 
 /// The mount points of daemon-created private NTFS mounts (under
 /// [`PRIVATE_MOUNT_ROOT`]) that are currently live, from `/proc/mounts`.
-///
-/// The daemon does not unmount these on shutdown (a known defect, see
-/// `plans/risks.md` R13), so this is used to log what leaks.
 pub fn private_mounts() -> Vec<PathBuf> {
     let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else {
         return Vec::new();
@@ -83,6 +81,33 @@ pub fn private_mounts() -> Vec<PathBuf> {
             target.starts_with(PRIVATE_MOUNT_ROOT).then_some(target)
         })
         .collect()
+}
+
+/// Whether the mount at `mount_point` is mounted read-only, from
+/// `/proc/mounts`. `None` when the mount point is not currently mounted.
+///
+/// Used to enforce the read-only invariant (B12): a writable mount is never
+/// indexed, so a forced close or power loss cannot set a dirty bit or lose
+/// data through the daemon.
+pub fn mount_is_readonly(mount_point: &Path) -> Option<bool> {
+    let mounts = std::fs::read_to_string("/proc/mounts").ok()?;
+    let target = mount_point.to_string_lossy();
+    for line in mounts.lines() {
+        let mut fields = line.split_whitespace();
+        let _source = fields.next()?;
+        let mp = fields.next()?;
+        let _fs_type = fields.next()?;
+        let options = fields.next().unwrap_or("");
+        if unescape_mount(mp) == target {
+            return Some(readonly_from_options(options));
+        }
+    }
+    None
+}
+
+/// Whether a `/proc/mounts` option list marks the mount read-only.
+fn readonly_from_options(options: &str) -> bool {
+    options.split(',').any(|o| o == "ro")
 }
 
 /// The mount point of `device` if it is already mounted, from `/proc/mounts`.
@@ -212,6 +237,91 @@ fn mount_via_ntfs3(device: &Path, uuid: Option<&str>) -> Result<PathBuf, String>
     Ok(mount_point)
 }
 
+/// How many times a busy unmount is retried before the lazy fallback, and how
+/// long to wait between attempts (B13).
+const BUSY_UNMOUNT_RETRIES: u32 = 3;
+const BUSY_UNMOUNT_BACKOFF: Duration = Duration::from_millis(200);
+
+/// Whether `mount_point` is still a live mount under [`PRIVATE_MOUNT_ROOT`].
+fn still_mounted(mount_point: &Path) -> bool {
+    private_mounts().iter().any(|m| m == mount_point)
+}
+
+/// Unmount one private mount point, retrying a bounded number of times when
+/// the mount is busy, then falling back to a lazy (`umount -l`) unmount (B13).
+/// Returns whether the mount was released; a mount that survives even the lazy
+/// unmount is logged with its mount point and reported (never fatal, B14).
+fn unmount_mount_point(mount_point: &Path) -> bool {
+    for attempt in 1..=BUSY_UNMOUNT_RETRIES {
+        let ok = Command::new("umount")
+            .arg(mount_point)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok && !still_mounted(mount_point) {
+            return true;
+        }
+        debug!(
+            mount_point = %mount_point.display(),
+            attempt,
+            "ntfs: umount failed or the mount is still live; retrying"
+        );
+        std::thread::sleep(BUSY_UNMOUNT_BACKOFF);
+    }
+    let lazy = Command::new("umount")
+        .arg("-l")
+        .arg(mount_point)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if lazy && !still_mounted(mount_point) {
+        info!(
+            mount_point = %mount_point.display(),
+            "ntfs: lazy unmount released the busy mount"
+        );
+        return true;
+    }
+    warn!(
+        mount_point = %mount_point.display(),
+        "ntfs: mount could not be released even with a lazy unmount; leaving it in place (non-fatal)"
+    );
+    false
+}
+
+/// Unmount every live daemon-created private mount. Used on shutdown (B9) and
+/// by startup reconciliation (B10). Each unmount is bounded by the retry loop
+/// and the lazy fallback (B13); a failure is logged, never fatal (B14).
+pub fn unmount_all_private() {
+    let mounts = private_mounts();
+    if mounts.is_empty() {
+        return;
+    }
+    info!(
+        mounts = ?mounts,
+        "ntfs: unmounting daemon-created private mounts"
+    );
+    for mount_point in &mounts {
+        unmount_mount_point(mount_point);
+    }
+}
+
+/// Reconcile the private-mount root on startup: unmount stale daemon-created
+/// mounts left behind by a `SIGKILL` or crash, before indexing (B10). Called
+/// on the NTFS startup thread, so it is non-blocking for the rest of startup,
+/// and a failed unmount is non-fatal (B14): a stuck mount cannot put the
+/// daemon into a restart loop.
+pub fn reconcile_stale_mounts() {
+    let stale = private_mounts();
+    if stale.is_empty() {
+        return;
+    }
+    warn!(
+        mounts = ?stale,
+        "ntfs: stale daemon-created mounts from a previous run; unmounting"
+    );
+    unmount_all_private();
+}
+
 /// Enumerate an NTFS device's MFT into a list of entries, without touching the
 /// index.
 ///
@@ -245,13 +355,40 @@ pub fn enumerate_device(device: &Path) -> Result<Vec<NtfsEntry>, String> {
     volume.enumerate().map_err(|e| e.to_string())
 }
 
+/// A7: validate an NTFS `entry.path` before joining it onto the mount point.
+/// The path comes from attacker-controlled on-disk MFT structures, so a crafted
+/// record must not be able to escape the mount point: reject absolute paths,
+/// `..` components, and Windows drive/UNC forms.
+fn is_safe_rel_path(path: &str) -> bool {
+    if path.is_empty() {
+        return true; // the volume root itself
+    }
+    let bytes = path.as_bytes();
+    if bytes[0] == b'/' || bytes[0] == b'\\' {
+        return false;
+    }
+    // A Windows drive form (`C:\…`) or a UNC path (`\\server\…`).
+    if bytes.len() >= 2 && bytes[1] == b':' {
+        return false;
+    }
+    !path.split(['/', '\\']).any(|c| c == ".." || c == ".")
+}
+
 /// Insert pre-enumerated NTFS entries into `index` under `mount_point`. Performs
 /// no device I/O, so the caller can hold the index write lock for the duration.
-/// Returns the number of entries added.
+/// Entries whose path fails the A7 validation are skipped. Returns the number
+/// of entries added.
 pub fn apply_entries(index: &mut Index, mount_point: &Path, entries: &[NtfsEntry]) -> usize {
     index.add_root(mount_point, FsKind::Ntfs);
     let mut added = 0usize;
     for entry in entries {
+        if !is_safe_rel_path(&entry.path) {
+            warn!(
+                path = %entry.path,
+                "ntfs: skipping entry with an unsafe MFT path"
+            );
+            continue;
+        }
         let path = mount_point.join(&entry.path);
         if index.find(&path).is_none() {
             index.insert(&path, entry.is_dir, entry.size, entry.mtime);
@@ -271,10 +408,28 @@ pub fn mount_index_and_remember(
     partition: &NtfsPartition,
 ) -> Result<PathBuf, String> {
     let mount_point = mount_readonly(&partition.device, partition.uuid.as_deref())?;
+    // B12: never index through a writable mount. A forced close or power loss
+    // on a writable mount can set the volume's dirty bit or lose data, so a
+    // mount that is not verifiably read-only is refused.
+    match mount_is_readonly(&mount_point) {
+        Some(true) => {}
+        Some(false) => {
+            return Err(format!(
+                "refusing to index writable mount {}",
+                mount_point.display()
+            ));
+        }
+        None => {
+            return Err(format!(
+                "mount {} vanished before the read-only check",
+                mount_point.display()
+            ));
+        }
+    }
     info!(
         device = %partition.device.display(),
         mount_point = %mount_point.display(),
-        "ntfs: mount event (daemon will not unmount this on shutdown)"
+        "ntfs: mount event (daemon-created private mounts are unmounted on shutdown)"
     );
     // Read and parse the MFT outside the index lock: on a multi-million-record
     // volume this takes seconds, and holding the write lock for it would stall
@@ -366,6 +521,70 @@ pub fn default_policy_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsafe_mft_paths_are_rejected() {
+        // Absolute and Windows-absolute forms cannot escape via join, but are
+        // rejected anyway so nothing attacker-shaped is ever joined.
+        assert!(!is_safe_rel_path("/etc/passwd"));
+        assert!(!is_safe_rel_path("\\Windows\\system32"));
+        assert!(!is_safe_rel_path("C:\\Windows"));
+        assert!(!is_safe_rel_path("\\\\server\\share"));
+        // `..` traversal, in both separator styles.
+        assert!(!is_safe_rel_path("../escape"));
+        assert!(!is_safe_rel_path("sub/../../escape"));
+        assert!(!is_safe_rel_path("sub\\..\\..\\escape"));
+        // A single `.` component is likewise never legitimate in an MFT path.
+        assert!(!is_safe_rel_path("./x"));
+        // Legitimate relative paths pass.
+        assert!(is_safe_rel_path("hello.txt"));
+        assert!(is_safe_rel_path("subdir/world.txt"));
+        assert!(is_safe_rel_path("deep/a/b/c.txt"));
+        assert!(is_safe_rel_path(""));
+    }
+
+    #[test]
+    fn a_crafted_mft_path_cannot_escape_the_mount_point() {
+        let mut index = Index::new();
+        let mount_point = Path::new("/mnt/ntfs");
+        let entries = vec![
+            NtfsEntry {
+                path: "../../etc/passwd".to_string(),
+                is_dir: false,
+                size: 1,
+                mtime: 0,
+            },
+            NtfsEntry {
+                path: "/etc/shadow".to_string(),
+                is_dir: false,
+                size: 1,
+                mtime: 0,
+            },
+            NtfsEntry {
+                path: "safe.txt".to_string(),
+                is_dir: false,
+                size: 1,
+                mtime: 0,
+            },
+        ];
+        let added = apply_entries(&mut index, mount_point, &entries);
+        assert_eq!(added, 1);
+        assert!(index.find(Path::new("/mnt/ntfs/safe.txt")).is_some());
+        // Nothing outside the mount point was indexed.
+        assert!(index.find(Path::new("/etc/passwd")).is_none());
+        assert!(index.find(Path::new("/etc/shadow")).is_none());
+        assert!(index.find(Path::new("/mnt/etc/passwd")).is_none());
+    }
+
+    #[test]
+    fn readonly_from_options_matches_ro_only() {
+        assert!(readonly_from_options("ro,relatime"));
+        assert!(readonly_from_options("relatime,ro"));
+        assert!(!readonly_from_options("rw,relatime"));
+        assert!(!readonly_from_options("rw,nosuid,nodev,noexec"));
+        // A prefix like "roxx" must not count as `ro`.
+        assert!(!readonly_from_options("roxx,rw"));
+    }
 
     #[test]
     fn unescapes_mount_points() {

@@ -145,6 +145,9 @@ expect_no_grep_re() {
 cleanup() {
   # Best-effort teardown so a failure does not leave a daemon or install behind.
   pkill -x omavrythingd 2>/dev/null || true
+  # M25: release the simulated stale mount used by the reconciliation check.
+  umount -l /run/omavrything/ntfs/stale-smoke 2>/dev/null || true
+  rmdir /run/omavrything/ntfs/stale-smoke 2>/dev/null || true
   remove_smoke_user
   if [[ "$keep" == 1 ]]; then
     echo "keeping the install and $tmp (--keep)"
@@ -519,6 +522,13 @@ expect "a second daemon on the same socket refuses to start" 1 \
 kill "$daemon_pid" 2>/dev/null || true
 wait "$daemon_pid" 2>/dev/null || true
 
+# M25 (B9): a SIGTERM must leave no daemon-created private mount behind.
+if grep -qs 'omavrything/ntfs' /proc/mounts; then
+  fail "SIGTERM leaves no /run/omavrything/ntfs mount"
+else
+  ok "SIGTERM leaves no /run/omavrything/ntfs mount"
+fi
+
 # 4b. Idle eviction: with a snapshot and a short idle period the daemon must
 # evict the owned index (the candidate arenas drop to zero) and still serve
 # searches from the snapshot image. Regression guard for the twelfth E2E run,
@@ -659,6 +669,64 @@ assert "version" in data, data
   systemctl stop omavrythingd >/dev/null 2>&1 || true
   expect_path "stopping the daemon removes the system socket" \
     /run/omavrything/omavrything.sock absent
+
+  # 5b. M25: NTFS forced-close and shutdown safety.
+  unit=/usr/lib/systemd/system/omavrythingd.service
+  expect_grep "unit sets KillSignal=SIGTERM" "$unit" "KillSignal=SIGTERM"
+  expect_grep "unit bounds the stop timeout" "$unit" "TimeoutStopSec"
+  expect_grep "unit sweeps private mounts on stop" "$unit" "ExecStopPost"
+  # B10: a stale daemon-created mount (a SIGKILL/crash leftover) is reconciled
+  # on startup, and the daemon still serves searches (B14) even if it cannot
+  # be released. A read-only tmpfs under the private mount root simulates the
+  # leftover; the daemon's startup reconciliation must unmount it.
+  #
+  # The daemon is run directly rather than through systemd: a pre-existing
+  # mount inside the unit's RuntimeDirectory makes systemd's own
+  # RUNTIME_DIRECTORY setup fail ("Read-only file system"), which would test
+  # systemd's namespace handling rather than the daemon's reconciliation.
+  mkdir -p /run/omavrything/ntfs/stale-smoke
+  if mount -t tmpfs -o ro,size=1m tmpfs /run/omavrything/ntfs/stale-smoke 2>/dev/null; then
+    /usr/bin/omavrythingd \
+      --no-config --root "$root_dir" --socket "$run_dir/omavrything.sock" \
+      --no-dbus --no-snapshot --no-watch --log-level info \
+      >"$tmp/daemon-ntfs.log" 2>&1 &
+    ntfs_pid=$!
+    for _ in $(seq 1 100); do
+      [[ -S "$run_dir/omavrything.sock" ]] && break
+      sleep 0.1
+    done
+    # Give the NTFS startup thread time to reconcile the stale mount.
+    for _ in $(seq 1 50); do
+      grep -qs 'ntfs/stale-smoke' /proc/mounts || break
+      sleep 0.2
+    done
+    if grep -qs 'ntfs/stale-smoke' /proc/mounts; then
+      fail "startup reconciles a stale private mount"
+    else
+      ok "startup reconciles a stale private mount"
+    fi
+    # B14: the daemon must still serve searches regardless.
+    expect "daemon serves searches despite the stale mount" 0 \
+      --grep "omavrything-smoke-marker" -- as_smoke /usr/bin/omavry search omavrything-smoke-marker
+    # B9: a SIGTERM unmounts any daemon-created private mount.
+    kill "$ntfs_pid" 2>/dev/null || true
+    wait "$ntfs_pid" 2>/dev/null || true
+    if grep -qs 'omavrything/ntfs' /proc/mounts; then
+      fail "SIGTERM leaves no /run/omavrything/ntfs mount"
+    else
+      ok "SIGTERM leaves no /run/omavrything/ntfs mount"
+    fi
+    # Safety net: never leave the simulated mount behind for the uninstall.
+    umount -l /run/omavrything/ntfs/stale-smoke 2>/dev/null || true
+  else
+    printf 'skip - stale-mount reconciliation (tmpfs mount unavailable)\n'
+  fi
+  # B9/B11: a clean stop (and the ExecStopPost sweep) leaves no private mount.
+  if grep -qs 'omavrything/ntfs' /proc/mounts; then
+    fail "systemctl stop leaves no /run/omavrything/ntfs mount"
+  else
+    ok "systemctl stop leaves no /run/omavrything/ntfs mount"
+  fi
 else
   printf 'skip - D-Bus status check (no systemd on pid 1)\n'
 fi

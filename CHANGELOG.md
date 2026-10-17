@@ -4,6 +4,32 @@ Notable changes to `omavrything`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0-rc9] — 2026-10-17
+
+### Added
+
+- **NTFS forced-close and shutdown safety (M25).** The daemon now unmounts
+  every mount it created on `SIGTERM`/`SIGINT`, retrying a busy unmount a
+  bounded number of times before a lazy (`umount -l`) fallback, and reconciles
+  stale daemon-created mounts under `/run/omavrything/ntfs` on startup after a
+  `SIGKILL` or crash. Every mount is verified read-only before indexing, and a
+  writable mount is refused. The systemd unit sets `KillSignal=SIGTERM` and an
+  `ExecStopPost` sweep so `systemctl stop`, reboot, and poweroff release mounts
+  before the local filesystems are unmounted.
+- **Indexing correctness (M15).** The walker no longer crosses a nested mount
+  that shares the root's device (bind mounts, btrfs subvolumes), using the
+  `/proc/self/mountinfo` mount points, and tracks a visited `(dev, inode)` set
+  so a traversal cycle cannot loop. NTFS `entry.path` values are validated
+  before being joined onto the mount point, so a crafted MFT record cannot
+  escape it.
+- **Indexing observability and lifecycle (M16).** Traversal failures are
+  recorded (an exact count plus a bounded path sample) and surfaced in
+  `GetStatus` and the `ScanProgress` signal. A scan is cancelled promptly on
+  shutdown or when a newer rescan supersedes it. Subtrees that could not be
+  watched (`max_user_watches` exhaustion) are rescanned on a targeted cadence
+  and counted in status. Traversal of network filesystems is time-boxed so a
+  stalled mount cannot block a scan.
+
 ## [0.2.0-rc8] — 2026-10-17
 
 ### Fixed
