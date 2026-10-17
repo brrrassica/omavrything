@@ -4,6 +4,11 @@
 //! to a private read-only `ntfs3` mount. Indexing reads the MFT directly from
 //! the raw device via `omavrything-ntfs`, so a partition can be indexed without
 //! being mounted.
+//!
+//! M18 (mount lifecycle): the daemon records which mounts it created in an
+//! ownership state file, unmounts only those on shutdown, reconciles the state
+//! on restart, and drops a mount's index entries when the mount disappears
+//! (re-indexing when it returns).
 
 use std::collections::HashSet;
 use std::io;
@@ -20,6 +25,12 @@ use crate::manager::IndexManager;
 
 /// The private mount root used when udisks2 is unavailable.
 const PRIVATE_MOUNT_ROOT: &str = "/run/omavrything/ntfs";
+
+/// M18 (B2): the mount-ownership state file, next to the auto-mount policy.
+/// One `mount_point<TAB>owned` line per tracked mount; `owned` is `1` for a
+/// mount the daemon created (unmounted on shutdown) and `0` for a pre-existing
+/// user/udisks2 mount (never unmounted).
+const OWNED_FILE_NAME: &str = "mounts.state";
 
 /// Mount an NTFS device read-only, preferring udisks2 and falling back to a
 /// private `ntfs3` mount. Returns the mount point.
@@ -291,18 +302,185 @@ fn unmount_mount_point(mount_point: &Path) -> bool {
 /// Unmount every live daemon-created private mount. Used on shutdown (B9) and
 /// by startup reconciliation (B10). Each unmount is bounded by the retry loop
 /// and the lazy fallback (B13); a failure is logged, never fatal (B14).
+///
+/// M18 (B1): only mounts the daemon created are unmounted. A private mount
+/// under [`PRIVATE_MOUNT_ROOT`] is daemon-created by construction; a
+/// pre-existing user/udisks2 mount (e.g. under `/run/media`) is never in that
+/// set, so it is never touched. Released mounts are forgotten from the
+/// ownership state (B2).
 pub fn unmount_all_private() {
     let mounts = private_mounts();
     if mounts.is_empty() {
         return;
     }
+    let mut ownership = MountOwnership::load(default_ownership_path());
+    // B1: only daemon-created mounts are candidates. A private mount is
+    // daemon-created by construction; the ownership state is consulted so a
+    // mount recorded as pre-existing is never unmounted even if it somehow
+    // appears under the private root.
+    let owned: Vec<PathBuf> = mounts
+        .into_iter()
+        .filter(|mp| mp.starts_with(PRIVATE_MOUNT_ROOT) || ownership.is_owned(mp))
+        .collect();
+    if owned.is_empty() {
+        return;
+    }
     info!(
-        mounts = ?mounts,
+        mounts = ?owned,
         "ntfs: unmounting daemon-created private mounts"
     );
-    for mount_point in &mounts {
-        unmount_mount_point(mount_point);
+    for mount_point in &owned {
+        if unmount_mount_point(mount_point) {
+            let _ = ownership.forget(mount_point);
+        }
     }
+}
+
+/// M18 (B2): the persisted mount-ownership state.
+///
+/// Maps mount point -> owned flag. A mount the daemon created (`owned`) is
+/// unmounted on shutdown and reconciled on restart; a pre-existing user or
+/// udisks2 mount (`!owned`) is never unmounted. The state is written
+/// atomically (temp file + rename) so a crash mid-write leaves the previous
+/// state intact.
+#[derive(Debug, Default)]
+pub struct MountOwnership {
+    path: PathBuf,
+    entries: std::collections::HashMap<PathBuf, bool>,
+}
+
+impl MountOwnership {
+    /// Load the ownership state from `path`. A missing or unreadable file is
+    /// an empty state (nothing is owned yet).
+    pub fn load(path: PathBuf) -> Self {
+        let entries = std::fs::read_to_string(&path)
+            .map(|text| {
+                text.lines()
+                    .filter_map(|line| {
+                        let (mp, owned) = line.split_once('\t')?;
+                        Some((PathBuf::from(mp), owned == "1"))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self { path, entries }
+    }
+
+    /// Whether `mount_point` is tracked as daemon-owned.
+    pub fn is_owned(&self, mount_point: &Path) -> bool {
+        self.entries.get(mount_point).copied().unwrap_or(false)
+    }
+
+    /// The tracked mount points.
+    pub fn mount_points(&self) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = self.entries.keys().cloned().collect();
+        v.sort();
+        v
+    }
+
+    /// The number of tracked mounts.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the state is empty.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Record `mount_point` with `owned`, pruning entries for mount points
+    /// that are no longer live, and persist atomically.
+    pub fn record(&mut self, mount_point: &Path, owned: bool) -> io::Result<()> {
+        self.entries.insert(mount_point.to_path_buf(), owned);
+        self.save()
+    }
+
+    /// Drop the entry for `mount_point` and persist.
+    pub fn forget(&mut self, mount_point: &Path) -> io::Result<()> {
+        if self.entries.remove(mount_point).is_some() {
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    /// Prune entries whose mount point is no longer live in `/proc/mounts`
+    /// (a mount that disappeared while the daemon was down) and persist.
+    pub fn reconcile(&mut self) -> io::Result<()> {
+        let live: HashSet<PathBuf> = private_mounts()
+            .into_iter()
+            .chain(existing_mount_points_anywhere())
+            .collect();
+        let before = self.entries.len();
+        self.entries.retain(|mp, _| live.contains(mp));
+        if self.entries.len() != before {
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    fn save(&self) -> io::Result<()> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut lines: Vec<String> = self
+            .entries
+            .iter()
+            .map(|(mp, owned)| format!("{}\t{}", mp.display(), if *owned { "1" } else { "0" }))
+            .collect();
+        lines.sort();
+        let mut body = lines.join("\n");
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        // Atomic write: a crash mid-write leaves the previous state intact.
+        let tmp = self.path.with_extension("state.tmp");
+        std::fs::write(&tmp, body.as_bytes())?;
+        std::fs::rename(&tmp, &self.path)
+    }
+}
+
+/// Every mount point currently live in `/proc/mounts`, not just the private
+/// ones. Used by [`MountOwnership::reconcile`] so pre-existing (udisks2) mounts
+/// stay tracked.
+fn existing_mount_points_anywhere() -> Vec<PathBuf> {
+    let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else {
+        return Vec::new();
+    };
+    mounts
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let _source = fields.next()?;
+            let target = fields.next()?;
+            Some(PathBuf::from(unescape_mount(target)))
+        })
+        .collect()
+}
+
+/// The default ownership-state path, next to the auto-mount policy.
+pub fn default_ownership_path() -> PathBuf {
+    let mut base = default_policy_path();
+    base.set_file_name(OWNED_FILE_NAME);
+    base
+}
+
+/// M18 (B8): drop the index entries of a mount whose mount point is no longer
+/// live. Returns whether entries were dropped.
+pub fn drop_mount_entries(index: &IndexManager, mount_point: &Path) -> bool {
+    let still_there = existing_mount_points_anywhere()
+        .iter()
+        .any(|mp| mp == mount_point);
+    if still_there {
+        return false;
+    }
+    let dropped = index.with_index_mut(|idx| idx.remove(mount_point));
+    if dropped {
+        info!(
+            mount_point = %mount_point.display(),
+            "ntfs: mount disappeared; index entries dropped"
+        );
+    }
+    dropped
 }
 
 /// Reconcile the private-mount root on startup: unmount stale daemon-created
@@ -407,6 +585,23 @@ pub fn mount_index_and_remember(
     policy: &Mutex<NtfsPolicy>,
     partition: &NtfsPartition,
 ) -> Result<PathBuf, String> {
+    mount_index_and_remember_with_ownership(
+        index,
+        policy,
+        &Mutex::new(MountOwnership::load(default_ownership_path())),
+        partition,
+    )
+}
+
+/// Like [`mount_index_and_remember`], but records the mount's ownership in
+/// `ownership` (M18, B2): a mount the daemon created is marked owned (unmounted
+/// on shutdown); a pre-existing mount is marked not-owned (never unmounted).
+pub fn mount_index_and_remember_with_ownership(
+    index: &IndexManager,
+    policy: &Mutex<NtfsPolicy>,
+    ownership: &Mutex<MountOwnership>,
+    partition: &NtfsPartition,
+) -> Result<PathBuf, String> {
     let mount_point = mount_readonly(&partition.device, partition.uuid.as_deref())?;
     // B12: never index through a writable mount. A forced close or power loss
     // on a writable mount can set the volume's dirty bit or lose data, so a
@@ -426,9 +621,20 @@ pub fn mount_index_and_remember(
             ));
         }
     }
+    // M18 (B2): record whether this mount is daemon-owned. A private mount
+    // under PRIVATE_MOUNT_ROOT was created by the daemon; anything else
+    // (udisks2, a pre-existing mount) is not ours to unmount.
+    let owned = mount_point.starts_with(PRIVATE_MOUNT_ROOT);
+    {
+        let mut o = ownership.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = o.record(&mount_point, owned) {
+            warn!(error = %e, "ntfs: could not persist mount ownership");
+        }
+    }
     info!(
         device = %partition.device.display(),
         mount_point = %mount_point.display(),
+        owned,
         "ntfs: mount event (daemon-created private mounts are unmounted on shutdown)"
     );
     // Read and parse the MFT outside the index lock: on a multi-million-record
@@ -661,6 +867,110 @@ mod tests {
         assert_eq!(apply_entries(&mut index, mount_point, &entries), 0);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ownership_records_loads_and_reconciles() {
+        // M18 (B2): the ownership state persists owned vs pre-existing mounts,
+        // prunes entries for mounts that are no longer live, and never touches
+        // a pre-existing mount's entry.
+        let dir = std::env::temp_dir().join(format!("omavrything-own-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mounts.state");
+
+        // Paths that are guaranteed not to be live mounts in any environment.
+        let owned_mp = Path::new("/run/omavrything/ntfs/omavrything-test-vol");
+        let preexisting_mp = Path::new("/omavrything-test-preexisting-mount");
+
+        let mut o = MountOwnership::load(path.clone());
+        assert!(o.is_empty());
+        o.record(owned_mp, true).unwrap();
+        o.record(preexisting_mp, false).unwrap();
+        assert!(o.is_owned(owned_mp));
+        assert!(!o.is_owned(preexisting_mp));
+        assert_eq!(o.len(), 2);
+
+        // A fresh load sees both entries.
+        let reloaded = MountOwnership::load(path.clone());
+        assert!(reloaded.is_owned(owned_mp));
+        assert!(!reloaded.is_owned(preexisting_mp));
+
+        // Reconcile prunes entries whose mount point is not live. Neither
+        // simulated path is mounted in this environment, so both go.
+        let mut reloaded = reloaded;
+        reloaded.reconcile().unwrap();
+        assert!(reloaded.is_empty(), "unmounted entries must be pruned");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ownership_save_is_atomic_and_crash_safe() {
+        // M18: a crash mid-write leaves the previous state intact because the
+        // write goes to a temp file that is renamed.
+        let dir =
+            std::env::temp_dir().join(format!("omavrything-own-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mounts.state");
+
+        let mut o = MountOwnership::load(path.clone());
+        o.record(Path::new("/mp/a"), true).unwrap();
+        let good = std::fs::read_to_string(&path).unwrap();
+
+        // A leftover temp file from a crash must not be read as state.
+        std::fs::write(path.with_extension("state.tmp"), b"garbage").unwrap();
+        let reloaded = MountOwnership::load(path.clone());
+        assert_eq!(reloaded.len(), 1);
+        assert!(reloaded.is_owned(Path::new("/mp/a")));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), good);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ownership_forget_drops_the_entry() {
+        let dir =
+            std::env::temp_dir().join(format!("omavrything-own-forget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mounts.state");
+
+        let mut o = MountOwnership::load(path.clone());
+        o.record(Path::new("/mp/a"), true).unwrap();
+        o.forget(Path::new("/mp/a")).unwrap();
+        assert!(o.is_empty());
+        assert!(MountOwnership::load(path).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drop_mount_entries_removes_a_vanished_mounts_subtree() {
+        // M18 (B8): when a mount disappears, its index entries are dropped;
+        // when it is still live, nothing is touched.
+        let mut index = Index::new();
+        let mp = Path::new("/run/omavrything/ntfs/vol");
+        index.add_root(mp, FsKind::Ntfs);
+        index.insert(&mp.join("hello.txt"), false, 1, 0);
+        assert!(index.find(&mp.join("hello.txt")).is_some());
+
+        // The mount point is not live in /proc/mounts, so the entries go.
+        let manager = IndexManager::new(index, Vec::new(), None);
+        assert!(drop_mount_entries(&manager, mp));
+        assert!(
+            manager
+                .with_index_mut(|idx| idx.find(&mp.join("hello.txt")))
+                .is_none()
+        );
+
+        // A mount point that is still live (any real mount, e.g. /) is kept.
+        let mut index = Index::new();
+        index.add_root(Path::new("/"), FsKind::Other);
+        index.insert(Path::new("/etc-hosts-placeholder"), false, 1, 0);
+        let manager = IndexManager::new(index, Vec::new(), None);
+        assert!(!drop_mount_entries(&manager, Path::new("/")));
     }
 
     #[test]

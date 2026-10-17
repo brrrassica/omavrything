@@ -1,4 +1,4 @@
-//! Versioned, directly-mappable binary image of the index (v5).
+//! Versioned, directly-mappable binary image of the index (v6).
 //!
 //! The format is:
 //!
@@ -10,7 +10,7 @@
 //! section table: per section { kind: u32, _pad: u32, offset: u64, len: u64 }
 //!   kind 1 = ROOTS        (root count u32, then per root:
 //!                            fs_kind u8, _pad[7], device u64, generation u64,
-//!                            path_off u64, path_len u32, _pad[4])
+//!                            mtime u64, path_off u64, path_len u32, _pad[4])
 //!   kind 2 = RECORDS      (record count u32, _pad[4], then a contiguous array
 //!                            of #[repr(C)] FileRecord)
 //!   kind 3 = PATHS        (raw byte arena)
@@ -46,7 +46,7 @@ const MAGIC: &[u8; 8] = b"OMAVIMG\0";
 /// The current snapshot format version. Bump it whenever the on-disk layout
 /// changes; [`IndexImage::from_bytes`] rejects any other version rather than
 /// misreading it.
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 
 /// Section kind: the root table (fs kind, identity, and path range).
 const SECTION_ROOTS: u32 = 1;
@@ -63,8 +63,8 @@ const HEADER_FIXED: usize = 20;
 /// One section-table entry: kind(4) + pad(4) + offset(8) + len(8).
 const SECTION_ENTRY: usize = 24;
 /// One root entry: fs_kind(1) + pad(7) + device(8) + generation(8) +
-/// path_off(8) + path_len(4) + pad(4).
-const ROOT_ENTRY: usize = 40;
+/// mtime(8) + path_off(8) + path_len(4) + pad(4).
+const ROOT_ENTRY: usize = 48;
 /// The serialized size of a `FileRecord`.
 const RECORD_BYTES: usize = std::mem::size_of::<FileRecord>();
 
@@ -115,6 +115,16 @@ pub struct RootIdentity {
     pub device: u64,
     /// btrfs subvolume generation, or 0 when unavailable.
     pub generation: u64,
+    /// A4: the root directory's mtime at scan time (Unix seconds), for the
+    /// non-btrfs staleness watermark. 0 when unavailable.
+    ///
+    /// On ext4/xfs/f2fs there is no cheap generation counter, so a warm start
+    /// compares this watermark against the root's current mtime: a root whose
+    /// mtime moved forward while the daemon was down had an entry created,
+    /// removed, or renamed directly in it, so its snapshot subtree is stale and
+    /// must be rescanned. A root whose mtime is unchanged may still have had
+    /// deeper changes, but those are covered by the periodic idle rescan.
+    pub mtime: u64,
 }
 
 /// How a warm start loads the snapshot (F6).
@@ -154,6 +164,14 @@ pub fn root_identity(path: &Path) -> Option<RootIdentity> {
     Some(RootIdentity {
         device: meta.dev(),
         generation: btrfs_generation(path).unwrap_or(0),
+        // A4: the root's mtime is the non-btrfs staleness watermark. Clamp to
+        // 0 for a pre-epoch timestamp, matching the record's mtime handling.
+        mtime: meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
     })
 }
 
@@ -191,7 +209,7 @@ fn btrfs_generation(path: &Path) -> Option<u64> {
     Some(u64::from_ne_bytes(generation_bytes))
 }
 
-/// Serialize `index` and its root identities into a v5 image.
+/// Serialize `index` and its root identities into a v6 image.
 ///
 /// The image is directly mappable: the `RECORDS` section is a bulk copy of the
 /// live `FileRecord` array (with `parent` links remapped past tombstones), and
@@ -208,6 +226,7 @@ pub fn encode(index: &Index, identities: &[RootIdentity]) -> Vec<u8> {
         let id = identities.get(i).copied().unwrap_or(RootIdentity {
             device: 0,
             generation: 0,
+            mtime: 0,
         });
         let path_off = root_strings.len() as u64;
         root_strings.extend_from_slice(root.path.as_bytes());
@@ -215,6 +234,7 @@ pub fn encode(index: &Index, identities: &[RootIdentity]) -> Vec<u8> {
         roots_section.extend_from_slice(&[0u8; 7]);
         put_u64(&mut roots_section, id.device);
         put_u64(&mut roots_section, id.generation);
+        put_u64(&mut roots_section, id.mtime);
         put_u64(&mut roots_section, path_off);
         put_u32(&mut roots_section, root.path.len() as u32);
         roots_section.extend_from_slice(&[0u8; 4]);
@@ -306,7 +326,7 @@ pub fn decode(bytes: &[u8]) -> Result<(Index, Vec<RootIdentity>), SnapshotError>
     Ok((image.to_index(), identities))
 }
 
-/// A borrowed view over a v5 snapshot image.
+/// A borrowed view over a v6 snapshot image.
 ///
 /// The image is byte-identical to the on-disk snapshot: `records` and `paths`
 /// borrow directly from the mapping (no decode, no rebuild), so loading is an
@@ -337,7 +357,7 @@ impl Records<'_> {
 }
 
 impl<'a> IndexImage<'a> {
-    /// Parse and validate a v5 image from `bytes`.
+    /// Parse and validate a v6 image from `bytes`.
     ///
     /// The record and path arenas are borrowed from `bytes` (no allocation, no
     /// rebuild); only the small `ROOTS`/`ROOT_STRINGS` sections are parsed into
@@ -422,8 +442,9 @@ impl<'a> IndexImage<'a> {
             let fs_kind = fs_kind_from_code(e[0]);
             let device = u64::from_le_bytes(e[8..16].try_into().unwrap());
             let generation = u64::from_le_bytes(e[16..24].try_into().unwrap());
-            let path_off = u64::from_le_bytes(e[24..32].try_into().unwrap()) as usize;
-            let path_len = u32::from_le_bytes(e[32..36].try_into().unwrap()) as usize;
+            let mtime = u64::from_le_bytes(e[24..32].try_into().unwrap());
+            let path_off = u64::from_le_bytes(e[32..40].try_into().unwrap()) as usize;
+            let path_len = u32::from_le_bytes(e[40..44].try_into().unwrap()) as usize;
             let end = path_off
                 .checked_add(path_len)
                 .ok_or(SnapshotError::Truncated)?;
@@ -434,7 +455,11 @@ impl<'a> IndexImage<'a> {
                 .map_err(|_| SnapshotError::InvalidUtf8)?
                 .to_string();
             roots.push(Root { path, fs_kind });
-            identities.push(RootIdentity { device, generation });
+            identities.push(RootIdentity {
+                device,
+                generation,
+                mtime,
+            });
         }
 
         // RECORDS section.
@@ -748,6 +773,7 @@ pub fn warm_start_with(
             id_by_path.get(&root.path).copied().unwrap_or(RootIdentity {
                 device: 0,
                 generation: 0,
+                mtime: 0,
             })
         })
         .collect();
@@ -906,6 +932,7 @@ mod tests {
         let ids = vec![RootIdentity {
             device: 42,
             generation: 99,
+            mtime: 0,
         }];
         let bytes = encode(&index, &ids);
         let (back, back_ids) = decode(&bytes).unwrap();
@@ -928,6 +955,7 @@ mod tests {
         let ids = vec![RootIdentity {
             device: 1,
             generation: 0,
+            mtime: 0,
         }];
         let good = encode(&index, &ids);
 
@@ -969,6 +997,7 @@ mod tests {
         let ids = vec![RootIdentity {
             device: 7,
             generation: 3,
+            mtime: 0,
         }];
 
         save(&index, &ids, &path).unwrap();
@@ -986,6 +1015,7 @@ mod tests {
         let ids = vec![RootIdentity {
             device: 1,
             generation: 0,
+            mtime: 0,
         }];
 
         let mut index = Index::new();
@@ -1090,6 +1120,7 @@ mod tests {
         let ids = vec![RootIdentity {
             device: 1,
             generation: 0,
+            mtime: 0,
         }];
         let bytes = encode(&index, &ids);
         let (back, _) = decode(&bytes).unwrap();
@@ -1162,6 +1193,79 @@ mod tests {
     }
 
     #[test]
+    fn warm_start_finds_a_file_created_while_down_on_non_btrfs() {
+        // M17 (A4): on ext4/xfs/f2fs there is no generation counter, so the
+        // root's mtime is the staleness watermark. A file created directly in
+        // the root while the daemon was down bumps the root's mtime, so the
+        // warm start must rescan and find it.
+        let dir = temp_dir("warm-stale");
+        let data = dir.join("data");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("a.txt"), b"x").unwrap();
+        let snap = dir.join("index.snapshot");
+        let config = ScanConfig::with_roots(vec![data.clone()]);
+
+        let cold = warm_start(&config, &snap);
+        save(&cold.index, &cold.identities, &snap).unwrap();
+
+        // "The daemon is down": a file appears in the root after the snapshot
+        // was written. This bumps the root directory's mtime. The mtime is
+        // set explicitly because the test runs within the same second the
+        // snapshot was taken, and the watermark's granularity is 1 s.
+        fs::write(data.join("offline.txt"), b"y").unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        let f = File::open(&data).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(later))
+            .unwrap();
+        drop(f);
+
+        let warm = warm_start(&config, &snap);
+        assert_eq!(
+            warm.outcome,
+            WarmStart::Partial { rescanned: 1 },
+            "a root whose mtime moved forward must be rescanned"
+        );
+        assert!(warm.index.find(&data.join("offline.txt")).is_some());
+        assert!(warm.index.find(&data.join("a.txt")).is_some());
+
+        // A second warm start with no further changes is a snapshot hit: the
+        // watermark was refreshed by the rescan's identities.
+        save(&warm.index, &warm.identities, &snap).unwrap();
+        let warm2 = warm_start(&config, &snap);
+        assert_eq!(warm2.outcome, WarmStart::Snapshot);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn warm_start_watermark_survives_a_snapshot_round_trip() {
+        // The mtime watermark must be persisted in the ROOTS section and
+        // restored by decode, so a warm start compares against the scan-time
+        // value rather than 0.
+        let dir = temp_dir("warm-watermark");
+        let data = dir.join("data");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("a.txt"), b"x").unwrap();
+        let snap = dir.join("index.snapshot");
+        let config = ScanConfig::with_roots(vec![data.clone()]);
+
+        let cold = warm_start(&config, &snap);
+        save(&cold.index, &cold.identities, &snap).unwrap();
+
+        let (_, ids) = load(&snap).unwrap();
+        let current = root_identity(&data).unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0].device, current.device);
+        assert_eq!(
+            ids[0].mtime, current.mtime,
+            "the persisted watermark must match the root's mtime"
+        );
+        assert!(ids[0].mtime > 0, "the watermark must be a real timestamp");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn mmap_load_round_trips() {
         // F6: the mmap load path must decode the same index as the read path.
         let dir = temp_dir("mmap");
@@ -1170,6 +1274,7 @@ mod tests {
         let ids = vec![RootIdentity {
             device: 5,
             generation: 2,
+            mtime: 0,
         }];
         save(&index, &ids, &path).unwrap();
 
@@ -1188,6 +1293,7 @@ mod tests {
         let ids = vec![RootIdentity {
             device: 1,
             generation: 0,
+            mtime: 0,
         }];
         let mut index = Index::new();
         index.add_root(Path::new("/"), FsKind::Other);
@@ -1233,6 +1339,7 @@ mod tests {
         let ids = vec![RootIdentity {
             device: 42,
             generation: 99,
+            mtime: 0,
         }];
         let bytes = encode(&index, &ids);
         let image = IndexImage::from_bytes(&bytes).unwrap();

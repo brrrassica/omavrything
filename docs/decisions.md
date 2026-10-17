@@ -320,14 +320,16 @@ gate on the marketplace-tracked branch); a `release/*` branch per version
 
 ## ADR-017 — Evictable, image-backed index
 
-**Decision:** The snapshot format is a **directly-mappable image** (v5): a
+**Decision:** The snapshot format is a **directly-mappable image** (v6): a
 header, a section table, and four 8-byte aligned sections (`ROOTS`, `RECORDS`,
 `PATHS`, `ROOT_STRINGS`). The `RECORDS` section is a contiguous `#[repr(C)]`
 `FileRecord` array cast directly from the mapping, so loading is an `mmap` plus
 header validation — no decode, no rebuild. The daemon's `IndexManager` **evicts**
 the owned index to this image when idle; while evicted, only the mapping (file
 backed, reclaimable) and a resident path -> index map remain, and queries scan
-the image merged with a small `DeltaIndex` of live updates.
+the image merged with a small `DeltaIndex` of live updates. v6 adds a per-root
+`mtime` watermark to the `ROOTS` section (M17/A4), so a warm start on a
+non-btrfs filesystem can detect a root that changed while the daemon was down.
 
 **Rationale:** The v4 warm-start decode rebuilt `by_path` and the candidate index
 (~580 ms). A byte-identical image removes that cost and lets the daemon drop the

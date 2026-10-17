@@ -722,6 +722,31 @@ pub(crate) fn run_ntfs_startup(index: Arc<IndexManager>, policy: Arc<Mutex<ntfs:
     // failed unmount is non-fatal (B14): a stuck mount cannot put the daemon
     // into a restart loop.
     ntfs::reconcile_stale_mounts();
+    // M18 (B2): load the persisted mount-ownership state and reconcile it —
+    // entries for mounts that are no longer live are pruned, and a tracked
+    // mount that vanished while the daemon was down has its index entries
+    // dropped (B8). A mount that is live again is re-indexed below by the
+    // normal partition pass.
+    let ownership = Arc::new(Mutex::new(ntfs::MountOwnership::load(
+        ntfs::default_ownership_path(),
+    )));
+    {
+        let mut o = ownership.lock().unwrap_or_else(|e| e.into_inner());
+        if !o.is_empty() {
+            info!(mounts = o.len(), "ntfs: tracked mount ownership");
+        }
+        // B8: a recorded mount that is no longer live had its entries indexed
+        // before the daemon stopped; drop them so the index matches the volume.
+        // `drop_mount_entries` is a no-op for a mount that is live again, which
+        // the partition pass below then re-indexes.
+        for mp in o.mount_points() {
+            ntfs::drop_mount_entries(&index, &mp);
+        }
+        // Prune the state of mounts that are no longer live.
+        if let Err(e) = o.reconcile() {
+            warn!(error = %e, "ntfs: could not persist the reconciled ownership state");
+        }
+    }
     {
         let p = policy.lock().unwrap_or_else(|e| e.into_inner());
         if !p.is_empty() {
@@ -751,7 +776,9 @@ pub(crate) fn run_ntfs_startup(index: Arc<IndexManager>, policy: Arc<Mutex<ntfs:
         // whole startup thread and no later partition is indexed at all. The index
         // and policy locks are reached through `unwrap_or_else(|e| e.into_inner())`
         // everywhere, so a lock poisoned by a contained panic stays usable.
-        match contain_panic(|| ntfs::mount_index_and_remember(&index, &policy, part)) {
+        match contain_panic(|| {
+            ntfs::mount_index_and_remember_with_ownership(&index, &policy, &ownership, part)
+        }) {
             Ok(Ok(mount_point)) => info!(
                 device = %part.device.display(),
                 mount_point = %mount_point.display(),

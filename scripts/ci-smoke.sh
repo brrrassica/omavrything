@@ -8,6 +8,10 @@
 # user experiences it; running the client as root would bypass the group check
 # entirely and prove nothing.
 #
+# It also covers the M17 snapshot-staleness warm start (a file created while
+# the daemon is down is found after a restart) and the M18 mount lifecycle
+# (ownership is recorded, reconciled on startup, and forgotten on shutdown).
+#
 # Needs root (the system install writes to /usr); this is what the CI smoke job
 # runs inside the Arch container.
 #
@@ -148,6 +152,9 @@ cleanup() {
   # M25: release the simulated stale mount used by the reconciliation check.
   umount -l /run/omavrything/ntfs/stale-smoke 2>/dev/null || true
   rmdir /run/omavrything/ntfs/stale-smoke 2>/dev/null || true
+  # M18: drop the seeded mount-ownership state so a failed run does not leave a
+  # stale record behind for the next one.
+  rm -f /var/lib/omavrything/mounts.state 2>/dev/null || true
   remove_smoke_user
   if [[ "$keep" == 1 ]]; then
     echo "keeping the install and $tmp (--keep)"
@@ -577,6 +584,73 @@ expect "search still works from the evicted image" 0 \
 kill "$evict_pid" 2>/dev/null || true
 wait "$evict_pid" 2>/dev/null || true
 
+# 4c. M17 (A4): snapshot staleness on a non-btrfs root. The first daemon saves
+# a snapshot on SIGTERM; a file is then created while the daemon is down; the
+# second daemon warm-starts from the snapshot and must detect the moved root
+# mtime watermark, rescan the root, and serve the offline-created file.
+warm_snap="$tmp/warm.snapshot"
+rm -f "$warm_snap"
+/usr/bin/omavrythingd \
+  --no-config --root "$root_dir" --socket "$run_dir/omavrything.sock" \
+  --snapshot "$warm_snap" --no-dbus --no-ntfs --no-watch --scan-interval 0 \
+  --log-level info >"$tmp/daemon-warm1.log" 2>&1 &
+warm1_pid=$!
+for _ in $(seq 1 100); do
+  [[ -S "$run_dir/omavrything.sock" ]] && break
+  sleep 0.1
+done
+expect "pre-shutdown search finds the marker" 0 \
+  --grep "omavrything-smoke-marker" -- as_smoke /usr/bin/omavry search omavrything-smoke-marker
+kill "$warm1_pid" 2>/dev/null || true
+wait "$warm1_pid" 2>/dev/null || true
+expect_path "the shutdown wrote the warm-start snapshot" "$warm_snap" present
+# The offline change: created after the daemon stopped, so only a warm start
+# that detects the moved watermark can find it. Sleep first so the root
+# directory's mtime (the A4 watermark, in seconds) is guaranteed to move.
+sleep 1
+: > "$root_dir/omavrything-warm-late.txt"
+/usr/bin/omavrythingd \
+  --no-config --root "$root_dir" --socket "$run_dir/omavrything.sock" \
+  --snapshot "$warm_snap" --no-dbus --no-ntfs --no-watch --scan-interval 0 \
+  --log-level info >"$tmp/daemon-warm2.log" 2>&1 &
+warm2_pid=$!
+for _ in $(seq 1 100); do
+  [[ -S "$run_dir/omavrything.sock" ]] && break
+  sleep 0.1
+done
+# The warm start rescans the root in the background; poll until the offline
+# file is served (the socket is bound before the rescan completes).
+warm_found=""
+for _ in $(seq 1 50); do
+  if as_smoke /usr/bin/omavry search omavrything-warm-late 2>/dev/null |
+    grep -q "omavrything-warm-late"; then
+    warm_found=yes
+    break
+  fi
+  sleep 0.2
+done
+if [[ -n "$warm_found" ]]; then
+  ok "a warm start finds a file created while the daemon was down"
+else
+  fail "a warm start finds a file created while the daemon was down"
+  cat "$tmp/daemon-warm2.log" >&2 || true
+fi
+kill "$warm2_pid" 2>/dev/null || true
+wait "$warm2_pid" 2>/dev/null || true
+
+# 4d. M18 (B1/B2/B8) source guards: the daemon records which mounts it created,
+# reconciles that ownership on startup, and drops a disappeared mount's index
+# entries. The behavioural checks live in the ntfs unit tests and the M25
+# stale-mount section below.
+expect_grep "ntfs records daemon-created mounts" \
+  crates/omavrythingd/src/ntfs.rs "record_owned_mount"
+expect_grep "ntfs reconciles recorded ownership on startup" \
+  crates/omavrythingd/src/ntfs.rs "reconcile_stale_mounts"
+expect_grep "ntfs drops entries for a disappeared mount" \
+  crates/omavrythingd/src/ntfs.rs "drop_mount_entries"
+expect_grep "ntfs never unmounts a pre-existing mount" \
+  crates/omavrythingd/src/ntfs.rs "is_owned"
+
 # 5. D-Bus status, only where systemd is available (the CI container has none).
 if [[ "$(ps -p 1 -o comm= 2>/dev/null || true)" == "systemd" ]]; then
   expect "systemctl start omavrythingd" 0 -- systemctl start omavrythingd
@@ -686,6 +760,12 @@ assert "version" in data, data
   # systemd's namespace handling rather than the daemon's reconciliation.
   mkdir -p /run/omavrything/ntfs/stale-smoke
   if mount -t tmpfs -o ro,size=1m tmpfs /run/omavrything/ntfs/stale-smoke 2>/dev/null; then
+    # M18 (B2): seed the mount-ownership state with the simulated stale mount,
+    # so startup reconciliation reads the recorded ownership (not just the
+    # mount table) and the shutdown sweep clears the record.
+    mkdir -p /var/lib/omavrything
+    printf '/run/omavrything/ntfs/stale-smoke\t1\n' \
+      >/var/lib/omavrything/mounts.state
     /usr/bin/omavrythingd \
       --no-config --root "$root_dir" --socket "$run_dir/omavrything.sock" \
       --no-dbus --no-snapshot --no-watch --log-level info \
@@ -715,6 +795,14 @@ assert "version" in data, data
       fail "SIGTERM leaves no /run/omavrything/ntfs mount"
     else
       ok "SIGTERM leaves no /run/omavrything/ntfs mount"
+    fi
+    # M18 (B1/B2): the shutdown sweep forgets the released mount, so the
+    # ownership state no longer records it.
+    if grep -qs 'stale-smoke' /var/lib/omavrything/mounts.state 2>/dev/null; then
+      fail "shutdown forgets a released daemon-created mount"
+      cat /var/lib/omavrything/mounts.state >&2 || true
+    else
+      ok "shutdown forgets a released daemon-created mount"
     fi
     # Safety net: never leave the simulated mount behind for the uninstall.
     umount -l /run/omavrything/ntfs/stale-smoke 2>/dev/null || true

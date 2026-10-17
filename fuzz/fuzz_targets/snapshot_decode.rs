@@ -13,7 +13,7 @@ fuzz_target!(|data: &[u8]| {
     // particular outcome. A successful parse is also re-encoded to exercise the
     // writer against attacker-influenced index contents.
     //
-    // Exercise the v5 image parser directly (the daemon's evicted path), then
+    // Exercise the v6 image parser directly (the daemon's evicted path), then
     // the materializing decode.
     if let Ok(image) = snapshot::IndexImage::from_bytes(data) {
         let _ = snapshot::encode(&image.to_index(), image.identities());

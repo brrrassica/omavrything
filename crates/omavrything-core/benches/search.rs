@@ -49,7 +49,7 @@ fn bench_search(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark the v5 image: parsing (the evicted-load cost) and the linear scan
+/// Benchmark the v6 image: parsing (the evicted-load cost) and the linear scan
 /// over the borrowed image (the evicted-query cost).
 fn bench_image(c: &mut Criterion) {
     let index = build_index(1_000_000);
