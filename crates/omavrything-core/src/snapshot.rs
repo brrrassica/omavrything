@@ -738,6 +738,7 @@ pub fn warm_start_with(
                 excludes: config.excludes.clone(),
                 skip_pseudo: config.skip_pseudo,
                 metadata: config.metadata,
+                allow_removable: config.allow_removable,
             };
             let sub_report = scan_into_index(&mut index, &sub);
             report.entries += sub_report.entries;

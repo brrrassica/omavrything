@@ -11,6 +11,10 @@ auto = true
 # Explicit roots, used when `auto` is false.
 # roots = ["/home", "/mnt/data"]
 
+# Block devices mounted through the settings UI. The daemon records them in its
+# state config and mounts/indexes them again on the next start.
+# volumes = ["/dev/sda1"]
+
 # Exclude globs applied during traversal.
 excludes = ["**/.git/**", "**/node_modules/**", "**/.cache/**"]
 

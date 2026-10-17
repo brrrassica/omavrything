@@ -37,6 +37,11 @@ pub struct ScanConfig {
     /// faster but leaves `size`/`mtime` at zero. Directories are still stat'd so
     /// nested mounts are not crossed.
     pub metadata: bool,
+    /// Allow walking removable media under `/run/media`. Off by default: the
+    /// generic walker must not double-index NTFS volumes (ADR-018). A targeted
+    /// rescan of a volume the user explicitly mounted sets this so non-NTFS
+    /// removable media can be indexed on demand.
+    pub allow_removable: bool,
 }
 
 impl Default for ScanConfig {
@@ -46,6 +51,7 @@ impl Default for ScanConfig {
             excludes: Vec::new(),
             skip_pseudo: false,
             metadata: true,
+            allow_removable: false,
         }
     }
 }
@@ -58,6 +64,7 @@ impl ScanConfig {
             excludes: Vec::new(),
             skip_pseudo: true,
             metadata: true,
+            allow_removable: false,
         }
     }
 
@@ -68,6 +75,7 @@ impl ScanConfig {
             excludes: Vec::new(),
             skip_pseudo: true,
             metadata: true,
+            allow_removable: false,
         }
     }
 }
@@ -279,6 +287,7 @@ pub fn scan_into_index(index: &mut Index, config: &ScanConfig) -> ScanReport {
                 visited: &visited,
                 excludes: &excludes,
                 collect_metadata: config.metadata,
+                allow_removable: config.allow_removable,
                 errors: &errors,
                 cancel: None,
                 deadline: root_deadline(&mount_table, root),
@@ -328,6 +337,7 @@ pub fn scan_subtree(index: &mut Index, root: &Path, config: &ScanConfig) {
         visited: &visited,
         excludes: &excludes,
         collect_metadata: config.metadata,
+        allow_removable: config.allow_removable,
         errors: &errors,
         cancel: None,
         deadline: root_deadline(&mount_table, root),
@@ -361,6 +371,7 @@ pub fn scan_subtree_into_delta(delta: &mut DeltaIndex, root: &Path, config: &Sca
         visited: &visited,
         excludes: &excludes,
         collect_metadata: config.metadata,
+        allow_removable: config.allow_removable,
         errors: &errors,
         cancel: None,
         deadline: root_deadline(&mount_table, root),
@@ -415,6 +426,7 @@ pub fn plan_rescan_cancellable(config: &ScanConfig, cancel: Option<&ScanCancel>)
                 visited: &visited,
                 excludes: &excludes,
                 collect_metadata: config.metadata,
+                allow_removable: config.allow_removable,
                 errors: &errors,
                 cancel,
                 deadline: root_deadline(&mount_table, root),
@@ -528,7 +540,7 @@ pub fn resolve_roots(config: &ScanConfig) -> Vec<(PathBuf, FsKind)> {
         return config
             .roots
             .iter()
-            .filter(|r| !mounts::is_removable_media_path(r))
+            .filter(|r| config.allow_removable || !mounts::is_removable_media_path(r))
             .map(|r| (r.clone(), fs_kind_for_path(&mounts, r)))
             .collect();
     }
@@ -536,7 +548,7 @@ pub fn resolve_roots(config: &ScanConfig) -> Vec<(PathBuf, FsKind)> {
     mounts
         .iter()
         .filter(|m| {
-            if mounts::is_removable_media_path(&m.mount_point) {
+            if !config.allow_removable && mounts::is_removable_media_path(&m.mount_point) {
                 return false;
             }
             !(config.skip_pseudo
@@ -569,6 +581,9 @@ struct WalkCtx<'a> {
     visited: &'a Mutex<HashSet<(u64, u64)>>,
     excludes: &'a GlobSet,
     collect_metadata: bool,
+    /// Whether removable media under `/run/media` may be walked (targeted
+    /// on-demand indexing of a non-NTFS volume).
+    allow_removable: bool,
     errors: &'a ScanErrors,
     /// Cancellation (A3): checked once per directory.
     cancel: Option<&'a ScanCancel<'a>>,
@@ -654,8 +669,9 @@ fn walk(dir: &Path, ctx: &WalkCtx) -> WalkBuffer {
             if is_dir {
                 // Removable media under /run/media is indexed by the daemon's
                 // NTFS MFT path, not the generic walker, so never descend into
-                // it even when it is reachable from another root.
-                if mounts::is_removable_media_path(&path) {
+                // it even when it is reachable from another root. A targeted
+                // on-demand scan of a non-NTFS volume opts in.
+                if !ctx.allow_removable && mounts::is_removable_media_path(&path) {
                     continue;
                 }
                 if boundaries.contains(&path) && path != root {
@@ -877,6 +893,7 @@ mod tests {
             excludes: vec!["**/.git/**".into()],
             skip_pseudo: true,
             metadata: true,
+            allow_removable: false,
         };
         let (index, _) = scan(&config);
 
@@ -1029,6 +1046,7 @@ mod tests {
             excludes: Vec::new(),
             skip_pseudo: true,
             metadata: false,
+            allow_removable: false,
         };
         let (index, report) = scan(&config);
 

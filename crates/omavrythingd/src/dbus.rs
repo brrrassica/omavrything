@@ -5,7 +5,7 @@
 //! the `tech.alatcerdas.omavrything.control` polkit action.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -19,6 +19,7 @@ use crate::config::SharedConfig;
 use crate::manager::IndexManager;
 use crate::ntfs::{self, NtfsPolicy};
 use crate::polkit;
+use crate::volumes;
 
 /// The well-known bus name.
 pub const SERVICE_NAME: &str = "tech.alatcerdas.omavrything";
@@ -228,6 +229,115 @@ impl Manager {
         self.index.roots().iter().map(|r| r.path.clone()).collect()
     }
 
+    /// Every detected block volume with its indexing status.
+    ///
+    /// NTFS volumes are omitted while NTFS support is disabled, matching the
+    /// detection gate. Read-only: no polkit authorization is required.
+    async fn list_volumes(&self) -> Vec<HashMap<String, String>> {
+        let ntfs_enabled = self.config.ntfs();
+        let detected = tokio::task::spawn_blocking(volumes::list_block_volumes)
+            .await
+            .unwrap_or_default();
+        detected
+            .into_iter()
+            .filter(|v| ntfs_enabled || !v.is_ntfs())
+            .map(|v| {
+                let mut map = HashMap::new();
+                map.insert("device".into(), v.device.display().to_string());
+                map.insert("uuid".into(), v.uuid.clone().unwrap_or_default());
+                map.insert("label".into(), v.label.clone().unwrap_or_default());
+                map.insert("fstype".into(), v.fstype.clone());
+                map.insert(
+                    "mount_point".into(),
+                    v.mount_point
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default(),
+                );
+                map.insert("status".into(), volumes::status(&v, &self.index).into());
+                map
+            })
+            .collect()
+    }
+
+    /// Mount a volume by device path and index it. Returns the mount point.
+    ///
+    /// NTFS uses the MFT path (read-only mount); every other filesystem is
+    /// mounted through udisks2 and added as an index root.
+    async fn mount_volume(
+        &self,
+        device: String,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] connection: &zbus::Connection,
+    ) -> zbus::fdo::Result<String> {
+        authorize(&header, connection, polkit::ACTION).await?;
+        let device = PathBuf::from(device);
+        let probe_device = device.clone();
+        let fstype = tokio::task::spawn_blocking(move || volumes::probe_fstype(&probe_device))
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+            .ok_or_else(|| {
+                zbus::fdo::Error::InvalidArgs(format!(
+                    "no filesystem detected on {}",
+                    device.display()
+                ))
+            })?;
+        let is_ntfs = matches!(fstype.as_str(), "ntfs" | "ntfs3");
+        if is_ntfs && !self.config.ntfs() {
+            return Err(zbus::fdo::Error::AccessDenied(
+                "NTFS support is disabled".into(),
+            ));
+        }
+
+        if is_ntfs {
+            let partition = omavrything_ntfs::list_ntfs_partitions()
+                .into_iter()
+                .find(|p| p.device == device)
+                .ok_or_else(|| {
+                    zbus::fdo::Error::InvalidArgs(format!(
+                        "no NTFS partition at {}",
+                        device.display()
+                    ))
+                })?;
+            let index = Arc::clone(&self.index);
+            let policy = Arc::clone(&self.policy);
+            let mount_point = tokio::task::spawn_blocking(move || {
+                ntfs::mount_index_and_remember(&index, &policy, &partition)
+            })
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+            .map_err(zbus::fdo::Error::Failed)?;
+            let entries = self.index.len() as u64;
+            let _ = self.events.send(IndexEvent::Changed { entries });
+            let _ = self.config.remember_volume(&device.to_string_lossy());
+            return Ok(mount_point.display().to_string());
+        }
+
+        // Non-NTFS: mount through udisks2, add the mount point as a root, and
+        // walk it. The indexing guard makes the settings UI show "indexing"
+        // while the walk runs.
+        let mount_device = device.clone();
+        let mount_point =
+            tokio::task::spawn_blocking(move || volumes::mount_generic(&mount_device))
+                .await
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+                .map_err(zbus::fdo::Error::Failed)?;
+
+        let kind = omavrything_core::mounts::fs_kind(&fstype);
+        self.index
+            .with_index_mut(|idx| idx.add_root(&mount_point, kind));
+        let _indexing = volumes::IndexingGuard::new(&device);
+        run_rescan(
+            Arc::clone(&self.index),
+            Arc::clone(&self.config),
+            self.events.clone(),
+            &mount_point.display().to_string(),
+        )
+        .await?;
+        let _ = self.config.remember_volume(&device.to_string_lossy());
+        Ok(mount_point.display().to_string())
+    }
+
     /// Mount an NTFS partition by UUID and index it via the MFT. Returns the
     /// mount point.
     async fn mount_ntfs(
@@ -246,6 +356,7 @@ impl Manager {
 
         let index = Arc::clone(&self.index);
         let policy = Arc::clone(&self.policy);
+        let device = partition.device.clone();
         let mount_point = tokio::task::spawn_blocking(move || {
             ntfs::mount_index_and_remember(&index, &policy, &partition)
         })
@@ -255,7 +366,38 @@ impl Manager {
 
         let entries = self.index.len() as u64;
         let _ = self.events.send(IndexEvent::Changed { entries });
+        let _ = self.config.remember_volume(&device.to_string_lossy());
         Ok(mount_point.display().to_string())
+    }
+
+    /// Unmount a volume by device path and drop its index entries.
+    async fn unmount_volume(
+        &self,
+        device: String,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] connection: &zbus::Connection,
+    ) -> zbus::fdo::Result<()> {
+        authorize(&header, connection, polkit::ACTION).await?;
+        let device = PathBuf::from(device);
+        let Some(mount_point) = volumes::existing_mount_point(&device) else {
+            return Ok(());
+        };
+        let unmount_device = device.clone();
+        let unmount_point = mount_point.clone();
+        tokio::task::spawn_blocking(move || volumes::unmount(&unmount_device, &unmount_point))
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+            .map_err(zbus::fdo::Error::Failed)?;
+
+        // The volume is gone: stop serving its records and forget the root.
+        self.index
+            .with_index_mut(|idx| idx.remove_root(&mount_point));
+        let mut ownership = ntfs::MountOwnership::load(ntfs::default_ownership_path());
+        let _ = ownership.forget(&mount_point);
+        let _ = self.config.forget_volume(&device.to_string_lossy());
+        let entries = self.index.len() as u64;
+        let _ = self.events.send(IndexEvent::Changed { entries });
+        Ok(())
     }
 
     /// Emitted when the index changes.
@@ -322,6 +464,11 @@ async fn run_rescan(
                 excludes: scan.excludes.clone(),
                 skip_pseudo: scan.skip_pseudo,
                 metadata: scan.metadata,
+                // A targeted rescan of a volume the user explicitly mounted may
+                // live under /run/media; the full scan still excludes it.
+                allow_removable: omavrything_core::mounts::is_removable_media_path(Path::new(
+                    &root,
+                )),
             };
             plan_rescan_cancellable(&sub, Some(&cancel))
         };

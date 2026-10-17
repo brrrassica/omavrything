@@ -196,6 +196,42 @@ impl SharedConfig {
         self.candidate_index.load(Ordering::Relaxed)
     }
 
+    /// The block devices mounted through the settings UI, persisted in the
+    /// state config so they are mounted again on the next start.
+    pub fn remembered_volumes(&self) -> Vec<String> {
+        self.state
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .volumes
+            .clone()
+            .unwrap_or_default()
+    }
+
+    /// Remember a mounted device in the state config.
+    pub fn remember_volume(&self, device: &str) -> Result<(), String> {
+        let Some(path) = &self.state_path else {
+            return Ok(());
+        };
+        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+        let volumes = state.volumes.get_or_insert_with(Vec::new);
+        if !volumes.iter().any(|v| v == device) {
+            volumes.push(device.to_string());
+        }
+        state.save(path)
+    }
+
+    /// Forget an unmounted device in the state config.
+    pub fn forget_volume(&self, device: &str) -> Result<(), String> {
+        let Some(path) = &self.state_path else {
+            return Ok(());
+        };
+        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(volumes) = &mut state.volumes {
+            volumes.retain(|v| v != device);
+        }
+        state.save(path)
+    }
+
     /// Apply a configuration change and persist it. Returns an error for
     /// unknown keys or invalid values.
     pub fn set(&self, key: &str, value: &str) -> Result<(), String> {
@@ -298,6 +334,7 @@ impl SharedConfig {
             self.background_opacity().to_string(),
         );
         map.insert("candidate_index".into(), self.candidate_index().to_string());
+        map.insert("volumes".into(), self.remembered_volumes().join(","));
         map
     }
 }

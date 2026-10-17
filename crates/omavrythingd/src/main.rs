@@ -14,6 +14,7 @@ mod manager;
 mod ntfs;
 mod peer;
 mod polkit;
+mod volumes;
 
 use std::ffi::CString;
 use std::fs::File;
@@ -445,6 +446,86 @@ fn run_startup(
             run_ntfs_startup(index, policy)
         });
     }
+
+    // Mount and index volumes the user mounted through the settings UI. NTFS
+    // volumes are skipped here: the NTFS startup pass above already remembers
+    // them by UUID in its own policy file.
+    {
+        let index = Arc::clone(&index);
+        let config = Arc::clone(&config);
+        let events = events.clone();
+        spawn_thread("omavry-volumes", CONTROL_STACK, move || {
+            run_remembered_volumes(index, config, events)
+        });
+    }
+}
+
+/// Mount and index the non-NTFS volumes remembered in the state config.
+fn run_remembered_volumes(
+    index: Arc<IndexManager>,
+    config: Arc<SharedConfig>,
+    events: UnboundedSender<IndexEvent>,
+) {
+    let devices = config.remembered_volumes();
+    if devices.is_empty() {
+        return;
+    }
+    info!(
+        count = devices.len(),
+        "volumes: mounting remembered volumes"
+    );
+    for device in devices {
+        let device = PathBuf::from(device);
+        let Some(fstype) = volumes::probe_fstype(&device) else {
+            warn!(
+                device = %device.display(),
+                "volumes: remembered device has no filesystem; skipping"
+            );
+            continue;
+        };
+        // NTFS is handled by the NTFS startup pass (its policy remembers UUIDs).
+        if matches!(fstype.as_str(), "ntfs" | "ntfs3") {
+            continue;
+        }
+        let mount_point = match volumes::mount_generic(&device) {
+            Ok(mount_point) => mount_point,
+            Err(err) => {
+                warn!(
+                    device = %device.display(),
+                    error = %err,
+                    "volumes: could not mount remembered volume"
+                );
+                continue;
+            }
+        };
+        if index
+            .roots()
+            .iter()
+            .any(|r| Path::new(&r.path) == mount_point.as_path())
+        {
+            continue;
+        }
+        let kind = omavrything_core::mounts::fs_kind(&fstype);
+        index.with_index_mut(|idx| idx.add_root(&mount_point, kind));
+        let scan = config.scan();
+        let sub = ScanConfig {
+            roots: vec![mount_point.clone()],
+            excludes: scan.excludes.clone(),
+            skip_pseudo: scan.skip_pseudo,
+            metadata: scan.metadata,
+            allow_removable: true,
+        };
+        let plan = plan_rescan_cancellable(&sub, None);
+        let report = index.with_index_mut(|idx| apply_rescan(idx, plan));
+        info!(
+            device = %device.display(),
+            mount_point = %mount_point.display(),
+            entries = report.entries,
+            "volumes: remembered volume indexed"
+        );
+    }
+    let entries = index.len() as u64;
+    let _ = events.send(IndexEvent::Changed { entries });
 }
 
 /// Set the socket to mode `0660` and, when running as root, group
@@ -1371,6 +1452,7 @@ impl Args {
             excludes: self.excludes.clone(),
             skip_pseudo: true,
             metadata: self.metadata,
+            allow_removable: false,
         }
     }
 }

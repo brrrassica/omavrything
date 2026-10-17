@@ -24,7 +24,7 @@ use tracing::{debug, info, warn};
 use crate::manager::IndexManager;
 
 /// The private mount root used when udisks2 is unavailable.
-const PRIVATE_MOUNT_ROOT: &str = "/run/omavrything/ntfs";
+pub(crate) const PRIVATE_MOUNT_ROOT: &str = "/run/omavrything/ntfs";
 
 /// M18 (B2): the mount-ownership state file, next to the auto-mount policy.
 /// One `mount_point<TAB>owned` line per tracked mount; `owned` is `1` for a
@@ -683,8 +683,12 @@ pub fn mount_index_and_remember_with_ownership(
     );
     // Read and parse the MFT outside the index lock: on a multi-million-record
     // volume this takes seconds, and holding the write lock for it would stall
-    // every search for the duration.
-    let entries = enumerate_device(&partition.device)?;
+    // every search for the duration. The guard reports "indexing" to the
+    // settings UI for the duration of the read.
+    let entries = {
+        let _indexing = crate::volumes::IndexingGuard::new(&partition.device);
+        enumerate_device(&partition.device)?
+    };
     index.with_index_mut(|idx| apply_entries(idx, &mount_point, &entries));
     if let Some(uuid) = &partition.uuid {
         let mut p = policy.lock().unwrap_or_else(|e| e.into_inner());

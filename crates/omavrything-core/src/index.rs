@@ -1306,6 +1306,20 @@ impl Index {
         idx
     }
 
+    /// Remove a root and its subtree from the index. Returns whether anything
+    /// was removed.
+    ///
+    /// Used when a volume is unmounted: its records must stop being served and
+    /// the root must no longer be reported by [`Index::roots`].
+    pub fn remove_root(&mut self, path: &Path) -> bool {
+        let path_str = path.to_string_lossy();
+        let had_root = self.roots.iter().any(|r| r.path == path_str);
+        self.roots.retain(|r| r.path != path_str);
+        let removed = self.remove(path);
+        self.invalidate_cache();
+        had_root || removed
+    }
+
     /// Insert a file or directory record. Returns its record index.
     pub fn insert(&mut self, path: &Path, is_dir: bool, size: u64, mtime: i64) -> u32 {
         self.insert_with_flags(path, is_dir, false, size, mtime)

@@ -58,6 +58,13 @@ Item {
   property var settings: ({})
   property string configCommand: "omavry"
 
+  // Detected block volumes and their indexing status, shown at the bottom of
+  // the settings panel. Refreshed while the panel is open so a mount/index
+  // transition is visible without reopening it.
+  property var volumes: []
+  property bool volumesBusy: false
+  property string volumesError: ""
+
   // Snapshot-interval choices: 30 s to 300 s in 30 s steps.
   readonly property var snapshotOptions: {
     var opts = []
@@ -124,6 +131,13 @@ Item {
   readonly property real modifiedWidth: Math.round(contentWidth * colModifiedFrac)
   readonly property real pathWidth: Math.max(0, contentWidth - nameWidth - sizeWidth - modifiedWidth - columnGap * 3)
 
+  // Volume table columns: mount point, filesystem type, label, status, then
+  // the mount and unmount buttons.
+  readonly property real volMountWidth: Math.round(contentWidth * 0.30)
+  readonly property real volFsWidth: Math.round(contentWidth * 0.10)
+  readonly property real volLabelWidth: Math.round(contentWidth * 0.18)
+  readonly property int volButtonSize: Style.space(24)
+
   // Plugin lifecycle hooks, called by the shell host.
   function open(payloadJson) {
     root.settingsOpen = false
@@ -172,11 +186,44 @@ Item {
   function openSettings() {
     root.settingsOpen = true
     root.settingsError = ""
+    root.volumesError = ""
     configGetProc.running = true
+    root.refreshVolumes()
   }
 
   function closeSettings() {
     root.settingsOpen = false
+  }
+
+  // Load the detected volumes and their statuses from the daemon.
+  function refreshVolumes() {
+    if (!root.settingsOpen) return
+    volumesGetProc.running = true
+  }
+
+  function applyVolumes(text) {
+    var parsed
+    try { parsed = JSON.parse(text) } catch (e) { root.volumesError = "Could not read volumes"; return }
+    if (!Array.isArray(parsed)) return
+    root.volumes = parsed
+  }
+
+  // Mount and index one volume through the daemon (polkit-gated).
+  function mountVolume(device) {
+    if (root.volumesBusy) return
+    root.volumesBusy = true
+    root.volumesError = ""
+    volumeMountProc.command = [root.configCommand, "mount-volume", device]
+    volumeMountProc.running = true
+  }
+
+  // Unmount one volume and drop its index entries (polkit-gated).
+  function unmountVolume(device) {
+    if (root.volumesBusy) return
+    root.volumesBusy = true
+    root.volumesError = ""
+    volumeUnmountProc.command = [root.configCommand, "unmount-volume", device]
+    volumeUnmountProc.running = true
   }
 
   // Parse `omavry config get --json` output and apply the UI-side setting.
@@ -464,6 +511,51 @@ Item {
       root.settingsBusy = false
       if (exitCode !== 0) root.settingsError = "Could not apply setting"
     }
+  }
+
+  // Read the detected volumes and their statuses for the settings panel.
+  Process {
+    id: volumesGetProc
+    command: [root.configCommand, "volumes", "--json"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.applyVolumes(text)
+    }
+    onExited: function(exitCode) {
+      if (exitCode !== 0) root.volumesError = "Could not read volumes"
+    }
+  }
+
+  // Mount and index one volume.
+  Process {
+    id: volumeMountProc
+    stdout: StdioCollector { waitForEnd: true }
+    onExited: function(exitCode) {
+      root.volumesBusy = false
+      if (exitCode !== 0) root.volumesError = "Could not mount volume"
+      else root.refreshVolumes()
+    }
+  }
+
+  // Unmount one volume and drop its index entries.
+  Process {
+    id: volumeUnmountProc
+    stdout: StdioCollector { waitForEnd: true }
+    onExited: function(exitCode) {
+      root.volumesBusy = false
+      if (exitCode !== 0) root.volumesError = "Could not unmount volume"
+      else root.refreshVolumes()
+    }
+  }
+
+  // Poll while the settings panel is open so "indexing" transitions to
+  // "indexed" without the user reopening the panel.
+  Timer {
+    id: volumesTimer
+    interval: 2000
+    repeat: true
+    running: root.settingsOpen
+    onTriggered: root.refreshVolumes()
   }
 
   PanelWindow {
@@ -866,11 +958,19 @@ Item {
           }
 
           // ---------------------------------------------------- settings menu
-          Column {
+          Flickable {
             id: settingsPanel
             anchors.fill: parent
             visible: root.settingsOpen
-            spacing: root.contentSpacing
+            contentWidth: width
+            contentHeight: settingsColumn.implicitHeight
+            clip: true
+            boundsBehavior: Flickable.StopAtBounds
+
+            Column {
+              id: settingsColumn
+              width: parent.width
+              spacing: root.contentSpacing
 
             // Header: title + close button.
             Item {
@@ -944,32 +1044,6 @@ Item {
                   root.backgroundOpacity = v
                   root.setSetting("background_opacity", v.toFixed(2))
                 }
-              }
-            }
-
-            // NTFS support.
-            Item {
-              width: parent.width
-              height: root.rowHeight
-
-              Text {
-                width: root.nameWidth
-                anchors.left: parent.left
-                anchors.verticalCenter: parent.verticalCenter
-                text: "NTFS support"
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.body
-              }
-
-              ToggleSwitch {
-                anchors.left: parent.left
-                anchors.leftMargin: root.nameWidth + root.columnGap
-                anchors.verticalCenter: parent.verticalCenter
-                checked: root.settingValue("ntfs", "true") === "true"
-                foreground: root.foreground
-                accent: Color.accent
-                onToggled: root.setSetting("ntfs", !checked)
               }
             }
 
@@ -1070,6 +1144,250 @@ Item {
               }
             }
 
+            // NTFS support. Sits directly above the Volumes section because it
+            // gates whether NTFS volumes are detected and listed.
+            Item {
+              width: parent.width
+              height: root.rowHeight
+
+              Text {
+                width: root.nameWidth
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                text: "NTFS support"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+              }
+
+              ToggleSwitch {
+                anchors.left: parent.left
+                anchors.leftMargin: root.nameWidth + root.columnGap
+                anchors.verticalCenter: parent.verticalCenter
+                checked: root.settingValue("ntfs", "true") === "true"
+                foreground: root.foreground
+                accent: Color.accent
+                onToggled: root.setSetting("ntfs", !checked)
+              }
+            }
+
+            // Breathing room between the NTFS toggle and the volume table.
+            Item {
+              width: parent.width
+              height: root.contentSpacing * 2
+            }
+
+            // Volumes: every detected block filesystem, its indexing status,
+            // and mount/unmount actions. NTFS rows disappear when the toggle
+            // above is off (the daemon filters them out).
+            Text {
+              width: parent.width
+              text: "Volumes"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              font.bold: true
+            }
+
+            // Column headers.
+            Item {
+              width: parent.width
+              height: root.headerHeight
+
+              Text {
+                width: root.volMountWidth
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Mount point"
+                color: root.foreground
+                opacity: 0.6
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+              }
+
+              Text {
+                anchors.left: parent.left
+                anchors.leftMargin: root.volMountWidth + root.columnGap
+                width: root.volFsWidth
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Type"
+                color: root.foreground
+                opacity: 0.6
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+              }
+
+              Text {
+                anchors.left: parent.left
+                anchors.leftMargin: root.volMountWidth + root.volFsWidth + root.columnGap * 2
+                width: root.volLabelWidth
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Label"
+                color: root.foreground
+                opacity: 0.6
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+              }
+
+              Text {
+                anchors.left: parent.left
+                anchors.leftMargin: root.volMountWidth + root.volFsWidth + root.volLabelWidth + root.columnGap * 3
+                anchors.right: parent.right
+                anchors.rightMargin: root.volButtonSize * 2 + root.columnGap * 2
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Status"
+                color: root.foreground
+                opacity: 0.6
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+              }
+            }
+
+            Text {
+              width: parent.width
+              visible: root.volumes.length === 0
+              text: "No volumes detected"
+              color: root.foreground
+              opacity: 0.6
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+
+            Repeater {
+              model: root.volumes
+
+              delegate: Item {
+                width: parent.width
+                height: root.rowHeight
+
+                // Mount point (the device path when the volume is unmounted).
+                Text {
+                  width: root.volMountWidth
+                  anchors.left: parent.left
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: modelData.mount_point && modelData.mount_point !== ""
+                    ? modelData.mount_point
+                    : modelData.device
+                  elide: Text.ElideRight
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                }
+
+                // Filesystem type.
+                Text {
+                  anchors.left: parent.left
+                  anchors.leftMargin: root.volMountWidth + root.columnGap
+                  width: root.volFsWidth
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: modelData.fstype
+                  elide: Text.ElideRight
+                  color: root.foreground
+                  opacity: 0.8
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                }
+
+                // Label (empty when the volume has none).
+                Text {
+                  anchors.left: parent.left
+                  anchors.leftMargin: root.volMountWidth + root.volFsWidth + root.columnGap * 2
+                  width: root.volLabelWidth
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: modelData.label || ""
+                  elide: Text.ElideRight
+                  color: root.foreground
+                  opacity: 0.8
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                }
+
+                // Status.
+                Text {
+                  anchors.left: parent.left
+                  anchors.leftMargin: root.volMountWidth + root.volFsWidth + root.volLabelWidth + root.columnGap * 3
+                  anchors.right: mountButton.left
+                  anchors.rightMargin: root.columnGap
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: modelData.status
+                  elide: Text.ElideRight
+                  color: modelData.status === "indexing" ? Color.accent : root.foreground
+                  opacity: modelData.status === "unmounted" ? 0.6 : 0.9
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                }
+
+                // Mount button.
+                Item {
+                  id: mountButton
+                  anchors.right: unmountButton.left
+                  anchors.rightMargin: root.columnGap
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: root.volButtonSize
+                  height: root.volButtonSize
+
+                  Text {
+                    anchors.centerIn: parent
+                    text: "󰋊"
+                    color: root.foreground
+                    opacity: mountMouse.enabled
+                      ? (mountMouse.containsMouse ? 0.95 : 0.7)
+                      : 0.3
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                  }
+
+                  MouseArea {
+                    id: mountMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    enabled: modelData.status === "unmounted" && !root.volumesBusy
+                    cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                    onClicked: root.mountVolume(modelData.device)
+                  }
+                }
+
+                // Unmount button.
+                Item {
+                  id: unmountButton
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: root.volButtonSize
+                  height: root.volButtonSize
+
+                  Text {
+                    anchors.centerIn: parent
+                    text: "󰅖"
+                    color: root.foreground
+                    opacity: unmountMouse.enabled
+                      ? (unmountMouse.containsMouse ? 0.95 : 0.7)
+                      : 0.3
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                  }
+
+                  MouseArea {
+                    id: unmountMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    enabled: modelData.mount_point && modelData.mount_point !== "" && !root.volumesBusy
+                    cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                    onClicked: root.unmountVolume(modelData.device)
+                  }
+                }
+              }
+            }
+
+            Text {
+              width: parent.width
+              visible: root.volumesError !== ""
+              text: root.volumesError
+              color: Color.accent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.WordWrap
+            }
+
             Text {
               width: parent.width
               visible: root.settingsError !== ""
@@ -1078,6 +1396,7 @@ Item {
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
               wrapMode: Text.WordWrap
+            }
             }
           }
         }
