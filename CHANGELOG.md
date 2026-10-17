@@ -58,6 +58,45 @@ Measured: the empty-index baseline is 5 MiB; the 500 k hermetic tree fell from
   error reporting, non-btrfs snapshot staleness, mount ownership and hotplug,
   install/uninstall hardening, and a single copyable setup command.
 
+## [0.1.8] — 2026-10-14
+
+A security-hardening release for the `omarchy-shell` QML integration, closing
+the findings that blocked marketplace verification.
+
+### Security
+
+- **Index-derived text is rendered as plain text.** `Text` defaults to
+  `AutoText`, so a file name or parent path that "looks like" HTML was handed to
+  Qt's rich-text engine; an `<img src="...">` in a directory name (any local user
+  can create one) would load and decode an attacker-chosen local file
+  (PNG/JPG/SVG/PDF/…) or fetch a remote URL during a search — a
+  memory-exhaustion vector in the shared shell. Every `Text` that renders
+  index- or query-derived data now sets `textFormat: Text.PlainText`.
+- **The query mirror no longer falls back to `/tmp`.** The overlay writes the
+  query to a runtime file the bar watches. With `XDG_RUNTIME_DIR` unset the path
+  was `/tmp/omavrything-query`, world-writable: another local user could
+  pre-create it as a symlink (the overlay would overwrite the link target with
+  the query) or feed the bar arbitrary content. The mirror now uses
+  `$XDG_RUNTIME_DIR` (0700) and is disabled when it is unset.
+- **The socket response is bounded.** `handleResponse` trusted the daemon's
+  result count; a spoofed socket or a compromised daemon could make the shell
+  allocate an unbounded result set. The page is now sliced to `maxResults`.
+- **`xdg-open` only receives an absolute path.** A spoofed daemon could return a
+  URL or an option-like string (`--help`); the overlay now rejects anything that
+  is not an absolute path.
+
+### Added
+
+- Regression guards **C14** (index-derived `Text` must be `PlainText`) and
+  **C15** (the query mirror must not use `/tmp`) in `scripts/ci-smoke.sh` and
+  `scripts/test-install-uninstall.sh`.
+
+### Documentation
+
+- `plans/security-posture-omacom-impact.md` §7 records the QML integration
+  security review (fixed and pending), and `plans/risks.md` gains R22 (systemic
+  `/tmp` socket fallback) and R23 (QML integration review readability).
+
 ## [0.1.7] — 2026-10-13
 
 ### Security
@@ -352,6 +391,7 @@ Then install 0.1.1, run `omavrything-install-plugin`, and enable
 First release: the `omavrythingd` index daemon, the `omavry` CLI, and the
 `omarchy-shell` search plugin (bar widget, overlay, service).
 
+[0.1.8]: https://github.com/brrrassica/omavrything/releases/tag/v0.1.8
 [0.1.7]: https://github.com/brrrassica/omavrything/releases/tag/v0.1.7
 [0.1.6]: https://github.com/brrrassica/omavrything/releases/tag/v0.1.6
 [0.1.5]: https://github.com/brrrassica/omavrything/releases/tag/v0.1.5

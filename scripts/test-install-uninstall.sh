@@ -217,5 +217,45 @@ else
   bad "overlay QML contains a clipboard-connected text input"
 fi
 
+# --- C14: index-derived text is rendered as plain text ------------------------
+# Regression guard (2026-10-14): Text defaults to AutoText, which hands a string
+# that "looks like" rich text to Qt's rich-text engine. File names and parent
+# paths are attacker-controlled — any local user can create a directory whose
+# name is HTML — so an <img src="..."> in a directory name would make the
+# overlay load and decode an attacker-chosen local file (PNG/JPG/SVG/PDF/...)
+# during a search, a memory-exhaustion vector in the shared shell. Every Text
+# that renders index-derived data must set textFormat: Text.PlainText. The awk
+# walks each flat `Text { ... }` block and fails if a block binds
+# `text: rowDelegate.*` without a PlainText format.
+if awk '
+  /Text[[:space:]]*\{/ { intext = 1; plain = 0; dyn = 0; next }
+  intext && /textFormat:[[:space:]]*Text\.PlainText/ { plain = 1 }
+  intext && /text:[[:space:]]*rowDelegate\./ { dyn = 1 }
+  intext && /^[[:space:]]*\}/ {
+    if (dyn && !plain) { printf "unsafe Text at line %d\n", NR; bad = 1 }
+    intext = 0
+  }
+  END { exit bad }
+' "$here/shell/omavrything/SearchOverlay.qml"; then
+  ok "overlay QML renders index-derived text as plain text (no rich-text <img> load)"
+else
+  bad "overlay QML renders index-derived text with AutoText (rich-text <img> load)"
+fi
+
+# --- C15: the query mirror never uses a world-writable path -------------------
+# Regression guard (2026-10-14): the overlay writes the query to a runtime file
+# the bar watches. A predictable path under /tmp lets another local user
+# pre-create it as a symlink (the overlay would then overwrite the link target
+# with the query) or feed the bar arbitrary content. The mirror must be derived
+# from $XDG_RUNTIME_DIR and disabled when it is unset — never fall back to /tmp.
+if grep -q 'XDG_RUNTIME_DIR") || ""' "$here/shell/omavrything/SearchOverlay.qml" &&
+  grep -q 'XDG_RUNTIME_DIR") || ""' "$here/shell/omavrything/SearchBar.qml" &&
+  ! grep -Eq 'queryFile:.*"/tmp"' "$here/shell/omavrything/SearchOverlay.qml" &&
+  ! grep -Eq 'queryFile:.*"/tmp"' "$here/shell/omavrything/SearchBar.qml"; then
+  ok "query mirror uses a private per-user path (no /tmp fallback)"
+else
+  bad "query mirror may fall back to a world-writable /tmp path"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]

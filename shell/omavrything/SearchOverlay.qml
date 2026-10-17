@@ -86,7 +86,16 @@ Item {
   // Set when open() is waiting for socketProbe to resolve the socket path
   // before the Socket is allowed to connect.
   property bool pendingOpen: false
-  readonly property string queryFile: runtimeDir + "/omavrything-query"
+  // The query mirror is a private channel between the overlay and the bar. It
+  // must never live in a world-writable directory: a predictable path under
+  // /tmp lets another local user pre-create it as a symlink (the overlay would
+  // then overwrite the link target with the query) or feed the bar arbitrary
+  // content. It therefore uses $XDG_RUNTIME_DIR (0700) and is disabled when
+  // that is unset — a Wayland session always sets it — rather than falling back
+  // to /tmp. The socket path above keeps the /tmp fallback only to stay
+  // consistent with the daemon and CLI.
+  readonly property string queryDir: Quickshell.env("XDG_RUNTIME_DIR") || ""
+  readonly property string queryFile: queryDir !== "" ? queryDir + "/omavrything-query" : ""
 
   // Theme: shares the [menu] surface tokens.
   property color background: Color.menu.background
@@ -199,8 +208,10 @@ Item {
     return (v === undefined || v === null) ? fallback : String(v)
   }
 
-  // Mirror the query to the runtime file the bar widget watches.
+  // Mirror the query to the runtime file the bar widget watches. No-op when the
+  // mirror is disabled (no private per-user directory).
   function writeQuery(text) {
+    if (root.queryFile === "") return
     queryFileView.setText(text)
   }
 
@@ -239,10 +250,16 @@ Item {
       return
     }
 
-    root.results = response.results
-    if (root.selectedIndex >= response.results.length)
-      root.selectedIndex = Math.max(0, response.results.length - 1)
-    if (response.results.length === 0) root.cursorActive = false
+    // Bound the page. The daemon is trusted, but a spoofed socket or a
+    // compromised daemon must not be able to make the shared shell allocate an
+    // unbounded result set (0.1.8 security hardening).
+    var results = response.results
+    if (results.length > root.maxResults) results = results.slice(0, root.maxResults)
+
+    root.results = results
+    if (root.selectedIndex >= results.length)
+      root.selectedIndex = Math.max(0, results.length - 1)
+    if (results.length === 0) root.cursorActive = false
 
     root.applySort()
     root.rebuildModel()
@@ -308,6 +325,10 @@ Item {
     var index = root.cursorActive ? root.selectedIndex : 0
     if (index < 0 || index >= root.results.length) return
     var item = root.results[index]
+    // Only ever hand an absolute path to xdg-open. The index holds absolute
+    // paths, but a spoofed socket could return a URL or an option-like string
+    // ("--help"), which xdg-open would treat as a URL or a flag.
+    if (typeof item.path !== "string" || item.path.charAt(0) !== "/") return
     root.dismiss()
     Quickshell.execDetached(["xdg-open", item.path])
   }
@@ -582,6 +603,10 @@ Item {
                 anchors.verticalCenter: parent.verticalCenter
                 width: Math.max(0, parent.width - cursor.width)
                 text: root.filterText
+                // The query is user-typed, but it is still rendered as plain
+                // text: Text defaults to AutoText, which would hand a query
+                // that "looks like" rich text to Qt's rich-text engine.
+                textFormat: Text.PlainText
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.heading
@@ -758,10 +783,21 @@ Item {
                 anchors.rightMargin: Style.space(6)
                 spacing: root.columnGap
 
+                // Every cell renders index-derived text. File names and parent
+                // paths are attacker-controlled: any local user can create a
+                // directory whose name is HTML. Text defaults to AutoText,
+                // which hands a string that "looks like" rich text to Qt's
+                // rich-text engine; an <img src="..."> in a directory name
+                // would then load and decode an attacker-chosen local file
+                // (PNG/JPG/SVG/PDF/...) — or fetch a remote URL — during a
+                // search, a memory-exhaustion vector in the shared shell.
+                // PlainText disables rich-text parsing entirely, so no
+                // resource is ever loaded. Do not remove these.
                 Text {
                   width: root.nameWidth
                   anchors.verticalCenter: parent.verticalCenter
                   text: rowDelegate.name
+                  textFormat: Text.PlainText
                   color: rowDelegate.hasCursor ? root.selectedText : root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.body
@@ -771,6 +807,7 @@ Item {
                   width: root.sizeWidth
                   anchors.verticalCenter: parent.verticalCenter
                   text: rowDelegate.sizeText
+                  textFormat: Text.PlainText
                   color: rowDelegate.hasCursor ? root.selectedText : root.foreground
                   opacity: 0.75
                   font.family: root.fontFamily
@@ -781,6 +818,7 @@ Item {
                   width: root.modifiedWidth
                   anchors.verticalCenter: parent.verticalCenter
                   text: rowDelegate.modifiedText
+                  textFormat: Text.PlainText
                   color: rowDelegate.hasCursor ? root.selectedText : root.foreground
                   opacity: 0.75
                   font.family: root.fontFamily
@@ -791,6 +829,7 @@ Item {
                   width: root.pathWidth
                   anchors.verticalCenter: parent.verticalCenter
                   text: rowDelegate.parentPath
+                  textFormat: Text.PlainText
                   color: rowDelegate.hasCursor ? root.selectedText : root.foreground
                   opacity: 0.55
                   font.family: root.fontFamily
@@ -817,6 +856,9 @@ Item {
               : (root.indexLoading
                  ? "Reloading index…"
                  : (root.filterText ? "No matches for “" + root.filterText + "”" : "Type to search files"))
+            // Echoes the user's query; render as plain text so a query that
+            // looks like rich text is never parsed by the rich-text engine.
+            textFormat: Text.PlainText
             color: root.foreground
             opacity: 0.6
             font.family: root.fontFamily
