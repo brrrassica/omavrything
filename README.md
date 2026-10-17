@@ -16,7 +16,7 @@ system daemon (`omavrythingd`) keeps an in-memory index of all mounted
 filesystems — using directory traversal + inotify for Linux filesystems
 (btrfs/ext4/xfs/f2fs) and the MFT for NTFS partitions.
 
-> **Status:** v0.1.10. See [`docs/`](docs/) and the
+> **Status:** v0.1.11. See [`docs/`](docs/) and the
 > [changelog](CHANGELOG.md).
 
 ## Install from a release
