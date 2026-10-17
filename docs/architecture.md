@@ -248,7 +248,10 @@ flowchart TD
 - **Mounting:** the daemon triggers a **udisks2** mount so the partition appears
   at `/run/media/<user>/<label>` and the desktop sees it. If udisks2 is
   unavailable, the daemon falls back to a private read-only `ntfs3` mount at
-  `/run/omavrything/ntfs/<uuid>`.
+  `/run/omavrything/ntfs/<uuid>`. A pre-existing mount that is writable (a
+  udisks2 auto-mount at login) is remounted read-only and kept read-only, so the
+  MFT read cannot set the volume's dirty bit (B12); the generic walker never
+  indexes `/run/media` (ADR-018).
 - **Auto-mount policy:** a partition that was previously enabled and indexed is
   auto-mounted on detection; a newly seen partition is offered (notification +
   D-Bus `MountNtfs`), never silently mounted.

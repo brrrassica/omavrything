@@ -43,6 +43,9 @@ pub struct IndexManager {
     /// set, searches return an empty page with the `loading` flag so clients
     /// can show a warming-up state instead of a silently empty index.
     loading: AtomicBool,
+    /// Whether a background materialization of an evicted index is in flight,
+    /// so concurrent queries start at most one.
+    materializing: AtomicBool,
     start: Instant,
 }
 
@@ -59,6 +62,7 @@ impl IndexManager {
             identities: RwLock::new(identities),
             last_activity: AtomicU64::new(0),
             loading: AtomicBool::new(false),
+            materializing: AtomicBool::new(false),
             start: Instant::now(),
         }
     }
@@ -93,28 +97,51 @@ impl IndexManager {
     }
 
     /// Run a query. Returns the outcome and whether the index is still loading.
+    ///
+    /// When the index is evicted, this returns an empty page with `loading` set
+    /// and does **not** scan the image: a linear scan of a multi-million-record
+    /// image takes seconds (measured 8–16 s at 1.38 M), which is far too slow
+    /// for an interactive query. The caller should start a background
+    /// materialization with [`IndexManager::ensure_resident`]; the next query
+    /// is then served from the owned index at full speed.
     pub fn search(&self, query: &str, limit: usize, offset: usize) -> (SearchOutcome, bool) {
         self.touch();
         let loading = self.is_loading();
         let state = self.state.read().unwrap_or_else(|e| e.into_inner());
         match &*state {
             State::Owned(index) => (index.search(query, limit, offset), loading),
-            State::Image { mmap, .. } => {
-                let Ok(image) = IndexImage::from_bytes(&mmap[..]) else {
-                    return (SearchOutcome::default(), false);
-                };
-                let delta = self.delta.read().unwrap_or_else(|e| e.into_inner());
-                let outcome = omavrything_core::index::search_image_with_delta(
-                    image.records(),
-                    image.paths(),
-                    &delta,
-                    query,
-                    limit,
-                    offset,
-                );
-                (outcome, loading)
-            }
+            State::Image { .. } => (SearchOutcome::default(), true),
         }
+    }
+
+    /// If the index is evicted, start a background materialization and return
+    /// `true` (the caller should report `loading`). Returns `false` when the
+    /// index is resident; returns `true` when a materialization is already in
+    /// flight, so concurrent queries start at most one.
+    ///
+    /// The materialization folds the delta in and swaps the owned index back
+    /// in, so the next query is served at full speed. It runs on its own thread
+    /// because it takes ~1–2 s at 1.38 M records; the query that triggered it
+    /// returns immediately with `loading` instead of blocking.
+    pub fn ensure_resident(self: &Arc<Self>) -> bool {
+        if !self.is_evicted() {
+            return false;
+        }
+        if self.materializing.swap(true, Ordering::AcqRel) {
+            return true;
+        }
+        let this = Arc::clone(self);
+        let spawned = std::thread::Builder::new()
+            .name("omavry-materialize".into())
+            .stack_size(512 * 1024)
+            .spawn(move || {
+                this.with_index_mut(|_| {});
+                this.materializing.store(false, Ordering::Release);
+            });
+        if spawned.is_err() {
+            self.materializing.store(false, Ordering::Release);
+        }
+        true
     }
 
     /// Apply a filesystem event to the index (owned) or the delta (evicted).
@@ -375,15 +402,32 @@ mod tests {
     }
 
     #[test]
-    fn evict_then_search_uses_the_image() {
+    fn evict_then_search_reports_loading_and_materializes() {
         let dir = temp_dir("evict");
         let snap = dir.join("index.snapshot");
-        let manager = IndexManager::new(sample(), Vec::new(), Some(snap.clone()));
+        let manager = Arc::new(IndexManager::new(sample(), Vec::new(), Some(snap.clone())));
 
         assert!(!manager.is_evicted());
         manager.evict();
         assert!(manager.is_evicted());
 
+        // An evicted query reports `loading` and does not scan the image (a
+        // linear scan of a multi-million-record image takes seconds).
+        let (outcome, loading) = manager.search("report", 10, 0);
+        assert!(loading);
+        assert_eq!(outcome.hits.len(), 0);
+
+        // `ensure_resident` starts a background materialization; wait for it.
+        assert!(manager.ensure_resident());
+        for _ in 0..200 {
+            if !manager.is_evicted() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!manager.is_evicted(), "the index must be materialized");
+
+        // The next query is served from the owned index at full speed.
         let (outcome, loading) = manager.search("report", 10, 0);
         assert!(!loading);
         assert_eq!(outcome.hits.len(), 1);
@@ -403,8 +447,10 @@ mod tests {
         let config = ScanConfig::with_roots(vec![PathBuf::from("/")]);
         manager.apply_event(&FsEvent::Removed(PathBuf::from("/home/notes.md")), &config);
 
-        // A query sees the removal via the delta.
-        let (outcome, _) = manager.search("notes", 10, 0);
+        // An evicted query reports `loading`; the delta is folded on
+        // materialization, not scanned here.
+        let (outcome, loading) = manager.search("notes", 10, 0);
+        assert!(loading);
         assert_eq!(outcome.total, 0);
 
         // Materializing folds the delta into the owned index.

@@ -32,11 +32,19 @@ const PRIVATE_MOUNT_ROOT: &str = "/run/omavrything/ntfs";
 /// user/udisks2 mount (never unmounted).
 const OWNED_FILE_NAME: &str = "mounts.state";
 
+/// The error prefix returned when a mount is writable and MFT indexing is
+/// refused (B12). This is an expected, non-fatal outcome — the generic
+/// filesystem walker still indexes the mount — so callers log it at `info`
+/// rather than `error`. Shared so the producer and the caller cannot drift.
+pub const WRITABLE_MOUNT_ERR: &str = "refusing to index writable mount";
+
 /// Mount an NTFS device read-only, preferring udisks2 and falling back to a
 /// private `ntfs3` mount. Returns the mount point.
 ///
 /// A device that is already mounted (e.g. by udisks2 at login) reuses its
-/// existing mount point rather than attempting a second mount.
+/// existing mount point rather than attempting a second mount. A pre-existing
+/// mount that is writable is remounted read-only (B12): the daemon never
+/// indexes a writable mount, so the MFT read cannot set the volume's dirty bit.
 pub fn mount_readonly(device: &Path, uuid: Option<&str>) -> Result<PathBuf, String> {
     if let Some(mount_point) = existing_mount_point(device) {
         // Diagnostics: a pre-existing mount is *not* daemon-created, and its
@@ -50,12 +58,51 @@ pub fn mount_readonly(device: &Path, uuid: Option<&str>) -> Result<PathBuf, Stri
             options = state.as_ref().map(|s| s.1.as_str()).unwrap_or("?"),
             "ntfs: reusing pre-existing mount (not daemon-created)"
         );
+        // B12: the daemon only indexes read-only mounts. A pre-existing mount
+        // (e.g. a udisks2 auto-mount at login) is usually writable; remount it
+        // read-only so the MFT read cannot set the volume's dirty bit. The
+        // remount is kept: the daemon's model is read-only mounts, and a
+        // writable mount is never indexed.
+        if mount_is_readonly(&mount_point) == Some(false) {
+            remount_readonly(&mount_point)?;
+        }
         return Ok(mount_point);
     }
     if let Some(mount_point) = mount_via_udisks(device) {
         return Ok(mount_point);
     }
     mount_via_ntfs3(device, uuid)
+}
+
+/// Remount `mount_point` read-only (B12). Requires `CAP_SYS_ADMIN`, which the
+/// systemd unit grants. The remount is kept: the daemon never indexes a
+/// writable mount, so a pre-existing writable mount (a udisks2 auto-mount) is
+/// made read-only for the daemon's lifetime.
+fn remount_readonly(mount_point: &Path) -> Result<(), String> {
+    info!(
+        mount_point = %mount_point.display(),
+        command = "mount -o remount,ro <mount_point>",
+        "ntfs: remounting a writable mount read-only"
+    );
+    let output = Command::new("mount")
+        .arg("-o")
+        .arg("remount,ro")
+        .arg(mount_point)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        warn!(
+            mount_point = %mount_point.display(),
+            stderr = %stderr,
+            "ntfs: remount read-only failed"
+        );
+        return Err(format!(
+            "could not remount {} read-only: {stderr}",
+            mount_point.display()
+        ));
+    }
+    Ok(())
 }
 
 /// The filesystem type and mount options for `device` from `/proc/mounts`, as
@@ -609,10 +656,7 @@ pub fn mount_index_and_remember_with_ownership(
     match mount_is_readonly(&mount_point) {
         Some(true) => {}
         Some(false) => {
-            return Err(format!(
-                "refusing to index writable mount {}",
-                mount_point.display()
-            ));
+            return Err(format!("{WRITABLE_MOUNT_ERR} {}", mount_point.display()));
         }
         None => {
             return Err(format!(

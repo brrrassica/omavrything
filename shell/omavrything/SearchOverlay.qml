@@ -383,12 +383,12 @@ Item {
     onTriggered: root.sendQuery()
   }
 
-  // Retries a query while the daemon is reloading an evicted index. The load is
-  // a background mmap, so a short delay is enough for the next response to
-  // carry results.
+  // Retries a query while the daemon is reloading an evicted index. The daemon
+  // materializes the owned index in the background (~1-2 s at 1.38 M records),
+  // so the retry is spaced to avoid a burst of requests while it runs.
   Timer {
     id: reloadRetry
-    interval: 120
+    interval: 500
     repeat: false
     onTriggered: root.sendQuery()
   }

@@ -26,9 +26,10 @@ Roots are either explicit (`--root`, repeatable) or discovered from the mount
 table (`--auto`). With no arguments the daemon indexes `$HOME` as a development
 convenience. Pseudo-filesystems (`proc`, `sysfs`, `tmpfs`, `cgroup2`, `overlay`,
 …) and network filesystems (`nfs`, `cifs`, `9p`, `fuse.sshfs`, …) are skipped, as
-are the pseudo mount points `/proc`, `/sys`, and `/dev`. `/run` is **not**
-excluded, so removable media mounted under `/run/media/<user>/<volume>` (including
-NTFS) remains discoverable. `--exclude` globs prune matching paths during
+are the pseudo mount points `/proc`, `/sys`, and `/dev`. Removable media under
+`/run/media/<user>/<volume>` is **not** walked: the daemon indexes it through the
+NTFS MFT path instead (ADR-018), which mounts the volume read-only first.
+`--exclude` globs prune matching paths during
 traversal. The scanner walks each root in parallel and does not cross into nested
 mounts. Entry type comes from `readdir`'s `d_type` (no extra syscall); size and
 mtime require one `stat` per file. `--no-metadata` skips that stat for files

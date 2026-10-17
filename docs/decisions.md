@@ -326,16 +326,20 @@ header, a section table, and four 8-byte aligned sections (`ROOTS`, `RECORDS`,
 `FileRecord` array cast directly from the mapping, so loading is an `mmap` plus
 header validation — no decode, no rebuild. The daemon's `IndexManager` **evicts**
 the owned index to this image when idle; while evicted, only the mapping (file
-backed, reclaimable) and a resident path -> index map remain, and queries scan
-the image merged with a small `DeltaIndex` of live updates. v6 adds a per-root
-`mtime` watermark to the `ROOTS` section (M17/A4), so a warm start on a
-non-btrfs filesystem can detect a root that changed while the daemon was down.
+backed, reclaimable) and a resident path -> index map remain. A query while
+evicted reports `loading` and starts a **background materialization** of the
+owned index (folding the `DeltaIndex` of live updates in), so the next query is
+served at full speed; the image is never linear-scanned on the query path (that
+took 8–16 s at 1.38 M records). v6 adds a per-root `mtime` watermark to the
+`ROOTS` section (M17/A4), so a warm start on a non-btrfs filesystem can detect a
+root that changed while the daemon was down.
 
 **Rationale:** The v4 warm-start decode rebuilt `by_path` and the candidate index
 (~580 ms). A byte-identical image removes that cost and lets the daemon drop the
 owned record/path arenas and the candidate index when idle, cutting RSS. The
-linear scan over the image (~6 ms at 1.37 M) is well inside the query budget, so
-the candidate index is not persisted.
+candidate index is not persisted (it is the largest component), so an evicted
+query cannot narrow; it materializes the owned index in the background instead
+of scanning the image, which measured 8–16 s at 1.38 M records.
 
 **Consequences:** The snapshot format is versioned and v4 is rejected (a one-time
 cold scan after upgrade). Live updates while evicted accumulate in a bounded
@@ -347,3 +351,38 @@ path to its base-image record index.
 reduction); persisting the candidate index in the image (rejected: it is the
 largest component and the linear scan is fast enough); storing delta removals by
 path (rejected: the base scan would pay a per-match path check).
+
+## ADR-018 — Removable media is indexed only through the NTFS MFT path
+
+**Decision:** The generic filesystem walker **never** descends into
+`/run/media` (the udisks2 removable-media root): it is filtered out of the walk
+roots in `resolve_roots` and pruned in the walker's descend check. Removable
+media is indexed only by the daemon's NTFS MFT path. When that path finds a
+pre-existing mount that is writable (a udisks2 auto-mount at login), it
+**remounts it read-only and keeps it read-only** for the daemon's lifetime,
+rather than refusing to index it.
+
+**Rationale:** Before this, the walker indexed `/run/media` (it was deliberately
+a scan root) while the MFT path refused the same writable mount, so the volume
+was indexed by the walker and the daemon logged a contradictory "refusing to
+index writable mount" error. The MFT path is both faster (it reads the MFT
+directly) and the only path that can honour the read-only invariant (B12): the
+walker cannot make a mount read-only, so letting it index removable media
+silently bypassed the dirty-bit safety rule. Making the MFT path the sole owner
+of removable media removes the double-index and the contradiction.
+
+**Consequences:** A writable NTFS mount is remounted read-only, so the desktop
+loses write access to that partition while the daemon runs (the user accepted
+this trade-off: safety over write access). The daemon needs `CAP_SYS_ADMIN` to
+remount, which the systemd unit already grants. A remount failure is logged and
+the partition is skipped (never indexed writable). Non-NTFS removable media
+(e.g. a vfat USB stick) is no longer indexed at all, since the MFT path only
+handles NTFS.
+
+**Alternatives considered:** Keeping the walker indexing `/run/media` and only
+fixing the log (rejected: the read-only invariant stays bypassed and the volume
+is double-indexed); a transient remount (read-only for the MFT read, then
+read-write again — rejected: a race window where the desktop can write during
+the read, and the daemon's model is read-only mounts); a private second
+read-only mount of the same device (rejected: mounting one NTFS device twice is
+not reliably supported by the kernel driver).

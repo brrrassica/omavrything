@@ -30,6 +30,34 @@ Notable changes to `omavrything`. The format follows
   and counted in status. Traversal of network filesystems is time-boxed so a
   stalled mount cannot block a scan.
 
+### Fixed
+
+- **Removable media is now indexed only through the NTFS MFT path (ADR-018).**
+  The generic walker no longer descends into `/run/media` (it is filtered from
+  the walk roots and pruned in the walk), so a udisks2 NTFS mount is no longer
+  double-indexed by the walker while the MFT path refuses it. The MFT path now
+  remounts a writable pre-existing mount read-only and keeps it read-only, so
+  the read-only invariant (B12) is enforced instead of silently bypassed. A
+  writable NTFS partition therefore loses desktop write access while the daemon
+  runs (safety over write access).
+- **The daemon no longer logs a misleading `ERROR ntfs: failed to index` for a
+  writable mount.** The writable-mount refusal is an expected, non-fatal
+  outcome (the walker used to cover it) and is now logged at `info` with a
+  clarifying message; `error` is reserved for genuine failures.
+- **The smoke test's NTFS ownership guard named a function that never
+  existed.** `ci-smoke.sh` asserted `record_owned_mount` in `ntfs.rs`; the
+  function is `mount_index_and_remember_with_ownership`. The guard now names
+  the real symbol (the check had been failing 113/114).
+- **An evicted index is materialized on the first query instead of being
+  linear-scanned.** A query while evicted now returns `state: "loading"`
+  immediately and starts a background materialization of the owned index
+  (folding the live-update delta in); the next query is served at full speed.
+  Previously the query scanned the mmap image, which took 8–16 s at 1.38 M
+  records, so the widget's first search after the 20 s idle eviction appeared
+  to return nothing. The overlay's reload retry is spaced to 500 ms to match.
+  The smoke test's evicted-image check now retries the search until the marker
+  appears, matching the new loading-then-served contract.
+
 ## [0.2.0-rc8] — 2026-10-17
 
 ### Fixed

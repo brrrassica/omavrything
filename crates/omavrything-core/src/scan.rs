@@ -516,6 +516,11 @@ pub fn rescan_into_index(index: &mut Index, config: &ScanConfig) -> ScanReport {
 }
 
 /// Resolve the roots to scan: explicit roots, or non-pseudo mounts.
+///
+/// Removable media under `/run/media` is never a walk root: the daemon indexes
+/// it through the NTFS MFT path (which mounts the volume read-only first), so
+/// the generic walker must not descend into it (see
+/// [`mounts::is_removable_media_path`]).
 pub fn resolve_roots(config: &ScanConfig) -> Vec<(PathBuf, FsKind)> {
     let mounts = mounts::read_mounts().unwrap_or_default();
 
@@ -523,6 +528,7 @@ pub fn resolve_roots(config: &ScanConfig) -> Vec<(PathBuf, FsKind)> {
         return config
             .roots
             .iter()
+            .filter(|r| !mounts::is_removable_media_path(r))
             .map(|r| (r.clone(), fs_kind_for_path(&mounts, r)))
             .collect();
     }
@@ -530,6 +536,9 @@ pub fn resolve_roots(config: &ScanConfig) -> Vec<(PathBuf, FsKind)> {
     mounts
         .iter()
         .filter(|m| {
+            if mounts::is_removable_media_path(&m.mount_point) {
+                return false;
+            }
             !(config.skip_pseudo
                 && (mounts::is_pseudo_fs(&m.fs_type)
                     || mounts::is_pseudo_mount_point(&m.mount_point)))
@@ -643,6 +652,12 @@ fn walk(dir: &Path, ctx: &WalkCtx) -> WalkBuffer {
             // check alone cannot see. The walk root itself is, of course,
             // entered.
             if is_dir {
+                // Removable media under /run/media is indexed by the daemon's
+                // NTFS MFT path, not the generic walker, so never descend into
+                // it even when it is reachable from another root.
+                if mounts::is_removable_media_path(&path) {
+                    continue;
+                }
                 if boundaries.contains(&path) && path != root {
                     continue;
                 }
@@ -881,6 +896,33 @@ mod tests {
             roots.iter().all(|(p, _)| !mounts::is_pseudo_mount_point(p)),
             "auto roots must not include pseudo mount points: {roots:?}"
         );
+    }
+
+    #[test]
+    fn auto_roots_skip_removable_media() {
+        // Removable media under /run/media is indexed by the NTFS MFT path, not
+        // the walker, so it is never an auto root.
+        let config = ScanConfig::auto();
+        let roots = resolve_roots(&config);
+        assert!(
+            roots
+                .iter()
+                .all(|(p, _)| !mounts::is_removable_media_path(p)),
+            "auto roots must not include /run/media: {roots:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_roots_skip_removable_media() {
+        // Even an explicit root under /run/media is dropped: the walker must
+        // never index removable media.
+        let config = ScanConfig::with_roots(vec![
+            PathBuf::from("/home/sam"),
+            PathBuf::from("/run/media/sam/Data"),
+        ]);
+        let roots = resolve_roots(&config);
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].0, PathBuf::from("/home/sam"));
     }
 
     #[test]

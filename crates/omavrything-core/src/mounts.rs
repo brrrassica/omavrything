@@ -194,6 +194,20 @@ pub fn is_pseudo_mount_point(path: &Path) -> bool {
         .any(|p| path == Path::new(p) || path.starts_with(p))
 }
 
+/// The root under which udisks2 mounts removable media.
+pub const REMOVABLE_MEDIA_ROOT: &str = "/run/media";
+
+/// Whether `path` is under the removable-media root (`/run/media`).
+///
+/// The generic walker must not descend into `/run/media`: removable media
+/// (including NTFS) is indexed by the daemon through the NTFS MFT path, which
+/// mounts the volume read-only first. Letting the walker index it too would
+/// double-index the volume and, for a writable mount, contradict the daemon's
+/// read-only invariant (B12).
+pub fn is_removable_media_path(path: &Path) -> bool {
+    path.starts_with(REMOVABLE_MEDIA_ROOT)
+}
+
 /// Decode the octal escapes used by `/proc/mounts` (`\040` space, `\011` tab,
 /// `\012` newline, `\134` backslash).
 fn unescape(s: &str) -> String {
@@ -275,6 +289,20 @@ tmpfs /run tmpfs rw,nosuid,nodev,relatime,size=3276800k 0 0
         assert!(!is_pseudo_mount_point(Path::new("/home")));
         // Removable media under /run must remain discoverable.
         assert!(!is_pseudo_mount_point(Path::new("/run/media/sam/MyDrive")));
+    }
+
+    #[test]
+    fn identifies_removable_media_paths() {
+        // The walker must not descend into /run/media: the daemon indexes it
+        // through the NTFS MFT path instead.
+        assert!(is_removable_media_path(Path::new("/run/media")));
+        assert!(is_removable_media_path(Path::new("/run/media/sam/Data")));
+        assert!(is_removable_media_path(Path::new(
+            "/run/media/sam/Data/sub"
+        )));
+        assert!(!is_removable_media_path(Path::new("/run")));
+        assert!(!is_removable_media_path(Path::new("/run/mediax")));
+        assert!(!is_removable_media_path(Path::new("/home/sam")));
     }
 
     #[test]

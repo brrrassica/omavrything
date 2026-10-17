@@ -174,10 +174,14 @@ capability; a user-run daemon does not.
 
 4. **Mounting.** Mounting prefers **udisks2** (`udisksctl mount -o ro`) so the
    desktop sees the partition, and falls back to a private read-only **`ntfs3`**
-   mount at `/run/omavrything/ntfs/<uuid>`. If neither works, indexing still
-   succeeds (the MFT is read from the raw device) but the files are not mounted
-   for opening. Check that `udisks2` is installed and running, and that the
-   `ntfs3` kernel module is available (`modprobe ntfs3`).
+   mount at `/run/omavrything/ntfs/<uuid>`. A pre-existing mount that is
+   writable (a udisks2 auto-mount at login) is **remounted read-only and kept
+   read-only**, so the MFT read cannot set the volume's dirty bit; the desktop
+   then has no write access to that partition while the daemon runs. If neither
+   mount works, indexing still succeeds (the MFT is read from the raw device)
+   but the files are not mounted for opening. Check that `udisks2` is installed
+   and running, and that the `ntfs3` kernel module is available
+   (`modprobe ntfs3`).
 
 5. **Auto-mount policy.** Previously indexed partitions are remembered by UUID in
    a state file (`/var/lib/omavrything/ntfs.state` as root, else

@@ -239,15 +239,18 @@ detection.
 The daemon's [`IndexManager`](../crates/omavrythingd/src/manager.rs) can **evict**
 the owned index to this image when idle. While evicted, only the mapping (file
 backed, reclaimable) and a resident path -> index map (~9 B/record) remain; the
-owned record/path arenas and the candidate index are dropped. Queries scan the
-image with the storage-agnostic linear scan
-([`search_image`](../crates/omavrything-core/src/index.rs)), merged with a small
-[`DeltaIndex`](../crates/omavrything-core/src/index.rs) of live updates. The
-watcher records changes in the delta; a mutation that needs the owned index
-materializes it (folding the delta) and the idle timer evicts again.
+owned record/path arenas and the candidate index are dropped. A query while
+evicted returns `state: "loading"` and starts a **background materialization**
+of the owned index
+([`IndexManager::ensure_resident`](../crates/omavrythingd/src/manager.rs)),
+folding the [`DeltaIndex`](../crates/omavrything-core/src/index.rs) of live
+updates in; the next query is served at full speed. The watcher records changes
+in the delta; a mutation that needs the owned index materializes it (folding the
+delta) and the idle timer evicts again.
 
-The candidate index is **not** persisted: the evicted path uses the linear scan
-(~6 ms at 1.37 M), which is well inside the query budget. The candidate index
-remains available only in the owned (indexing) form. See
-[`plans/evictable-image-index.md`](../plans/evictable-image-index.md) and
+The candidate index is **not** persisted (it is the largest component), so an
+evicted query cannot narrow. It is materialized rather than linear-scanned: a
+scan of the image measured 8–16 s at 1.38 M records, far outside the query
+budget. The candidate index remains available only in the owned (indexing) form.
+See [`plans/evictable-image-index.md`](../plans/evictable-image-index.md) and
 [ADR-017](decisions.md).

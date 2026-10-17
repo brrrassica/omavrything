@@ -579,8 +579,25 @@ else
   fail "the index evicted after the idle period"
   cat "$tmp/daemon-evict.log" >&2 || true
 fi
-expect "search still works from the evicted image" 0 \
-  --grep "omavrything-smoke-marker" -- as_smoke /usr/bin/omavry search omavrything-smoke-marker
+# The first query while evicted returns `state: "loading"` and starts a
+# background materialization (ADR-017); the next query is served at full
+# speed. Retry until the marker appears, so the check still proves the
+# evicted index recovers without a linear scan.
+evicted_search_ok=""
+for _ in $(seq 1 50); do
+  if as_smoke /usr/bin/omavry search omavrything-smoke-marker 2>/dev/null \
+      | grep -q "omavrything-smoke-marker"; then
+    evicted_search_ok=yes
+    break
+  fi
+  sleep 0.2
+done
+if [[ -n "$evicted_search_ok" ]]; then
+  ok "search still works from the evicted image"
+else
+  fail "search still works from the evicted image"
+  as_smoke /usr/bin/omavry search omavrything-smoke-marker >&2 || true
+fi
 kill "$evict_pid" 2>/dev/null || true
 wait "$evict_pid" 2>/dev/null || true
 
@@ -643,7 +660,7 @@ wait "$warm2_pid" 2>/dev/null || true
 # entries. The behavioural checks live in the ntfs unit tests and the M25
 # stale-mount section below.
 expect_grep "ntfs records daemon-created mounts" \
-  crates/omavrythingd/src/ntfs.rs "record_owned_mount"
+  crates/omavrythingd/src/ntfs.rs "mount_index_and_remember_with_ownership"
 expect_grep "ntfs reconciles recorded ownership on startup" \
   crates/omavrythingd/src/ntfs.rs "reconcile_stale_mounts"
 expect_grep "ntfs drops entries for a disappeared mount" \

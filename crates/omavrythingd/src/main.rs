@@ -784,6 +784,15 @@ pub(crate) fn run_ntfs_startup(index: Arc<IndexManager>, policy: Arc<Mutex<ntfs:
                 mount_point = %mount_point.display(),
                 "ntfs: indexed"
             ),
+            // A writable mount is refused by design (B12): MFT parsing reads the
+            // raw device, which risks the volume's dirty bit. This is not a
+            // failure — the generic filesystem walker still indexes the mount —
+            // so it is logged at `info`, not `error`.
+            Ok(Err(err)) if err.starts_with(ntfs::WRITABLE_MOUNT_ERR) => info!(
+                device = %part.device.display(),
+                error = %err,
+                "ntfs: skipping MFT indexing of a writable mount (the filesystem walker still indexes it)"
+            ),
             Ok(Err(err)) => error!(
                 device = %part.device.display(),
                 error = %err,
@@ -1007,6 +1016,12 @@ fn serve(stream: UnixStream, index: Arc<IndexManager>, profile: bool) {
                 let limit = request.effective_limit();
                 let offset = request.effective_offset();
                 let (outcome, loading) = index.search(&request.q, limit, offset);
+                // An evicted index reports `loading` and is materialized in the
+                // background, so the client shows a reloading state and the next
+                // query is served from the owned index at full speed.
+                if loading {
+                    index.ensure_resident();
+                }
                 if profile {
                     debug!(query = %request.q, hits = outcome.hits.len(), "search");
                 }
