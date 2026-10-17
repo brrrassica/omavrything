@@ -71,7 +71,10 @@ Measured: the empty-index baseline is 5 MiB; the 500 k hermetic tree fell from
   one of the eight client slots indefinitely. Writes now carry a 30-second
   write timeout, so a stalled reader's connection is dropped and its slot
   freed. The bundled socket client also bounds its blocking reads with the
-  same deadline.
+  same deadline. Additionally, a failed error-reply write (the path taken
+  for malformed requests) now drops the connection instead of being
+  ignored, so a client that keeps supplying malformed requests without
+  reading replies cannot retain slots across repeated write timeouts.
 
 ## [0.1.9] — 2026-10-16
 
