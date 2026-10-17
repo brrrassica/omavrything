@@ -4,6 +4,17 @@ Notable changes to `omavrything`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.11] — 2026-10-17
+
+### Fixed
+
+- **A client that kept supplying malformed requests without reading replies
+  could retain all eight client slots across repeated write timeouts.** The
+  malformed-request path ignored a failed error-response write and continued
+  serving the connection, so the socket-search denial remained possible even
+  after the 0.1.10 write timeout. A failed error-reply write now drops the
+  connection and releases its slot; all reply writes fail closed.
+
 ## [0.1.10] — 2026-10-17
 
 ### Fixed

@@ -757,7 +757,13 @@ fn serve(stream: UnixStream, index: Arc<RwLock<Index>>, profile: bool) {
         let request = match parse_request(line.as_bytes()) {
             Ok(request) => request,
             Err(err) => {
-                let _ = write_response(&mut writer, &Response::error(err));
+                // A failed error-reply write (e.g. a write timeout because the
+                // client stopped reading) means the connection is wedged:
+                // drop it and release the slot instead of continuing to serve
+                // a client that can never receive replies.
+                if write_response(&mut writer, &Response::error(err)).is_err() {
+                    break;
+                }
                 continue;
             }
         };
