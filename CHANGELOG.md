@@ -4,6 +4,18 @@ Notable changes to `omavrything`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0-rc8] — 2026-10-17
+
+### Fixed
+
+- **The daemon failed to compile after the 0.1.9 fixes were rebased onto the
+  rc6+ codebase.** The rebase resolution kept the pre-rc6 two-argument
+  `spawn_thread` call at the D-Bus ntfs-startup site; it now passes the explicit
+  `CONTROL_STACK` stack size like every other call site.
+- **The idle evictor could be starved by filesystem events.** Event bursts kept
+  resetting the idle window so eviction never ran on busy filesystems; the
+  evictor now bounds how long event activity can defer an eviction pass.
+
 ## [Unreleased] — v0.2.0 roadmap
 
 The next release is a **performance-first** robustness release. The work below is
