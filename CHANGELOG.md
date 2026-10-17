@@ -58,6 +58,21 @@ Measured: the empty-index baseline is 5 MiB; the 500 k hermetic tree fell from
   error reporting, non-btrfs snapshot staleness, mount ownership and hotplug,
   install/uninstall hardening, and a single copyable setup command.
 
+## [0.1.10] — 2026-10-17
+
+### Fixed
+
+- **A search-authorized user could deny socket search to other users by
+  stopping reading replies.** The daemon set only a read timeout on client
+  connections; reply writes were blocking with no output deadline. A client
+  that kept sending requests but never read responses (including
+  malformed-request error replies, which require no large index) filled the
+  socket buffer and blocked its serving thread forever in `write`, holding
+  one of the eight client slots indefinitely. Writes now carry a 30-second
+  write timeout, so a stalled reader's connection is dropped and its slot
+  freed. The bundled socket client also bounds its blocking reads with the
+  same deadline.
+
 ## [0.1.9] — 2026-10-16
 
 ### Fixed
