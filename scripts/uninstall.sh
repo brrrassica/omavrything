@@ -230,17 +230,23 @@ fi
 # first, then remove it with --one-file-system so a mount that could not be
 # unmounted is still never crossed.
 unmount_runtime_mounts() {
-  command -v findmnt >/dev/null 2>&1 || return 0
   local target
+  local -a targets=()
+  if command -v findmnt >/dev/null 2>&1; then
+    mapfile -t targets < <(findmnt -rn -o TARGET | grep '^/run/omavrything/' | sort -r)
+  else
+    # Fallback for a minimal system without util-linux's findmnt.
+    mapfile -t targets < <(awk '$2 ~ /^\/run\/omavrything\// { print $2 }' /proc/mounts | sort -r)
+  fi
   # Deepest first, so a nested mount is unmounted before its parent.
-  while IFS= read -r target; do
+  for target in "${targets[@]}"; do
     [[ -n "$target" ]] || continue
     log "unmounting $target"
     if ! umount "$target" 2>/dev/null; then
       umount -l "$target" 2>/dev/null ||
         warn "could not unmount $target; it will be left in place"
     fi
-  done < <(findmnt -rn -o TARGET | grep '^/run/omavrything/' | sort -r)
+  done
 }
 unmount_runtime_mounts
 

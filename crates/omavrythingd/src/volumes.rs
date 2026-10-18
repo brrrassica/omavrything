@@ -221,17 +221,34 @@ pub fn mount_generic(device: &Path) -> Result<PathBuf, String> {
     if let Some(mount_point) = existing_mount_point(device) {
         return Ok(mount_point);
     }
-    let output = Command::new("udisksctl")
-        .arg("mount")
-        .arg("-b")
-        .arg(device)
-        .output()
-        .map_err(|e| e.to_string())?;
+    // B3: prefer the udisks2 D-Bus API; it returns the mount point directly.
+    match crate::udisks::mount(device, None) {
+        Ok(mount_point) => return Ok(mount_point),
+        Err(err) => {
+            tracing::debug!(
+                device = %device.display(),
+                error = %err,
+                "volumes: udisks2 D-Bus mount failed; falling back to udisksctl"
+            );
+        }
+    }
+    let device_str = device.to_string_lossy();
+    let output = crate::ntfs::run_command_timeout(
+        "udisksctl",
+        &["mount", "--no-user-interaction", "-b", &device_str],
+        crate::ntfs::UDISKS_TIMEOUT,
+    )
+    .map_err(|e| e.to_string())?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(format!("could not mount {}: {stderr}", device.display()));
     }
-    // udisksctl prints "Mounted /dev/sda1 at /run/media/user/Label."
+    // B3: prefer the kernel mount table over parsing English output. The
+    // `udisksctl` text is only a fallback for a mount that has not appeared in
+    // `/proc/mounts` yet.
+    if let Some(mount_point) = existing_mount_point(device) {
+        return Ok(mount_point);
+    }
     let stdout = String::from_utf8_lossy(&output.stdout);
     if let Some(pos) = stdout.find(" at ") {
         let mount_point = stdout[pos + 4..].trim().trim_end_matches('.').trim();
@@ -239,12 +256,10 @@ pub fn mount_generic(device: &Path) -> Result<PathBuf, String> {
             return Ok(PathBuf::from(mount_point));
         }
     }
-    existing_mount_point(device).ok_or_else(|| {
-        format!(
-            "udisksctl mounted {} but its mount point could not be determined",
-            device.display()
-        )
-    })
+    Err(format!(
+        "udisksctl mounted {} but its mount point could not be determined",
+        device.display()
+    ))
 }
 
 /// The mount point of `device` from `/proc/mounts`, if mounted.
@@ -264,31 +279,47 @@ pub fn existing_mount_point(device: &Path) -> Option<PathBuf> {
 /// a fallback.
 pub fn unmount(device: &Path, mount_point: &Path) -> Result<(), String> {
     let private = mount_point.starts_with(crate::ntfs::PRIVATE_MOUNT_ROOT);
+    let mount_point_str = mount_point.to_string_lossy();
     if private {
         for _ in 0..3 {
-            let ok = Command::new("umount")
-                .arg(mount_point)
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
+            let ok = crate::ntfs::run_command_timeout(
+                "umount",
+                &[&mount_point_str],
+                crate::ntfs::UNMOUNT_TIMEOUT,
+            )
+            .map(|s| s.status.success())
+            .unwrap_or(false);
             if ok && existing_mount_point(device).is_none() {
                 return Ok(());
             }
             std::thread::sleep(Duration::from_millis(200));
         }
-        let _ = Command::new("umount").arg("-l").arg(mount_point).status();
+        let _ = crate::ntfs::run_command_timeout(
+            "umount",
+            &["-l", &mount_point_str],
+            crate::ntfs::UNMOUNT_TIMEOUT,
+        );
     } else {
-        let output = Command::new("udisksctl")
-            .arg("unmount")
-            .arg("-b")
-            .arg(device)
-            .output();
+        // B3: prefer the udisks2 D-Bus API.
+        if crate::udisks::unmount(device).is_ok() && existing_mount_point(device).is_none() {
+            return Ok(());
+        }
+        let device_str = device.to_string_lossy();
+        let output = crate::ntfs::run_command_timeout(
+            "udisksctl",
+            &["unmount", "--no-user-interaction", "-b", &device_str],
+            crate::ntfs::UDISKS_TIMEOUT,
+        );
         if let Ok(output) = output {
             if output.status.success() && existing_mount_point(device).is_none() {
                 return Ok(());
             }
         }
-        let _ = Command::new("umount").arg(mount_point).status();
+        let _ = crate::ntfs::run_command_timeout(
+            "umount",
+            &[&mount_point_str],
+            crate::ntfs::UNMOUNT_TIMEOUT,
+        );
     }
     if existing_mount_point(device).is_some() {
         Err(format!("could not unmount {}", mount_point.display()))

@@ -10,12 +10,13 @@
 //! on restart, and drops a mount's index entries when the mount disappears
 //! (re-indexing when it returns).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::Mutex;
-use std::time::Duration;
+use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use omavrything_core::index::{FsKind, Index};
 use omavrything_ntfs::{NtfsEntry, NtfsPartition, NtfsVolume};
@@ -25,6 +26,20 @@ use crate::manager::IndexManager;
 
 /// The private mount root used when udisks2 is unavailable.
 pub(crate) const PRIVATE_MOUNT_ROOT: &str = "/run/omavrything/ntfs";
+
+/// B5: every mount is read-only and hardened against setuid, device nodes, and
+/// execution. The daemon only reads the MFT, so none of these are needed.
+pub(crate) const MOUNT_OPTIONS: &str = "ro,nosuid,nodev,noexec";
+
+/// B5: a mount or udisks2 call that hangs must not wedge the daemon.
+pub(crate) const MOUNT_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const UDISKS_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const UNMOUNT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// B7: serialize policy-file writes in-process. Callers already hold the
+/// `Mutex<NtfsPolicy>`; this lock also covers a save reached through a
+/// different policy instance (e.g. startup reconciliation).
+static POLICY_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 /// M18 (B2): the mount-ownership state file, next to the auto-mount policy.
 /// One `mount_point<TAB>owned` line per tracked mount; `owned` is `1` for a
@@ -68,6 +83,27 @@ pub fn mount_readonly(device: &Path, uuid: Option<&str>) -> Result<PathBuf, Stri
         }
         return Ok(mount_point);
     }
+    // B3: prefer the udisks2 D-Bus API. It returns the mount point directly,
+    // so no English output is parsed. A system service may be denied by
+    // udisks2/polkit; fall back to `udisksctl`, then to the private ntfs3
+    // mount.
+    match crate::udisks::mount(device, Some(MOUNT_OPTIONS)) {
+        Ok(mount_point) => {
+            info!(
+                device = %device.display(),
+                mount_point = %mount_point.display(),
+                "ntfs: udisks2 D-Bus mount succeeded"
+            );
+            return Ok(mount_point);
+        }
+        Err(err) => {
+            debug!(
+                device = %device.display(),
+                error = %err,
+                "ntfs: udisks2 D-Bus mount failed; falling back"
+            );
+        }
+    }
     if let Some(mount_point) = mount_via_udisks(device) {
         return Ok(mount_point);
     }
@@ -81,12 +117,14 @@ pub fn mount_readonly(device: &Path, uuid: Option<&str>) -> Result<PathBuf, Stri
 fn remount_readonly(mount_point: &Path) -> Result<(), String> {
     info!(
         mount_point = %mount_point.display(),
-        command = "mount -o remount,ro <mount_point>",
+        command = "mount -o remount,ro,nosuid,nodev,noexec <mount_point>",
         "ntfs: remounting a writable mount read-only"
     );
-    let output = run_command(
+    let mount_point_str = mount_point.to_string_lossy();
+    let output = run_command_timeout(
         "mount",
-        &["-o", "remount,ro", &mount_point.to_string_lossy()],
+        &["-o", "remount,ro,nosuid,nodev,noexec", &mount_point_str],
+        MOUNT_TIMEOUT,
     )
     .map_err(|e| e.to_string())?;
     if !output.status.success() {
@@ -125,11 +163,14 @@ fn mount_state(device: &Path) -> Option<(String, String)> {
 /// The mount points of daemon-created private NTFS mounts (under
 /// [`PRIVATE_MOUNT_ROOT`]) that are currently live, from `/proc/mounts`.
 pub fn private_mounts() -> Vec<PathBuf> {
-    let Ok(mounts) = mount_table() else {
-        return Vec::new();
-    };
-    mounts
-        .lines()
+    mount_table()
+        .map(|text| private_mounts_from(&text))
+        .unwrap_or_default()
+}
+
+/// Parse the private mount points out of a `/proc/mounts` body.
+fn private_mounts_from(text: &str) -> Vec<PathBuf> {
+    text.lines()
         .filter_map(|line| {
             let mut fields = line.split_whitespace();
             let _source = fields.next()?;
@@ -147,9 +188,15 @@ pub fn private_mounts() -> Vec<PathBuf> {
 /// indexed, so a forced close or power loss cannot set a dirty bit or lose
 /// data through the daemon.
 pub fn mount_is_readonly(mount_point: &Path) -> Option<bool> {
-    let mounts = mount_table().ok()?;
+    mount_table()
+        .ok()
+        .and_then(|text| mount_is_readonly_from(&text, mount_point))
+}
+
+/// Parse the read-only state of `mount_point` out of a `/proc/mounts` body.
+fn mount_is_readonly_from(text: &str, mount_point: &Path) -> Option<bool> {
     let target = mount_point.to_string_lossy();
-    for line in mounts.lines() {
+    for line in text.lines() {
         let mut fields = line.split_whitespace();
         let _source = fields.next()?;
         let mp = fields.next()?;
@@ -193,9 +240,34 @@ fn mount_table() -> io::Result<String> {
     std::fs::read_to_string("/proc/mounts")
 }
 
-/// Run `prog` with `args`, capturing its output.
-fn run_command(prog: &str, args: &[&str]) -> io::Result<std::process::Output> {
-    Command::new(prog).args(args).output()
+/// Run `prog` with `args`, capturing its output, and kill it if it does not
+/// finish within `timeout` (B5). A hung `mount`/`udisksctl` must not wedge the
+/// daemon's startup or hotplug thread.
+pub(crate) fn run_command_timeout(
+    prog: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> io::Result<Output> {
+    let mut child = Command::new(prog)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output();
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("{prog} timed out after {timeout:?}"),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 /// Decode the octal escapes used by `/proc/mounts` (`\040` space, `\011` tab,
@@ -220,19 +292,25 @@ fn unescape_mount(s: &str) -> String {
 
 /// Mount via `udisksctl` (a udisks2 user mount), returning the mount point.
 fn mount_via_udisks(device: &Path) -> Option<PathBuf> {
+    let device_str = device.to_string_lossy();
     info!(
         device = %device.display(),
-        command = "udisksctl mount -b <device> -o ro",
+        command = "udisksctl mount --no-user-interaction -b <device> -o ro,nosuid,nodev,noexec",
         "ntfs: attempting udisks2 mount"
     );
-    let output = Command::new("udisksctl")
-        .arg("mount")
-        .arg("-b")
-        .arg(device)
-        .arg("-o")
-        .arg("ro")
-        .output()
-        .ok()?;
+    let output = run_command_timeout(
+        "udisksctl",
+        &[
+            "mount",
+            "--no-user-interaction",
+            "-b",
+            &device_str,
+            "-o",
+            MOUNT_OPTIONS,
+        ],
+        UDISKS_TIMEOUT,
+    )
+    .ok()?;
     if !output.status.success() {
         warn!(
             device = %device.display(),
@@ -241,7 +319,11 @@ fn mount_via_udisks(device: &Path) -> Option<PathBuf> {
         );
         return None;
     }
-    let mount_point = parse_udisks_mount_point(&String::from_utf8_lossy(&output.stdout));
+    // B3: prefer the kernel mount table over parsing English output. The
+    // `udisksctl` text is only a fallback for a mount that has not appeared in
+    // `/proc/mounts` yet.
+    let mount_point = existing_mount_point(device)
+        .or_else(|| parse_udisks_mount_point(&String::from_utf8_lossy(&output.stdout)));
     if let Some(ref mp) = mount_point {
         let state = mount_state(device);
         info!(
@@ -269,27 +351,60 @@ fn parse_udisks_mount_point(text: &str) -> Option<PathBuf> {
     }
 }
 
+/// B6: a stable, collision-free private mount-point name. Prefer the UUID;
+/// fall back to the device basename (e.g. `sda1`) when the volume has no UUID,
+/// so two UUID-less volumes never share the constant `volume` mount point.
+fn private_mount_name(device: &Path, uuid: Option<&str>) -> String {
+    let raw = uuid
+        .filter(|u| !u.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            device
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "volume".to_string());
+    let sanitized: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "volume".to_string()
+    } else {
+        sanitized
+    }
+}
+
 /// Mount via the kernel `ntfs3` driver at a private read-only mount point.
 fn mount_via_ntfs3(device: &Path, uuid: Option<&str>) -> Result<PathBuf, String> {
-    let name = uuid.unwrap_or("volume");
+    let name = private_mount_name(device, uuid);
     let mount_point = PathBuf::from(PRIVATE_MOUNT_ROOT).join(name);
     std::fs::create_dir_all(&mount_point).map_err(|e| e.to_string())?;
+    let device_str = device.to_string_lossy();
+    let mount_point_str = mount_point.to_string_lossy();
     info!(
         device = %device.display(),
         mount_point = %mount_point.display(),
-        command = "mount -t ntfs3 -o ro <device> <mount_point>",
+        command = "mount -t ntfs3 -o ro,nosuid,nodev,noexec <device> <mount_point>",
         "ntfs: attempting private ntfs3 mount (daemon-created)"
     );
-    let output = run_command(
+    let output = run_command_timeout(
         "mount",
         &[
             "-t",
             "ntfs3",
             "-o",
-            "ro",
-            &device.to_string_lossy(),
-            &mount_point.to_string_lossy(),
+            MOUNT_OPTIONS,
+            &device_str,
+            &mount_point_str,
         ],
+        MOUNT_TIMEOUT,
     )
     .map_err(|e| e.to_string())?;
     if !output.status.success() {
@@ -308,7 +423,7 @@ fn mount_via_ntfs3(device: &Path, uuid: Option<&str>) -> Result<PathBuf, String>
         mount_point = %mount_point.display(),
         fs_type = state.as_ref().map(|s| s.0.as_str()).unwrap_or("?"),
         options = state.as_ref().map(|s| s.1.as_str()).unwrap_or("?"),
-        "ntfs: private ntfs3 mount result (daemon-created; NOT unmounted on shutdown)"
+        "ntfs: private ntfs3 mount result (daemon-created; unmounted on shutdown)"
     );
     Ok(mount_point)
 }
@@ -328,8 +443,9 @@ fn still_mounted(mount_point: &Path) -> bool {
 /// Returns whether the mount was released; a mount that survives even the lazy
 /// unmount is logged with its mount point and reported (never fatal, B14).
 fn unmount_mount_point(mount_point: &Path) -> bool {
+    let mount_point_str = mount_point.to_string_lossy();
     for attempt in 1..=BUSY_UNMOUNT_RETRIES {
-        let ok = run_command("umount", &[&mount_point.to_string_lossy()])
+        let ok = run_command_timeout("umount", &[&mount_point_str], UNMOUNT_TIMEOUT)
             .map(|o| o.status.success())
             .unwrap_or(false);
         if ok && !still_mounted(mount_point) {
@@ -342,7 +458,7 @@ fn unmount_mount_point(mount_point: &Path) -> bool {
         );
         std::thread::sleep(BUSY_UNMOUNT_BACKOFF);
     }
-    let lazy = run_command("umount", &["-l", &mount_point.to_string_lossy()])
+    let lazy = run_command_timeout("umount", &["-l", &mount_point_str], UNMOUNT_TIMEOUT)
         .map(|o| o.status.success())
         .unwrap_or(false);
     if lazy && !still_mounted(mount_point) {
@@ -374,14 +490,7 @@ pub fn unmount_all_private() {
         return;
     }
     let mut ownership = MountOwnership::load(default_ownership_path());
-    // B1: only daemon-created mounts are candidates. A private mount is
-    // daemon-created by construction; the ownership state is consulted so a
-    // mount recorded as pre-existing is never unmounted even if it somehow
-    // appears under the private root.
-    let owned: Vec<PathBuf> = mounts
-        .into_iter()
-        .filter(|mp| mp.starts_with(PRIVATE_MOUNT_ROOT) || ownership.is_owned(mp))
-        .collect();
+    let owned = daemon_owned_mounts(mounts, &ownership);
     if owned.is_empty() {
         return;
     }
@@ -394,6 +503,16 @@ pub fn unmount_all_private() {
             let _ = ownership.forget(mount_point);
         }
     }
+}
+
+/// B1: select only the mounts the daemon owns. A private mount under
+/// [`PRIVATE_MOUNT_ROOT`] is daemon-created by construction; the ownership
+/// state is consulted so a mount recorded as pre-existing is never selected.
+fn daemon_owned_mounts(mounts: Vec<PathBuf>, ownership: &MountOwnership) -> Vec<PathBuf> {
+    mounts
+        .into_iter()
+        .filter(|mp| mp.starts_with(PRIVATE_MOUNT_ROOT) || ownership.is_owned(mp))
+        .collect()
 }
 
 /// M18 (B2): the persisted mount-ownership state.
@@ -558,6 +677,116 @@ pub fn reconcile_stale_mounts() {
         "ntfs: stale daemon-created mounts from a previous run; unmounting"
     );
     unmount_all_private();
+}
+
+/// B4: react to udev block-device events and reconcile the NTFS mounts.
+///
+/// The daemon shares the host mount namespace, so a udisks2 mount made by the
+/// desktop and a private `ntfs3` mount made by the daemon are both visible in
+/// `/proc/mounts`. A udev netlink monitor wakes this pass on a block-device
+/// add/remove/change; a 30 s timeout is a fallback for a missed event. If the
+/// udev socket cannot be opened, the pass falls back to a 2 s poll.
+pub fn run_hotplug_monitor(
+    index: Arc<IndexManager>,
+    policy: Arc<Mutex<NtfsPolicy>>,
+    ownership: Arc<Mutex<MountOwnership>>,
+) {
+    // Only one monitor may run, even if NTFS is toggled on more than once.
+    static RUNNING: AtomicBool = AtomicBool::new(false);
+    if RUNNING.swap(true, Ordering::SeqCst) {
+        debug!("ntfs: hotplug monitor already running");
+        return;
+    }
+    const POLL: Duration = Duration::from_secs(2);
+    const FALLBACK: Duration = Duration::from_secs(30);
+    const RETRY: Duration = Duration::from_secs(60);
+    let events = crate::udev::monitor().ok();
+    if events.is_none() {
+        warn!("ntfs: udev monitor unavailable; falling back to mount-table polling");
+    }
+    let mut retry_at: HashMap<PathBuf, Instant> = HashMap::new();
+    loop {
+        // Drop entries for tracked mounts that vanished while the daemon ran.
+        let tracked = {
+            let o = ownership.lock().unwrap_or_else(|e| e.into_inner());
+            o.mount_points()
+        };
+        for mount_point in tracked {
+            if mount_point_is_live(&mount_point) {
+                continue;
+            }
+            drop_mount_entries(index.as_ref(), &mount_point);
+            let mut o = ownership.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = o.forget(&mount_point);
+        }
+
+        // Mount and index a remembered partition that appeared.
+        for part in omavrything_ntfs::list_ntfs_partitions() {
+            let Some(mount_point) = existing_mount_point(&part.device) else {
+                continue;
+            };
+            if index
+                .roots()
+                .iter()
+                .any(|root| Path::new(&root.path) == mount_point.as_path())
+            {
+                continue;
+            }
+            let known = part
+                .uuid
+                .as_deref()
+                .map(|uuid| {
+                    policy
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .is_known(uuid)
+                })
+                .unwrap_or(false);
+            if !known {
+                continue;
+            }
+            if retry_at
+                .get(&part.device)
+                .is_some_and(|deadline| *deadline > Instant::now())
+            {
+                continue;
+            }
+            match mount_index_and_remember_with_ownership(
+                index.as_ref(),
+                policy.as_ref(),
+                ownership.as_ref(),
+                &part,
+            ) {
+                Ok(mount_point) => {
+                    retry_at.remove(&part.device);
+                    info!(
+                        device = %part.device.display(),
+                        mount_point = %mount_point.display(),
+                        "ntfs: hotplug mount indexed"
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        device = %part.device.display(),
+                        error = %err,
+                        "ntfs: hotplug mount failed; backing off"
+                    );
+                    retry_at.insert(part.device.clone(), Instant::now() + RETRY);
+                }
+            }
+        }
+        match &events {
+            Some(rx) => crate::udev::wait_for_block_event(rx, FALLBACK),
+            None => std::thread::sleep(POLL),
+        }
+    }
+}
+
+/// Whether `mount_point` is currently live in `/proc/mounts`.
+fn mount_point_is_live(mount_point: &Path) -> bool {
+    existing_mount_points_anywhere()
+        .iter()
+        .any(|live| live == mount_point)
 }
 
 /// Enumerate an NTFS device's MFT into a list of entries, without touching the
@@ -757,6 +986,9 @@ impl NtfsPolicy {
     }
 
     fn save(&self) -> io::Result<()> {
+        // B7: serialize writers and write atomically (temp file + rename), so a
+        // crash mid-write leaves the previous policy intact.
+        let _guard = POLICY_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -766,7 +998,9 @@ impl NtfsPolicy {
         if !body.is_empty() {
             body.push('\n');
         }
-        std::fs::write(&self.path, body)
+        let tmp = self.path.with_extension("state.tmp");
+        std::fs::write(&tmp, body.as_bytes())?;
+        std::fs::rename(&tmp, &self.path)
     }
 }
 
@@ -1053,5 +1287,133 @@ mod tests {
         assert_eq!(reloaded.len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn policy_save_is_atomic_and_crash_safe() {
+        // B7: the policy is written to a temp file and renamed, so a crash
+        // mid-write leaves the previous policy intact.
+        let dir =
+            std::env::temp_dir().join(format!("omavrything-ntfs-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ntfs.state");
+
+        let mut policy = NtfsPolicy::load(path.clone());
+        policy.remember("AAAA-BBBB").unwrap();
+        let good = std::fs::read_to_string(&path).unwrap();
+
+        // A leftover temp file from a crash must not be read as state.
+        std::fs::write(path.with_extension("state.tmp"), b"garbage").unwrap();
+        let reloaded = NtfsPolicy::load(path.clone());
+        assert!(reloaded.is_known("AAAA-BBBB"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), good);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn private_mount_name_prefers_uuid_and_falls_back_to_device() {
+        // B6: a UUID-less volume uses its device basename, never the constant
+        // `volume`, so two such volumes cannot collide.
+        assert_eq!(
+            private_mount_name(Path::new("/dev/sda1"), Some("AAAA-BBBB")),
+            "AAAA-BBBB"
+        );
+        assert_eq!(private_mount_name(Path::new("/dev/sda1"), None), "sda1");
+        assert_eq!(
+            private_mount_name(Path::new("/dev/nvme0n1p2"), Some("")),
+            "nvme0n1p2"
+        );
+        assert_eq!(
+            private_mount_name(Path::new("/dev/disk/by-uuid/1234"), None),
+            "1234"
+        );
+    }
+
+    #[test]
+    fn mount_options_are_read_only_and_hardened() {
+        // B5: the daemon never mounts writable, setuid, device, or executable.
+        let options: Vec<&str> = MOUNT_OPTIONS.split(',').collect();
+        for required in ["ro", "nosuid", "nodev", "noexec"] {
+            assert!(
+                options.contains(&required),
+                "missing mount option {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_timeout_kills_a_hung_process() {
+        // B5: a hung mount/udisksctl call is killed instead of wedging the
+        // startup or hotplug thread.
+        let start = Instant::now();
+        let err = run_command_timeout("sleep", &["5"], Duration::from_millis(100)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn two_uuid_less_volumes_get_distinct_private_mount_points() {
+        // B6: two UUID-less volumes must not share the constant `volume`.
+        let a = private_mount_name(Path::new("/dev/sda1"), None);
+        let b = private_mount_name(Path::new("/dev/sdb1"), None);
+        assert_ne!(a, b);
+        assert_eq!(a, "sda1");
+        assert_eq!(b, "sdb1");
+    }
+
+    #[test]
+    fn private_mounts_from_filters_the_private_root() {
+        // B4/M19: only mounts under /run/omavrything/ntfs are daemon-created.
+        let text = "\
+/dev/sda1 /run/omavrything/ntfs/sda1 ntfs3 ro,nosuid,nodev,noexec 0 0
+/dev/sdb1 /run/media/sam/Data ntfs3 rw 0 0
+/dev/sdc1 /run/omavrything/ntfs/AAAA-BBBB ntfs3 ro 0 0
+";
+        assert_eq!(
+            private_mounts_from(text),
+            vec![
+                PathBuf::from("/run/omavrything/ntfs/sda1"),
+                PathBuf::from("/run/omavrything/ntfs/AAAA-BBBB"),
+            ]
+        );
+    }
+
+    #[test]
+    fn mount_is_readonly_from_reads_the_options_field() {
+        // B5/B12: the read-only check is based on the mount options, not the
+        // filesystem type or the source device.
+        let text = "\
+/dev/sda1 /run/omavrything/ntfs/sda1 ntfs3 ro,nosuid,nodev,noexec 0 0
+/dev/sdb1 /run/media/sam/Data ntfs3 rw,relatime 0 0
+";
+        assert_eq!(
+            mount_is_readonly_from(text, Path::new("/run/omavrything/ntfs/sda1")),
+            Some(true)
+        );
+        assert_eq!(
+            mount_is_readonly_from(text, Path::new("/run/media/sam/Data")),
+            Some(false)
+        );
+        assert_eq!(
+            mount_is_readonly_from(text, Path::new("/not/mounted")),
+            None
+        );
+    }
+
+    #[test]
+    fn daemon_owned_mounts_never_selects_a_preexisting_mount() {
+        // B1: a pre-existing udisks2 mount under /run/media is never selected
+        // for unmount, even though it is live.
+        let ownership = MountOwnership::default();
+        let mounts = vec![
+            PathBuf::from("/run/omavrything/ntfs/sda1"),
+            PathBuf::from("/run/media/sam/Data"),
+        ];
+        assert_eq!(
+            daemon_owned_mounts(mounts, &ownership),
+            vec![PathBuf::from("/run/omavrything/ntfs/sda1")]
+        );
     }
 }

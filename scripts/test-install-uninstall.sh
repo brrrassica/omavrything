@@ -130,6 +130,17 @@ else
   bad "uninstall.sh does not remove the per-user plugin / CLI symlink"
 fi
 
+# --- M19: uninstall.sh never recurses into a live NTFS mount ----------------
+# The daemon mounts NTFS read-only under /run/omavrything/ntfs. The uninstaller
+# must unmount those first and remove the runtime dir with --one-file-system.
+if grep -q 'unmount_runtime_mounts' "$pkg/scripts/uninstall.sh" &&
+  grep -q -- '--one-file-system' "$pkg/scripts/uninstall.sh" &&
+  grep -q '/run/omavrything/' "$pkg/scripts/uninstall.sh"; then
+  ok "uninstall.sh unmounts the runtime mounts and never crosses them"
+else
+  bad "uninstall.sh does not guard against recursing into a live mount"
+fi
+
 # --- C11: doctor.sh prints a report and reflects the install state ----------
 # doctor.sh emits [fail] only when the daemon binary is absent (or present but
 # broken); every other line is [ ok ] or [warn], and it exits non-zero iff it

@@ -14,6 +14,8 @@ mod manager;
 mod ntfs;
 mod peer;
 mod polkit;
+mod udev;
+mod udisks;
 mod volumes;
 
 use std::ffi::CString;
@@ -440,10 +442,13 @@ fn run_startup(
     }
 
     if config.ntfs() {
-        let index = Arc::clone(&index);
-        let policy = Arc::clone(&policy);
+        let ownership = Arc::new(Mutex::new(ntfs::MountOwnership::load(
+            ntfs::default_ownership_path(),
+        )));
+        let startup_index = Arc::clone(&index);
+        let startup_policy = Arc::clone(&policy);
         spawn_thread("omavry-ntfs", CONTROL_STACK, move || {
-            run_ntfs_startup(index, policy)
+            run_ntfs_startup(startup_index, startup_policy, ownership)
         });
     }
 
@@ -796,21 +801,22 @@ fn contain_panic<T>(job: impl FnOnce() -> T) -> Result<T, ()> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).map_err(|_| ())
 }
 
-pub(crate) fn run_ntfs_startup(index: Arc<IndexManager>, policy: Arc<Mutex<ntfs::NtfsPolicy>>) {
+pub(crate) fn run_ntfs_startup(
+    index: Arc<IndexManager>,
+    policy: Arc<Mutex<ntfs::NtfsPolicy>>,
+    ownership: Arc<Mutex<ntfs::MountOwnership>>,
+) {
     // B10: reconcile the ownership state left by a SIGKILL or crash — unmount
     // stale daemon-created private mounts before indexing. This runs on the
     // NTFS startup thread, so it does not block the rest of startup, and a
     // failed unmount is non-fatal (B14): a stuck mount cannot put the daemon
     // into a restart loop.
     ntfs::reconcile_stale_mounts();
-    // M18 (B2): load the persisted mount-ownership state and reconcile it —
-    // entries for mounts that are no longer live are pruned, and a tracked
-    // mount that vanished while the daemon was down has its index entries
-    // dropped (B8). A mount that is live again is re-indexed below by the
-    // normal partition pass.
-    let ownership = Arc::new(Mutex::new(ntfs::MountOwnership::load(
-        ntfs::default_ownership_path(),
-    )));
+    // M18 (B2): the persisted mount-ownership state is loaded by the caller and
+    // shared with the hotplug monitor. Reconcile it here — entries for mounts
+    // that are no longer live are pruned, and a tracked mount that vanished
+    // while the daemon was down has its index entries dropped (B8). A mount
+    // that is live again is re-indexed below by the normal partition pass.
     {
         let mut o = ownership.lock().unwrap_or_else(|e| e.into_inner());
         if !o.is_empty() {
@@ -858,7 +864,12 @@ pub(crate) fn run_ntfs_startup(index: Arc<IndexManager>, policy: Arc<Mutex<ntfs:
         // and policy locks are reached through `unwrap_or_else(|e| e.into_inner())`
         // everywhere, so a lock poisoned by a contained panic stays usable.
         match contain_panic(|| {
-            ntfs::mount_index_and_remember_with_ownership(&index, &policy, &ownership, part)
+            ntfs::mount_index_and_remember_with_ownership(
+                index.as_ref(),
+                policy.as_ref(),
+                ownership.as_ref(),
+                part,
+            )
         }) {
             Ok(Ok(mount_point)) => info!(
                 device = %part.device.display(),
@@ -901,6 +912,17 @@ pub(crate) fn run_ntfs_startup(index: Arc<IndexManager>, policy: Arc<Mutex<ntfs:
         );
     });
     trim_heap();
+
+    // B4: start the hotplug monitor only after the startup pass has finished,
+    // so it cannot race the initial mount/index of a large volume. The monitor
+    // is idempotent (a static guard prevents a second instance when NTFS is
+    // toggled on again at runtime).
+    let hotplug_index = Arc::clone(&index);
+    let hotplug_policy = Arc::clone(&policy);
+    let hotplug_ownership = Arc::clone(&ownership);
+    spawn_thread("omavry-ntfs-hotplug", CONTROL_STACK, move || {
+        ntfs::run_hotplug_monitor(hotplug_index, hotplug_policy, hotplug_ownership)
+    });
 }
 
 /// Periodically write a snapshot of the index.

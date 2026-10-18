@@ -4,6 +4,31 @@ Notable changes to `omavrything`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0-rc10] — 2026-10-18
+
+### Added
+
+- **M19 mount correctness and hotplug.** NTFS mount and unmount commands are
+  now time-boxed, so a hung `mount`/`udisksctl` cannot wedge the daemon. Both
+  the udisks2 and private `ntfs3` paths mount `ro,nosuid,nodev,noexec`, and a
+  pre-existing writable mount is remounted read-only. A UUID-less volume now
+  uses its device basename for the private mount point instead of the shared
+  constant `volume`. The NTFS policy file is written atomically under a lock.
+  Mounting prefers the udisks2 D-Bus API through zbus 6, which returns the
+  mount point directly; `udisksctl` and the private read-only `ntfs3` mount are
+  fallbacks. A udev netlink monitor wakes the hotplug pass on block-device
+  add/remove/change, with a 30 s fallback and a 2 s mount-table poll if the
+  socket is unavailable. A remembered partition that appears is mounted and
+  indexed; a mount that disappears has its entries dropped.
+
+### Changed
+
+- **Version bumped to `0.2.0-rc10`.** The systemd unit now states
+  `PrivateMounts=no`/`PrivateTmp=no` explicitly to preserve the host mount
+  namespace, and the tmpfiles drop-in creates `/run/omavrything/ntfs` with the
+  service account's ownership. `uninstall.sh` falls back to `/proc/mounts` when
+  `findmnt` is unavailable.
+
 ## [0.2.0-rc9] — 2026-10-17
 
 ### Added

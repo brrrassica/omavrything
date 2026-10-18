@@ -208,10 +208,13 @@ impl Manager {
         // present; disabling it only records the preference (nothing is
         // unmounted).
         if key == "ntfs" && self.config.ntfs() {
+            let ownership = Arc::new(std::sync::Mutex::new(crate::ntfs::MountOwnership::load(
+                crate::ntfs::default_ownership_path(),
+            )));
             let index = Arc::clone(&self.index);
             let policy = Arc::clone(&self.policy);
             crate::spawn_thread("ntfs-startup", crate::CONTROL_STACK, move || {
-                crate::run_ntfs_startup(index, policy)
+                crate::run_ntfs_startup(index, policy, ownership)
             });
             self.index.touch();
         }

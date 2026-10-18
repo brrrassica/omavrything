@@ -64,6 +64,11 @@ IOWeight=50
 # be usable. The daemon still runs as a dedicated unprivileged user with a
 # two-capability bounding set, NoNewPrivileges, a syscall filter, and the
 # options below.
+#
+# M19: make the host-namespace decision explicit. Do not add
+# PrivateMounts=yes or any option that implies it.
+PrivateMounts=no
+PrivateTmp=no
 NoNewPrivileges=yes
 # ProtectKernelModules= and ProtectHostname= are also deliberately not set:
 # they mask /usr/lib/modules and make /proc/sys/kernel/hostname read-only
