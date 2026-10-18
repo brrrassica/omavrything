@@ -222,25 +222,38 @@ fi
 # snapshot under /var/lib/omavrything is the only persistent state, so
 # --keep-state preserves it (and the runtime dir is always removed).
 #
-# Diagnostics: the daemon does not unmount the private NTFS mounts it created
-# (a known defect, see plans/risks.md R13). A live mount under
-# /run/omavrything/ntfs would be recursed into by the `rm -rf` below, so log
-# what is still mounted before removing the directory.
-if command -v findmnt >/dev/null 2>&1; then
-  live_ntfs="$(findmnt -rn -o TARGET,SOURCE,FSTYPE,OPTIONS | grep '^/run/omavrything/ntfs' || true)"
-  if [[ -n "$live_ntfs" ]]; then
-    warn "live NTFS mounts under /run/omavrything (the daemon does NOT unmount these):"
-    printf '%s\n' "$live_ntfs" | sed 's/^/       /'
-  fi
-fi
+# Safety: the daemon mounts NTFS volumes read-only under
+# /run/omavrything/ntfs/<uuid>. A plain `rm -rf /run/omavrything` recurses into
+# a live mount: on a read-only mount that fails noisily, and on a writable one
+# it would delete the user's files. Unmount every mount under the runtime dir
+# first, then remove it with --one-file-system so a mount that could not be
+# unmounted is still never crossed.
+unmount_runtime_mounts() {
+  command -v findmnt >/dev/null 2>&1 || return 0
+  local target
+  # Deepest first, so a nested mount is unmounted before its parent.
+  while IFS= read -r target; do
+    [[ -n "$target" ]] || continue
+    log "unmounting $target"
+    if ! umount "$target" 2>/dev/null; then
+      umount -l "$target" 2>/dev/null ||
+        warn "could not unmount $target; it will be left in place"
+    fi
+  done < <(findmnt -rn -o TARGET | grep '^/run/omavrything/' | sort -r)
+}
+unmount_runtime_mounts
+
 if [[ "$keep_state" == 1 ]]; then
   log "keeping /var/lib/omavrything (index snapshot)"
-  rm -rf /run/omavrything
 else
   log "removing runtime and state directories"
-  rm -rf /run/omavrything
   rm -rf /var/lib/omavrything
 fi
+# The runtime dir is always removed. --one-file-system guarantees a mount that
+# could not be unmounted is never crossed; a leftover mount makes rm report
+# EBUSY on the mount point, which is expected and non-fatal.
+rm -rf --one-file-system /run/omavrything ||
+  warn "could not fully remove /run/omavrything (a mount may still be present)"
 
 # 7. Remove the dedicated user and group created by the sysusers drop-in.
 if [[ "$keep_user" == 1 ]]; then

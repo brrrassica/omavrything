@@ -41,6 +41,14 @@ Notable changes to `omavrything`. The format follows
 
 ### Fixed
 
+- **`uninstall.sh` no longer recurses into a live NTFS mount.** The script
+  removed `/run/omavrything` with a plain `rm -rf`, which descended into any
+  daemon-created read-only mount under `/run/omavrything/ntfs/<uuid>`: on a
+  read-only mount that produced a flood of failed-removal errors, and on a
+  writable mount it would have deleted the user's files. The script now
+  unmounts every mount under the runtime directory first (with a lazy fallback)
+  and removes the directory with `rm -rf --one-file-system`, so a mount that
+  could not be unmounted is still never crossed.
 - **Files on a privately mounted NTFS volume can be opened again.** The
   systemd sandbox (`ProtectSystem=strict`/`ProtectHome`) gives the daemon a
   private mount namespace, so the read-only `ntfs3` fallback mount at
