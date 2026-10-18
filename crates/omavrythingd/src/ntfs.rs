@@ -645,6 +645,11 @@ pub fn default_ownership_path() -> PathBuf {
 
 /// M18 (B8): drop the index entries of a mount whose mount point is no longer
 /// live. Returns whether entries were dropped.
+///
+/// This must remove the root as well as its records. `Index::remove` only
+/// tombstones the records; leaving the root in `Index::roots` makes the volume
+/// still report `indexed` and makes the hotplug monitor skip re-indexing when
+/// the volume is mounted again.
 pub fn drop_mount_entries(index: &IndexManager, mount_point: &Path) -> bool {
     let still_there = existing_mount_points_anywhere()
         .iter()
@@ -652,11 +657,11 @@ pub fn drop_mount_entries(index: &IndexManager, mount_point: &Path) -> bool {
     if still_there {
         return false;
     }
-    let dropped = index.with_index_mut(|idx| idx.remove(mount_point));
+    let dropped = index.with_index_mut(|idx| idx.remove_root(mount_point));
     if dropped {
         info!(
             mount_point = %mount_point.display(),
-            "ntfs: mount disappeared; index entries dropped"
+            "ntfs: mount disappeared; root and index entries dropped"
         );
     }
     dropped
@@ -1243,8 +1248,8 @@ mod tests {
 
     #[test]
     fn drop_mount_entries_removes_a_vanished_mounts_subtree() {
-        // M18 (B8): when a mount disappears, its index entries are dropped;
-        // when it is still live, nothing is touched.
+        // M18 (B8): when a mount disappears, its root and index entries are
+        // dropped; when it is still live, nothing is touched.
         let mut index = Index::new();
         let mp = Path::new("/run/omavrything/ntfs/vol");
         index.add_root(mp, FsKind::Ntfs);
@@ -1259,6 +1264,14 @@ mod tests {
                 .with_index_mut(|idx| idx.find(&mp.join("hello.txt")))
                 .is_none()
         );
+        // The root must be gone too, otherwise the volume still reports
+        // `indexed` and the hotplug monitor skips the remount.
+        assert!(
+            manager
+                .roots()
+                .iter()
+                .all(|root| Path::new(&root.path) != mp)
+        );
 
         // A mount point that is still live (any real mount, e.g. /) is kept.
         let mut index = Index::new();
@@ -1266,6 +1279,42 @@ mod tests {
         index.insert(Path::new("/etc-hosts-placeholder"), false, 1, 0);
         let manager = IndexManager::new(index, Vec::new(), None);
         assert!(!drop_mount_entries(&manager, Path::new("/")));
+    }
+
+    #[test]
+    fn a_remounted_volume_is_reindexed_after_drop_mount_entries() {
+        // Regression: unmounting drops the root, so a remount is not skipped
+        // by the hotplug monitor's `index.roots()` check.
+        let mut index = Index::new();
+        let mp = Path::new("/run/omavrything/ntfs/vol");
+        index.add_root(mp, FsKind::Ntfs);
+        index.insert(&mp.join("cat-left-right.mp4"), false, 1, 0);
+        let manager = IndexManager::new(index, Vec::new(), None);
+
+        assert!(drop_mount_entries(&manager, mp));
+        assert!(
+            manager
+                .roots()
+                .iter()
+                .all(|root| Path::new(&root.path) != mp)
+        );
+
+        // A remount re-adds the root and the file.
+        manager.with_index_mut(|idx| {
+            idx.add_root(mp, FsKind::Ntfs);
+            idx.insert(&mp.join("cat-left-right.mp4"), false, 1, 0);
+        });
+        assert!(
+            manager
+                .roots()
+                .iter()
+                .any(|root| Path::new(&root.path) == mp)
+        );
+        assert!(
+            manager
+                .with_index_mut(|idx| idx.find(&mp.join("cat-left-right.mp4")))
+                .is_some()
+        );
     }
 
     #[test]

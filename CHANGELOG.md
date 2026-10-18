@@ -29,6 +29,14 @@ Notable changes to `omavrything`. The format follows
   service account's ownership. `uninstall.sh` falls back to `/proc/mounts` when
   `findmnt` is unavailable.
 
+### Fixed
+
+- **NTFS remount re-indexing.** Unmounting a volume now removes its root from
+  the index, not just its records. Previously the stale root made the volume
+  still report `indexed` with no searchable entries, and the hotplug monitor
+  skipped re-indexing when the volume was mounted again. A remount now
+  re-indexes and the files are searchable.
+
 ## [0.2.0-rc9] — 2026-10-17
 
 ### Added
