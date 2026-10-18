@@ -74,8 +74,11 @@ MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 # @system-service covers the daemon and its helper processes (blkid, udisksctl);
 # @mount is needed for the read-only ntfs3 fallback mount.
-# @setns is needed for the `nsenter -t 1 -m` host-namespace mount.
-SystemCallFilter=@system-service @mount @setns
+# `setns` is a bare syscall, not an @group: there is no @setns group, and
+# systemd silently ignores an unknown group, which would leave `nsenter -t 1 -m`
+# blocked and the host-namespace mount falling back to the daemon's private
+# namespace (where the host mount table cannot see it).
+SystemCallFilter=@system-service @mount setns
 SystemCallErrorNumber=EPERM
 ReadWritePaths=/run/omavrything /var/lib/omavrything
 UMask=0027

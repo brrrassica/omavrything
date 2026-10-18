@@ -41,6 +41,14 @@ Notable changes to `omavrything`. The format follows
 
 ### Fixed
 
+- **NTFS volumes are indexed again (the `@setns` syscall-filter typo).** The
+  unit's `SystemCallFilter` listed `@setns`, which is not a systemd syscall
+  group; systemd silently ignored it, so the seccomp filter blocked `setns`,
+  `nsenter -t 1 -m` failed, and the read-only mount fell back to the daemon's
+  private namespace. The host mount table (`/proc/1/mounts`) then could not see
+  the mount, so every NTFS volume failed with "mount ... vanished before the
+  read-only check" and was never indexed. The filter now names the bare `setns`
+  syscall, so the host-namespace mount succeeds and NTFS files are searchable.
 - **`uninstall.sh` no longer recurses into a live NTFS mount.** The script
   removed `/run/omavrything` with a plain `rm -rf`, which descended into any
   daemon-created read-only mount under `/run/omavrything/ntfs/<uuid>`: on a
