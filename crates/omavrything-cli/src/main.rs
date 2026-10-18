@@ -134,12 +134,23 @@ fn search(query: &str, json: bool) -> i32 {
         }
     };
 
-    let response = match client.search(query, 50, 0) {
-        Ok(response) => response,
-        Err(err) => {
-            eprintln!("search failed: {err}");
-            return 1;
+    // The daemon evicts the index when idle; a query while evicted returns
+    // `state: "loading"` and starts a background materialization. Retry briefly
+    // so the command returns results instead of a misleading empty page,
+    // matching the overlay's reload behavior.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let response = loop {
+        let response = match client.search(query, 50, 0) {
+            Ok(response) => response,
+            Err(err) => {
+                eprintln!("search failed: {err}");
+                return 1;
+            }
+        };
+        if !response.is_loading() || std::time::Instant::now() >= deadline {
+            break response;
         }
+        std::thread::sleep(std::time::Duration::from_millis(200));
     };
 
     if let Some(err) = &response.error {

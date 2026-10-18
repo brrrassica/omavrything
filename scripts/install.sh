@@ -87,12 +87,19 @@ fi
 # OMARCHY_PATH is required by the `omarchy` dispatcher and its subcommands
 # (e.g. `omarchy plugin enable` fails with "OMARCHY_PATH is not set" without
 # it); the user's login shell exports it, but `runuser` does not inherit it.
+#
+# A UTF-8 locale is set explicitly: without one, Qt (omarchy-shell) prints a
+# locale warning to stdout, which `omarchy plugin enable` captures and compares
+# against "ok", so the enable spuriously fails even though the plugin is
+# enabled.
 as_user() {
   [[ -n "$target_user" ]] || return 1
   runuser -u "$target_user" -- env \
     HOME="$user_home" \
     USER="$target_user" \
     LOGNAME="$target_user" \
+    LANG="C.UTF-8" \
+    LC_ALL="C.UTF-8" \
     XDG_RUNTIME_DIR="/run/user/$user_uid" \
     DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$user_uid/bus" \
     OMARCHY_PATH="/usr/share/omarchy" \

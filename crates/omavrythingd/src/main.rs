@@ -170,6 +170,7 @@ fn main() {
         Arc::clone(&index),
         Arc::clone(&config),
         args.snapshot.clone(),
+        args.socket.clone(),
     );
 
     if args.dbus {
@@ -1011,6 +1012,7 @@ fn install_shutdown_handler(
     index: Arc<IndexManager>,
     config: Arc<SharedConfig>,
     snapshot: Option<PathBuf>,
+    socket: PathBuf,
 ) {
     let mut fds = [0i32; 2];
     // SAFETY: `fds` is a valid 2-element array for `pipe`.
@@ -1071,6 +1073,14 @@ fn install_shutdown_handler(
         // in place rather than blocking shutdown (B14). The signal handler
         // itself stays async-signal-safe: all work happens on this thread.
         ntfs::unmount_all_private();
+        // Remove the socket so a stopped daemon leaves no stale socket behind.
+        // The unit no longer uses RuntimeDirectory= (systemd sets that up
+        // through a bind mount, which would give the service its own mount
+        // namespace and hide its NTFS mounts from the desktop), so systemd does
+        // not clean the runtime directory on stop; the daemon must remove its
+        // own socket. A stale socket would make clients hang or fail
+        // confusingly.
+        let _ = std::fs::remove_file(&socket);
         std::process::exit(0);
     });
 }
