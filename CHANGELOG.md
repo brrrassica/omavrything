@@ -30,6 +30,15 @@ Notable changes to `omavrything`. The format follows
   and counted in status. Traversal of network filesystems is time-boxed so a
   stalled mount cannot block a scan.
 
+### Changed
+
+- **`zbus` upgraded from 5 to 6.** The 5.x `zbus_names`, `zvariant`, and
+  `zvariant_derive` crates are unmaintained (RUSTSEC-2026-0370/0371/0372) and
+  were merged into `zbus` 6.0.0, so `cargo audit` failed the CI job. The
+  workspace now depends on `zbus` 6 with the `tokio`, `proxy`, and `service`
+  features, and the polkit subject uses the renamed `zbus::Variant` (formerly
+  `zbus::zvariant::Value`). The workspace MSRV rises to 1.89 (zbus 6's minimum).
+
 ### Fixed
 
 - **Files on a privately mounted NTFS volume can be opened again.** The
