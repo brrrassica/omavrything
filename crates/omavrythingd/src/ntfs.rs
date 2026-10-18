@@ -208,7 +208,12 @@ fn host_mount_table() -> io::Result<String> {
 /// run directly, which preserves the previous behaviour.
 fn run_in_host_ns(prog: &str, args: &[&str]) -> io::Result<std::process::Output> {
     let mut cmd = Command::new("nsenter");
-    cmd.arg("-t").arg("1").arg("-m").arg("--").arg(prog).args(args);
+    cmd.arg("-t")
+        .arg("1")
+        .arg("-m")
+        .arg("--")
+        .arg(prog)
+        .args(args);
     match cmd.output() {
         Ok(output) if output.status.success() => return Ok(output),
         // `nsenter` ran but the command failed (or the daemon is already in the
