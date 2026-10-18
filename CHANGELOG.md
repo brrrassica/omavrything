@@ -105,6 +105,15 @@ Notable changes to `omavrything`. The format follows
   failure (for example an unwritable snapshot path) still logged
   `index evicted (idle)` and retried every ~1.2 s; the evictor now logs a
   warning and backs off for 30 s instead of spinning.
+- **The installer and package now create `/var/lib/omavrything`.** The daemon
+  runs as the unprivileged `omavrything` user and cannot create a directory
+  under root-owned `/var/lib`, so the snapshot write and every `SetConfig`
+  (which persists the state config) failed with `Permission denied`. The
+  tmpfiles drop-in now creates `/var/lib/omavrything` with the daemon's
+  ownership, and the installer and the pacman scriptlet run
+  `systemd-tmpfiles --create`. This also lets the daemon write a snapshot on
+  shutdown and warm-start from it, so the first eviction after a restart no
+  longer waits for a full cold scan.
 
 ## [0.2.0-rc8] — 2026-10-17
 

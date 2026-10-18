@@ -167,11 +167,13 @@ log "creating the omavrything user"
 if ! systemd-sysusers; then
   die "systemd-sysusers failed; the omavrything user/group was not created"
 fi
-# Create /run/omavrything now (the unit no longer uses RuntimeDirectory=, which
-# would give the service its own mount namespace and hide its NTFS mounts from
-# the desktop); tmpfiles.d recreates it on every boot.
+# Create /run/omavrything and /var/lib/omavrything now (the unit no longer uses
+# RuntimeDirectory=/StateDirectory=, which would give the service its own mount
+# namespace and hide its NTFS mounts from the desktop); tmpfiles.d recreates
+# them on every boot. /var/lib/omavrything holds the index snapshot and the
+# state config, so the daemon (running as `omavrything`) can write both.
 if ! systemd-tmpfiles --create /usr/lib/tmpfiles.d/omavrything.conf; then
-  die "systemd-tmpfiles failed; /run/omavrything was not created"
+  die "systemd-tmpfiles failed; /run/omavrything or /var/lib/omavrything was not created"
 fi
 systemctl daemon-reload >/dev/null 2>&1 || true
 
