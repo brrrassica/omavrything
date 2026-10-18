@@ -213,6 +213,7 @@ impl Manager {
             crate::spawn_thread("ntfs-startup", crate::CONTROL_STACK, move || {
                 crate::run_ntfs_startup(index, policy)
             });
+            self.index.touch();
         }
         // F10: apply the candidate-index preference to the running index so the
         // change takes effect without a restart (disabling reclaims its memory).
@@ -220,6 +221,7 @@ impl Manager {
             let enabled = self.config.candidate_index();
             self.index
                 .with_index_mut(|index| index.set_candidate_enabled(enabled));
+            self.index.touch();
         }
         Ok(())
     }
@@ -307,6 +309,7 @@ impl Manager {
             .await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
             .map_err(zbus::fdo::Error::Failed)?;
+            self.index.touch();
             let entries = self.index.len() as u64;
             let _ = self.events.send(IndexEvent::Changed { entries });
             let _ = self.config.remember_volume(&device.to_string_lossy());
@@ -363,6 +366,7 @@ impl Manager {
         .await
         .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
         .map_err(zbus::fdo::Error::Failed)?;
+        self.index.touch();
 
         let entries = self.index.len() as u64;
         let _ = self.events.send(IndexEvent::Changed { entries });
@@ -392,6 +396,7 @@ impl Manager {
         // The volume is gone: stop serving its records and forget the root.
         self.index
             .with_index_mut(|idx| idx.remove_root(&mount_point));
+        self.index.touch();
         let mut ownership = ntfs::MountOwnership::load(ntfs::default_ownership_path());
         let _ = ownership.forget(&mount_point);
         let _ = self.config.forget_volume(&device.to_string_lossy());
@@ -484,6 +489,9 @@ async fn run_rescan(
     .unwrap_or((0, 0));
 
     config.set_scanning(false);
+    // A rescan is user-driven (the control interface or a volume mount), so it
+    // counts as activity and restarts the idle-eviction timer.
+    index.touch();
     let entries = index.len() as u64;
     let _ = events.send(IndexEvent::ScanProgress {
         phase: "done".into(),

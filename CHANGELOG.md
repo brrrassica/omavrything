@@ -91,6 +91,20 @@ Notable changes to `omavrything`. The format follows
   to return nothing. The overlay's reload retry is spaced to 500 ms to match.
   The smoke test's evicted-image check now retries the search until the marker
   appears, matching the new loading-then-served contract.
+- **Background indexing no longer resets the idle-eviction timer.**
+  `IndexManager::with_index_mut` used to call `touch()`, so NTFS/volume
+  indexing, snapshot encoding, and materialization all restarted the idle
+  window and delayed eviction until the last background pass finished. Only
+  user-driven work (a query, or a mutation requested through the control
+  interface) now touches the timer; the D-Bus mount/unmount/rescan/config
+  handlers call `touch()` explicitly. This is the same principle rc8 applied
+  to filesystem events.
+- **A failed eviction is no longer reported as a successful one.**
+  `IndexManager::evict` now returns whether the index actually became evicted,
+  and `evict_if_idle` propagates that result. Previously a snapshot write
+  failure (for example an unwritable snapshot path) still logged
+  `index evicted (idle)` and retried every ~1.2 s; the evictor now logs a
+  warning and backs off for 30 s instead of spinning.
 
 ## [0.2.0-rc8] — 2026-10-17
 

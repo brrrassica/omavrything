@@ -924,6 +924,12 @@ fn run_evictor(index: Arc<IndexManager>, config: Arc<SharedConfig>) {
         if index.evict_if_idle(idle) {
             info!(idle_secs = idle, "index evicted (idle)");
             trim_heap();
+        } else if !index.is_evicted() && index.idle_secs(idle) >= idle {
+            // The idle deadline passed but the eviction failed (for example the
+            // snapshot path is not writable). Back off instead of retrying every
+            // second, which would spin the evictor and spam the log.
+            warn!(idle_secs = idle, "index eviction failed; retrying in 30 s");
+            std::thread::sleep(Duration::from_secs(30));
         }
     }
 }

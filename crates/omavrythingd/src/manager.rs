@@ -90,8 +90,14 @@ impl IndexManager {
         self.loading.store(false, Ordering::Relaxed);
     }
 
-    /// Record activity, resetting the idle-eviction timer.
-    fn touch(&self) {
+    /// Record user activity, resetting the idle-eviction timer.
+    ///
+    /// Only user-driven work should call this: a query, or a mutation the user
+    /// requested through the control interface. Background indexing, snapshot
+    /// writes, and materialization must not, because they are not user
+    /// activity and touching on them starves the evictor exactly like
+    /// filesystem events did before rc8.
+    pub fn touch(&self) {
         self.last_activity
             .store(self.start.elapsed().as_millis() as u64, Ordering::Relaxed);
     }
@@ -189,8 +195,12 @@ impl IndexManager {
 
     /// Run `f` with mutable access to the owned index, materializing it (and
     /// folding the delta) if the index is evicted.
+    ///
+    /// This does **not** reset the idle-eviction timer: it is used by
+    /// background indexing, snapshot encoding, and materialization, none of
+    /// which are user activity. User-driven callers must call [`touch`] at
+    /// their entry point.
     pub fn with_index_mut<R>(&self, f: impl FnOnce(&mut Index) -> R) -> R {
-        self.touch();
         let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
         if matches!(&*state, State::Image { .. }) {
             let owned = self.materialize(&state);
@@ -219,15 +229,16 @@ impl IndexManager {
         index
     }
 
-    /// Evict the owned index to a memory-mapped snapshot. A no-op when already
-    /// evicted or when there is no snapshot path.
-    pub fn evict(&self) {
+    /// Evict the owned index to a memory-mapped snapshot. Returns whether the
+    /// index is now evicted. A no-op returning `false` when already evicted,
+    /// when there is no snapshot path, or when the snapshot cannot be written.
+    pub fn evict(&self) -> bool {
         let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
         let State::Owned(index) = &*state else {
-            return;
+            return false;
         };
         let Some(path) = &self.snapshot_path else {
-            return;
+            return false;
         };
         let ids = self
             .identities
@@ -236,24 +247,25 @@ impl IndexManager {
             .clone();
         let bytes = snapshot::encode(index, &ids);
         if snapshot::write_atomic(&bytes, path).is_err() {
-            return;
+            return false;
         }
         let Ok(file) = File::open(path) else {
-            return;
+            return false;
         };
         // SAFETY: the snapshot is written atomically (temp file + rename), so a
         // mapped file is never mutated in place.
         let Ok(mmap) = (unsafe { Mmap::map(&file) }) else {
-            return;
+            return false;
         };
         let Ok(image) = IndexImage::from_bytes(&mmap[..]) else {
-            return;
+            return false;
         };
         let by_path = PathIndex::build(image.records(), image.paths());
         *state = State::Image {
             mmap: Arc::new(mmap),
             by_path,
         };
+        true
     }
 
     /// Seconds since the last query or mutation, capped at `cap`. Used by the
@@ -264,9 +276,10 @@ impl IndexManager {
         now.saturating_sub(last).min(cap.saturating_mul(1000)) / 1000
     }
 
-    /// Evict the index if no query or mutation has occurred for `idle_secs`.
-    /// Returns whether it evicted. A no-op when `idle_secs` is 0 or the index is
-    /// already evicted.
+    /// Evict the index if no user activity has occurred for `idle_secs`.
+    /// Returns whether the index is now evicted. A no-op returning `false` when
+    /// `idle_secs` is 0, the index is already evicted, the idle deadline has
+    /// not passed, or the snapshot cannot be written.
     pub fn evict_if_idle(&self, idle_secs: u64) -> bool {
         if idle_secs == 0 || self.is_evicted() {
             return false;
@@ -276,8 +289,7 @@ impl IndexManager {
         if now.saturating_sub(last) < idle_secs.saturating_mul(1000) {
             return false;
         }
-        self.evict();
-        true
+        self.evict()
     }
 
     /// Reclaim slack in the owned index, if it is resident. A no-op when the
@@ -493,6 +505,58 @@ mod tests {
             0,
             "a filesystem event must not count as activity"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn with_index_mut_does_not_reset_the_idle_timer() {
+        // Background indexing, snapshot encoding, and materialization all go
+        // through `with_index_mut`; none of them are user activity, so none of
+        // them may starve the evictor.
+        let dir = temp_dir("mut-touch");
+        let snap = dir.join("index.snapshot");
+        let manager = IndexManager::new(sample(), Vec::new(), Some(snap));
+
+        manager.with_index_mut(|index| index.len());
+
+        assert_eq!(
+            manager.last_activity.load(Ordering::Relaxed),
+            0,
+            "a background mutation must not count as activity"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn evict_reports_failure_when_the_snapshot_cannot_be_written() {
+        let dir = temp_dir("evict-fail");
+        // Make the snapshot's parent a regular file so `create_dir_all` fails.
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let snap = blocker.join("index.snapshot");
+        let manager = IndexManager::new(sample(), Vec::new(), Some(snap));
+
+        assert!(!manager.evict(), "a failed write must not report eviction");
+        assert!(!manager.is_evicted());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn evict_if_idle_returns_the_real_eviction_result() {
+        let dir = temp_dir("evict-result");
+        let snap = dir.join("index.snapshot");
+        let manager = IndexManager::new(sample(), Vec::new(), Some(snap));
+
+        // The manager starts with `last_activity = 0`; wait past the deadline.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert!(manager.evict_if_idle(1));
+        assert!(manager.is_evicted());
+
+        // A second call is a no-op: the index is already evicted.
+        assert!(!manager.evict_if_idle(1));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
