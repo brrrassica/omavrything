@@ -32,6 +32,16 @@ Notable changes to `omavrything`. The format follows
 
 ### Fixed
 
+- **Files on a privately mounted NTFS volume can be opened again.** The
+  systemd sandbox (`ProtectSystem=strict`/`ProtectHome`) gives the daemon a
+  private mount namespace, so the read-only `ntfs3` fallback mount at
+  `/run/omavrything/ntfs/<uuid>` existed only inside the daemon: the desktop
+  saw an empty directory and `xdg-open` on an indexed path failed. The daemon
+  now mounts, remounts, and unmounts through `nsenter -t 1 -m` (with a direct
+  fallback when `nsenter` is unavailable or the namespace is already shared)
+  and reads the host mount table (`/proc/1/mounts`) for every mount check, so
+  the mount and the index paths agree with what the user's session sees. The
+  unit allows mount-namespace `setns` (`RestrictNamespaces=mnt`, `@setns`).
 - **Removable media is now indexed only through the NTFS MFT path (ADR-018).**
   The generic walker no longer descends into `/run/media` (it is filtered from
   the walk roots and pruned in the walk), so a udisks2 NTFS mount is no longer

@@ -84,12 +84,11 @@ fn remount_readonly(mount_point: &Path) -> Result<(), String> {
         command = "mount -o remount,ro <mount_point>",
         "ntfs: remounting a writable mount read-only"
     );
-    let output = Command::new("mount")
-        .arg("-o")
-        .arg("remount,ro")
-        .arg(mount_point)
-        .output()
-        .map_err(|e| e.to_string())?;
+    let output = run_in_host_ns(
+        "mount",
+        &["-o", "remount,ro", &mount_point.to_string_lossy()],
+    )
+    .map_err(|e| e.to_string())?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         warn!(
@@ -108,7 +107,7 @@ fn remount_readonly(mount_point: &Path) -> Result<(), String> {
 /// The filesystem type and mount options for `device` from `/proc/mounts`, as
 /// `(fs_type, options)`. Used only for diagnostics.
 fn mount_state(device: &Path) -> Option<(String, String)> {
-    let mounts = std::fs::read_to_string("/proc/mounts").ok()?;
+    let mounts = host_mount_table().ok()?;
     let dev = device.to_string_lossy();
     for line in mounts.lines() {
         let mut fields = line.split_whitespace();
@@ -126,7 +125,7 @@ fn mount_state(device: &Path) -> Option<(String, String)> {
 /// The mount points of daemon-created private NTFS mounts (under
 /// [`PRIVATE_MOUNT_ROOT`]) that are currently live, from `/proc/mounts`.
 pub fn private_mounts() -> Vec<PathBuf> {
-    let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else {
+    let Ok(mounts) = host_mount_table() else {
         return Vec::new();
     };
     mounts
@@ -148,7 +147,7 @@ pub fn private_mounts() -> Vec<PathBuf> {
 /// indexed, so a forced close or power loss cannot set a dirty bit or lose
 /// data through the daemon.
 pub fn mount_is_readonly(mount_point: &Path) -> Option<bool> {
-    let mounts = std::fs::read_to_string("/proc/mounts").ok()?;
+    let mounts = host_mount_table().ok()?;
     let target = mount_point.to_string_lossy();
     for line in mounts.lines() {
         let mut fields = line.split_whitespace();
@@ -170,7 +169,7 @@ fn readonly_from_options(options: &str) -> bool {
 
 /// The mount point of `device` if it is already mounted, from `/proc/mounts`.
 pub fn existing_mount_point(device: &Path) -> Option<PathBuf> {
-    let mounts = std::fs::read_to_string("/proc/mounts").ok()?;
+    let mounts = host_mount_table().ok()?;
     let dev = device.to_string_lossy();
     for line in mounts.lines() {
         let mut fields = line.split_whitespace();
@@ -181,6 +180,45 @@ pub fn existing_mount_point(device: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// The mount table of the **host** mount namespace (`/proc/1/mounts`), falling
+/// back to the daemon's own `/proc/mounts`.
+///
+/// The systemd unit sandboxes the daemon with `ProtectSystem=strict` /
+/// `ProtectHome`, which gives the service a private mount namespace. A mount
+/// the daemon creates exists only in that namespace, so the desktop could not
+/// open the files it indexes. Mounting therefore happens in the host namespace
+/// (see [`run_in_host_ns`]), and every mount-table read must also look at the
+/// host namespace rather than the daemon's own.
+fn host_mount_table() -> io::Result<String> {
+    match std::fs::read_to_string("/proc/1/mounts") {
+        Ok(text) => Ok(text),
+        Err(err) => std::fs::read_to_string("/proc/mounts").map_err(|_| err),
+    }
+}
+
+/// Run `prog` with `args` in the host (PID 1) mount namespace, so a mount the
+/// daemon creates is visible to the desktop.
+///
+/// The systemd sandbox gives the daemon its own mount namespace, so a plain
+/// `mount` would be invisible to the user's session. `nsenter -t 1 -m` enters
+/// the host namespace; when that is unavailable (no `nsenter`, or the daemon
+/// lacks the privilege to enter it — e.g. a user-run daemon), the command is
+/// run directly, which preserves the previous behaviour.
+fn run_in_host_ns(prog: &str, args: &[&str]) -> io::Result<std::process::Output> {
+    let mut cmd = Command::new("nsenter");
+    cmd.arg("-t").arg("1").arg("-m").arg("--").arg(prog).args(args);
+    match cmd.output() {
+        Ok(output) if output.status.success() => return Ok(output),
+        // `nsenter` ran but the command failed (or the daemon is already in the
+        // host namespace and the command failed for its own reason): retry
+        // directly so the real error is reported.
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    Command::new(prog).args(args).output()
 }
 
 /// Decode the octal escapes used by `/proc/mounts` (`\040` space, `\011` tab,
@@ -265,15 +303,18 @@ fn mount_via_ntfs3(device: &Path, uuid: Option<&str>) -> Result<PathBuf, String>
         command = "mount -t ntfs3 -o ro <device> <mount_point>",
         "ntfs: attempting private ntfs3 mount (daemon-created)"
     );
-    let output = Command::new("mount")
-        .arg("-t")
-        .arg("ntfs3")
-        .arg("-o")
-        .arg("ro")
-        .arg(device)
-        .arg(&mount_point)
-        .output()
-        .map_err(|e| e.to_string())?;
+    let output = run_in_host_ns(
+        "mount",
+        &[
+            "-t",
+            "ntfs3",
+            "-o",
+            "ro",
+            &device.to_string_lossy(),
+            &mount_point.to_string_lossy(),
+        ],
+    )
+    .map_err(|e| e.to_string())?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         warn!(
@@ -311,10 +352,8 @@ fn still_mounted(mount_point: &Path) -> bool {
 /// unmount is logged with its mount point and reported (never fatal, B14).
 fn unmount_mount_point(mount_point: &Path) -> bool {
     for attempt in 1..=BUSY_UNMOUNT_RETRIES {
-        let ok = Command::new("umount")
-            .arg(mount_point)
-            .status()
-            .map(|s| s.success())
+        let ok = run_in_host_ns("umount", &[&mount_point.to_string_lossy()])
+            .map(|o| o.status.success())
             .unwrap_or(false);
         if ok && !still_mounted(mount_point) {
             return true;
@@ -326,11 +365,8 @@ fn unmount_mount_point(mount_point: &Path) -> bool {
         );
         std::thread::sleep(BUSY_UNMOUNT_BACKOFF);
     }
-    let lazy = Command::new("umount")
-        .arg("-l")
-        .arg(mount_point)
-        .status()
-        .map(|s| s.success())
+    let lazy = run_in_host_ns("umount", &["-l", &mount_point.to_string_lossy()])
+        .map(|o| o.status.success())
         .unwrap_or(false);
     if lazy && !still_mounted(mount_point) {
         info!(
@@ -490,7 +526,7 @@ impl MountOwnership {
 /// ones. Used by [`MountOwnership::reconcile`] so pre-existing (udisks2) mounts
 /// stay tracked.
 fn existing_mount_points_anywhere() -> Vec<PathBuf> {
-    let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else {
+    let Ok(mounts) = host_mount_table() else {
         return Vec::new();
     };
     mounts

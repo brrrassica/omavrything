@@ -249,8 +249,13 @@ pub fn mount_generic(device: &Path) -> Result<PathBuf, String> {
 
 /// The mount point of `device` from `/proc/mounts`, if mounted.
 pub fn existing_mount_point(device: &Path) -> Option<PathBuf> {
-    mounts::read_mounts()
-        .unwrap_or_default()
+    // The daemon may run in a private mount namespace (systemd sandboxing), so
+    // its own /proc/mounts hides the mounts it created in the host namespace.
+    // Read the host table first.
+    let text = std::fs::read_to_string("/proc/1/mounts")
+        .or_else(|_| std::fs::read_to_string("/proc/mounts"))
+        .ok()?;
+    mounts::parse_mounts(&text)
         .into_iter()
         .find(|m| Path::new(&m.source) == device)
         .map(|m| m.mount_point)
