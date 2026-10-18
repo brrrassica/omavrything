@@ -24,3 +24,6 @@ criterion = { workspace = true }
 name = "search"
 harness = false
 test = false
+
+[lints]
+workspace = true

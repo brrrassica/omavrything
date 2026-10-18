@@ -138,6 +138,7 @@ rm -f /usr/bin/omavrythingd
 rm -f /usr/bin/omavry
 rm -f /usr/lib/systemd/system/omavrythingd.service
 rm -f /usr/lib/sysusers.d/omavrything.conf
+rm -f /usr/lib/tmpfiles.d/omavrything.conf
 rm -f /usr/share/dbus-1/system.d/tech.alatcerdas.omavrything.conf
 rm -f /usr/share/polkit-1/actions/tech.alatcerdas.omavrything.policy
 # Pre-rename (<= 0.1.4) bus/polkit names, so an upgrade from an old install

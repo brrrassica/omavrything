@@ -41,14 +41,23 @@ Notable changes to `omavrything`. The format follows
 
 ### Fixed
 
-- **NTFS volumes are indexed again (the `@setns` syscall-filter typo).** The
-  unit's `SystemCallFilter` listed `@setns`, which is not a systemd syscall
-  group; systemd silently ignored it, so the seccomp filter blocked `setns`,
-  `nsenter -t 1 -m` failed, and the read-only mount fell back to the daemon's
-  private namespace. The host mount table (`/proc/1/mounts`) then could not see
-  the mount, so every NTFS volume failed with "mount ... vanished before the
-  read-only check" and was never indexed. The filter now names the bare `setns`
-  syscall, so the host-namespace mount succeeds and NTFS files are searchable.
+- **NTFS volumes mount, index, search, and open again.** The earlier
+  host-namespace mount attempt (`nsenter -t 1 -m`) could never work: a
+  non-root daemon cannot open `/proc/1/ns/mnt` (it requires ptrace access to a
+  root process), so every mount fell back to the daemon's sandboxed mount
+  namespace, the host mount table could not see it, and each volume failed with
+  "mount ... vanished before the read-only check". The daemon now mounts in its
+  own namespace and reads `/proc/mounts` again — and the unit no longer gives
+  the service a private mount namespace at all: the filesystem-view options
+  (`ProtectSystem=`, `ProtectHome=`, `PrivateTmp=`, `ProtectKernelTunables=`,
+  `ProtectKernelLogs=`, `ProtectControlGroups=`, `ReadWritePaths=`) and the
+  bind-mount options (`ProtectKernelModules=`, `ProtectHostname=`,
+  `RuntimeDirectory=`, `StateDirectory=`) each create one, so they are dropped
+  and the read-only `ntfs3` mount lands in the host namespace where the desktop
+  can open the indexed files. `/run/omavrything` is now created by a tmpfiles.d
+  drop-in instead of `RuntimeDirectory=`. The daemon keeps its dedicated
+  unprivileged user, two-capability bounding set, `NoNewPrivileges`, syscall
+  filter, and the remaining hardening.
 - **`uninstall.sh` no longer recurses into a live NTFS mount.** The script
   removed `/run/omavrything` with a plain `rm -rf`, which descended into any
   daemon-created read-only mount under `/run/omavrything/ntfs/<uuid>`: on a
@@ -57,16 +66,6 @@ Notable changes to `omavrything`. The format follows
   unmounts every mount under the runtime directory first (with a lazy fallback)
   and removes the directory with `rm -rf --one-file-system`, so a mount that
   could not be unmounted is still never crossed.
-- **Files on a privately mounted NTFS volume can be opened again.** The
-  systemd sandbox (`ProtectSystem=strict`/`ProtectHome`) gives the daemon a
-  private mount namespace, so the read-only `ntfs3` fallback mount at
-  `/run/omavrything/ntfs/<uuid>` existed only inside the daemon: the desktop
-  saw an empty directory and `xdg-open` on an indexed path failed. The daemon
-  now mounts, remounts, and unmounts through `nsenter -t 1 -m` (with a direct
-  fallback when `nsenter` is unavailable or the namespace is already shared)
-  and reads the host mount table (`/proc/1/mounts`) for every mount check, so
-  the mount and the index paths agree with what the user's session sees. The
-  unit allows mount-namespace `setns` (`RestrictNamespaces=mnt`, `@setns`).
 - **Removable media is now indexed only through the NTFS MFT path (ADR-018).**
   The generic walker no longer descends into `/run/media` (it is filtered from
   the walk roots and pruned in the walk), so a udisks2 NTFS mount is no longer

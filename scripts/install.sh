@@ -124,6 +124,8 @@ install -Dm644 "$here/data/systemd/omavrythingd.service" \
   /usr/lib/systemd/system/omavrythingd.service
 install -Dm644 "$here/data/sysusers/omavrything.conf" \
   /usr/lib/sysusers.d/omavrything.conf
+install -Dm644 "$here/data/tmpfiles/omavrything.conf" \
+  /usr/lib/tmpfiles.d/omavrything.conf
 install -Dm644 "$here/data/dbus/tech.alatcerdas.omavrything.conf" \
   /usr/share/dbus-1/system.d/tech.alatcerdas.omavrything.conf
 install -Dm644 "$here/data/polkit/tech.alatcerdas.omavrything.policy" \
@@ -164,6 +166,12 @@ done
 log "creating the omavrything user"
 if ! systemd-sysusers; then
   die "systemd-sysusers failed; the omavrything user/group was not created"
+fi
+# Create /run/omavrything now (the unit no longer uses RuntimeDirectory=, which
+# would give the service its own mount namespace and hide its NTFS mounts from
+# the desktop); tmpfiles.d recreates it on every boot.
+if ! systemd-tmpfiles --create /usr/lib/tmpfiles.d/omavrything.conf; then
+  die "systemd-tmpfiles failed; /run/omavrything was not created"
 fi
 systemctl daemon-reload >/dev/null 2>&1 || true
 

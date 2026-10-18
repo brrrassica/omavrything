@@ -28,3 +28,6 @@ memmap2 = { workspace = true }
 [dev-dependencies]
 omavrything-ntfs = { workspace = true, features = ["test-image"] }
 omavrything-client = { workspace = true }
+
+[lints]
+workspace = true

@@ -13,3 +13,6 @@ description = "NTFS MFT and USN journal access for omavrything (libntfs-ng FFI)"
 test-image = []
 
 [dependencies]
+
+[lints]
+workspace = true

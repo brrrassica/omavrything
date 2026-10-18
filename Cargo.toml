@@ -11,6 +11,14 @@ members = [
 # libFuzzer runtime), so keep it out of the stable-toolchain workspace jobs.
 exclude = ["fuzz"]
 
+# The codebase predates let-chains (stabilized in Rust 1.88); with the MSRV now
+# at 1.89 clippy would rewrite every nested `if let` into a let-chain. Keep the
+# existing style rather than churn unrelated files.
+[workspace.lints.clippy]
+collapsible_if = "allow"
+manual_is_multiple_of = "allow"
+chunks_exact_to_as_chunks = "allow"
+
 [workspace.package]
 version = "0.2.0-rc9"
 edition = "2024"
