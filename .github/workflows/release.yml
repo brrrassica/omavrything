@@ -37,6 +37,7 @@ jobs:
     env:
       CARGO_HOME: /ci/cache/cargo
       RUSTUP_HOME: /ci/cache/rustup
+      RUSTUP_TOOLCHAIN: stable
       CARGO_TARGET_DIR: /ci/cache/targets/${{ github.repository }}/${{ github.job }}
     steps:
       - name: Install dependencies (from the local pacman cache)
