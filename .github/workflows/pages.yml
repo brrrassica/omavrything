@@ -29,7 +29,7 @@ concurrency:
 jobs:
   build:
     name: build the site
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, opencode-sam]
     steps:
       - uses: actions/checkout@v7
 
@@ -52,7 +52,7 @@ jobs:
   deploy:
     name: deploy to GitHub Pages
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, opencode-sam]
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

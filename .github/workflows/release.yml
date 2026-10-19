@@ -23,7 +23,7 @@ permissions:
 jobs:
   release:
     name: build and publish release (Arch)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, opencode-sam]
     container: archlinux:base-devel
     steps:
       - name: Install dependencies
