@@ -80,18 +80,19 @@ This is a deliberate trade-off and is left at 500 ms for responsiveness.
 
 ## 4. Snapshot cost
 
-The snapshot writer compacts the index and encodes it under the read lock, then
-writes outside the lock. Encoding is O(index size) and the write is a few hundred
-MB at most; it runs every `snapshot_interval` (default 300 s) and on clean
-shutdown. It is not a meaningful idle cost, but on a very large index the encode
-is a brief CPU burst — raise `snapshot_interval` if that is undesirable.
+The snapshot writer encodes the index under the write lock, then writes outside
+the lock. Encoding is O(index size) and the write is a few hundred MB at most;
+it runs every `snapshot_interval` (default 300 s), on clean shutdown, and when
+the idle evictor runs. It is not a meaningful idle cost, but on a very large
+index the encode is a brief CPU burst — raise `snapshot_interval` if that is
+undesirable.
 
 ## 5. Memory cap behaviour
 
 The daemon's memory is bounded by the systemd unit, not by an in-process cap:
 
-- `MemoryHigh=1200M` — the kernel starts reclaiming and throttling above this.
-- `MemoryMax=1536M` — a hard cap; exceeding it triggers the OOM killer for the
+- `MemoryHigh=3G` — the kernel starts reclaiming and throttling above this.
+- `MemoryMax=4G` — a hard cap; exceeding it triggers the OOM killer for the
   cgroup.
 
 Both values are set from measurement rather than headroom guesswork:
@@ -105,10 +106,11 @@ Both values are set from measurement rather than headroom guesswork:
 `MemoryHigh` deliberately sits above the measured cold-index peak so ordinary
 indexing is never throttled, while `MemoryMax` is the hard ceiling.
 
-The index itself is ~70 B/file steady state (see
-[`memory-optimization.md`](memory-optimization.md)), so 1.5 GB accommodates
-roughly 20 M files at steady state, with the transient scan overhead on top. On a
-much larger index the daemon is killed and restarted by systemd
+The index itself is ~80 B/record on the synthetic tree and ~128 B/record on the
+live index (see [`memory-optimization.md`](memory-optimization.md)), so 3 GB
+accommodates roughly 20 M files at steady state, with the transient scan
+overhead on top. On a much larger index the daemon is killed and restarted by
+systemd
 (`Restart=on-failure`), which then warm-starts from the snapshot. To index more,
 raise `MemoryMax` or reduce the indexed roots/excludes. A user-run daemon has no
 such cap and is limited only by available RAM.

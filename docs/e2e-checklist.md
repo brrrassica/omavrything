@@ -66,8 +66,10 @@ Record the result of each item as pass/fail with the date and the Omarchy versio
 - [ ] Releasing the opacity slider saves without a password prompt
       (`set-config` action) and the value survives reopening the panel
       (regression guard for the polkit 127 `CheckAuthorization` bug).
-- [ ] Toggling NTFS, changing the snapshot interval, and changing the log level
-      apply to the daemon (these prompt for authentication).
+- [ ] Toggling NTFS, changing the snapshot interval, the idle-eviction period,
+      and the log level apply to the daemon (these prompt for authentication).
+- [ ] The detected-volume list shows each volume's status and can mount/unmount
+      a volume (polkit-gated).
 - [ ] The changes persist across a daemon restart (state config).
 
 ## 6. Persistence and warm start
@@ -107,7 +109,7 @@ Record the result of each item as pass/fail with the date and the Omarchy versio
 ## 10. Resource use
 
 - [ ] `systemctl status omavrythingd` shows RSS within the documented cap
-      (`MemoryHigh=1200M`, `MemoryMax=1536M`).
+      (`MemoryHigh=3G`, `MemoryMax=4G`).
 - [ ] A cold start from an empty snapshot indexing ~3M files peaks below
       900 MB RSS.
 - [ ] The daemon is idle (near-zero CPU) when the desktop is idle.

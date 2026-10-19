@@ -8,7 +8,7 @@ in-memory index and serves queries over a Unix domain socket.
 ```sh
 scripts/restart-all.sh                             # restart the daemon + reload the shell plugin
 scripts/restart-all.sh --rebuild                   # rebuild the release daemon first (-r)
-scripts/restart-all.sh --sudo                      # run the daemon as root (to index NTFS)
+scripts/restart-all.sh --sudo                      # run the daemon as root for raw-device access in a dev checkout
 scripts/restart-all.sh -- --auto                   # pass daemon args through
 scripts/run-daemon.sh                              # indexes $HOME
 scripts/run-daemon.sh --root /home/sam/Documents   # indexes a subtree
@@ -37,10 +37,11 @@ mtime require one `stat` per file. `--no-metadata` skips that stat for files
 faster but leaves `size`/`mtime` at zero in results.
 
 The socket defaults to `/run/omavrything/omavrything.sock` when running as root
-(the system service) and `$XDG_RUNTIME_DIR/omavrything.sock` (falling back to
-`/tmp/omavrything.sock`) otherwise. It is created mode `0660` and, as root,
-group `omavrything`. Every connection is checked with `SO_PEERCRED`: root, the
-daemon's own uid, and members of the `omavrything` group are allowed. A single
+and `$XDG_RUNTIME_DIR/omavrything.sock` (falling back to
+`/tmp/omavrything.sock`) otherwise. The system service fixes the system path on
+its command line. The socket is created mode `0660`, group `omavrything`. Every
+connection is checked with `SO_PEERCRED`: root, the daemon's own uid, and
+members of the `omavrything` group are allowed. A single
 daemon per socket is enforced with an exclusive `flock` on `<socket>.lock`, so a
 second instance refuses to start. Each request must complete within 30 seconds
 and be at most 64 KiB, so a slow or oversized client cannot hold a connection
@@ -85,10 +86,14 @@ persisted to a separate **state** config, so the shipped
 `--state-config <path>`. On start the daemon loads the base file, then overlays
 the state file, then applies command-line flags (CLI > state > base > defaults).
 
-The settable keys are `excludes`, `scan_interval`, `snapshot_interval`, `ntfs`,
-`log_level`, and `background_opacity`. `log_level` takes effect immediately;
-`ntfs = true` triggers NTFS detection and indexing; `background_opacity` is a
-UI-only value the daemon stores and serves but does not otherwise use.
+The settable keys are `excludes`, `scan_interval`, `snapshot_interval`,
+`evict_idle_secs`, `ntfs`, `log_level`, `background_opacity`, and
+`candidate_index`. `log_level` takes effect immediately; `ntfs = true` triggers
+NTFS detection and indexing; `candidate_index` enables or disables the derived
+trigram index at runtime; `background_opacity` is a UI-only value the daemon
+stores and serves but does not otherwise use. The `volumes` key is written by
+the daemon itself when a volume is mounted through the settings UI; it is not a
+`SetConfig` key.
 
 ## Logging
 
@@ -105,20 +110,23 @@ result (udisks2 or the private `ntfs3` fallback), whether a mount was reused or
 daemon-created, the filesystem type and options from `/proc/mounts`, and the
 `$Volume` dirty flag read from the MFT before indexing (a volume Windows did not
 unmount cleanly is replayed by the kernel `ntfs3` driver on mount). On shutdown
-it warns with the list of daemon-created mounts it does **not** unmount (a known
-defect tracked for v0.2.0). Raise the level to `info` to see these.
+it unmounts the private mounts it created and logs any it could not release.
+Raise the level to `info` to see these.
 
 ## systemd service
 
 `data/systemd/omavrythingd.service` runs the daemon as a hardened system service
 under a dedicated `omavrything` user (created by
 `data/sysusers/omavrything.conf`). It keeps only the minimal capability set it
-needs (raw block-device read for the NTFS MFT, and the read-only `ntfs3`
-fallback mount), and applies `ProtectSystem=strict`, `ProtectHome=read-only`,
-`NoNewPrivileges`, `MemoryDenyWriteExecute`, a `@system-service @mount` syscall
-filter, and memory, CPU, task, and file-descriptor limits. The socket and
-snapshot paths are fixed on the command line so the service does not depend on
-the invoking user's XDG directories.
+needs (`CAP_DAC_READ_SEARCH` for the NTFS MFT and `CAP_SYS_ADMIN` for the
+read-only `ntfs3` fallback mount), and applies `NoNewPrivileges`,
+`MemoryDenyWriteExecute`, a `@system-service @mount` syscall filter, and memory,
+CPU, task, and file-descriptor limits. The filesystem-view options
+(`ProtectSystem=`, `ProtectHome=`, `PrivateTmp=`, `PrivateMounts=`) are
+deliberately **not** set: they would give the service its own mount namespace
+and hide its read-only NTFS mounts from the desktop. The socket and snapshot
+paths are fixed on the command line so the service does not depend on the
+invoking user's XDG directories.
 
 ```sh
 sudo install -Dm644 data/systemd/omavrythingd.service /usr/lib/systemd/system/omavrythingd.service
@@ -178,23 +186,27 @@ Control and status are exposed on the system bus as
 
 | Method | Description |
 | --- | --- |
-| `GetStatus` | version, entries, roots, memory, scan state, uptime |
+| `GetStatus` | version, entries, roots, memory breakdown, scan state, errors, uptime |
 | `Rescan(root)` | rescan all roots (empty `root`) or one configured root; returns entries added |
 | `GetConfig` | the current configuration |
-| `SetConfig(key, value)` | set `excludes`, `scan_interval`, `snapshot_interval`, `ntfs`, `log_level`, or `background_opacity`; changing `excludes` triggers a rescan |
+| `SetConfig(key, value)` | set `excludes`, `scan_interval`, `snapshot_interval`, `evict_idle_secs`, `ntfs`, `log_level`, `background_opacity`, or `candidate_index`; changing `excludes` triggers a rescan |
 | `ListRoots` | the indexed roots |
+| `ListVolumes` | detected block volumes with UUID, label, fstype, mount point, and status |
 | `MountNtfs(uuid)` | mount an NTFS partition and index it via the MFT; returns the mount point |
+| `MountVolume(device)` | mount any volume and index it; returns the mount point |
+| `UnmountVolume(device)` | unmount a volume and drop its index entries |
 
 A rescan walks the filesystem outside the index lock and then reconciles the
 index under a brief write lock, so socket searches keep serving during the
 traversal without cloning the whole index (which doubled peak memory). A
 non-empty `root` must be one of the configured roots.
 
-Signals: `IndexChanged(entries)` and `ScanProgress(phase, entries)`.
+Signals: `IndexChanged(entries)` and `ScanProgress(phase, entries, errors)`.
 
-The read-only methods are open to all. `Rescan` and `MountNtfs`, and the
-privileged `SetConfig` keys (`excludes`, `ntfs`, `scan_interval`,
-`snapshot_interval`, `log_level`), are gated by the
+The read-only methods are open to all. `Rescan`, `MountNtfs`, `MountVolume`,
+`UnmountVolume`, and the privileged `SetConfig` keys (`excludes`, `ntfs`,
+`scan_interval`, `snapshot_interval`, `evict_idle_secs`, `log_level`,
+`candidate_index`), are gated by the
 `tech.alatcerdas.omavrything.control` polkit action. The cosmetic
 `background_opacity` key uses `tech.alatcerdas.omavrything.set-config`
 (`allow_active=yes`), so the settings panel can save without a prompt. Both
@@ -221,9 +233,10 @@ socket search path unaffected; `--no-dbus` disables the interface.
 
 ## Client library
 
-`omavrything-client` is the shared client used by the CLI and the shell plugin:
-`SocketClient` speaks the search protocol over the Unix socket, and
-`DbusClient` calls the control interface.
+`omavrything-client` is the shared Rust client used by the CLI and other
+callers: `SocketClient` speaks the search protocol over the Unix socket, and
+`DbusClient` calls the control interface. The QML shell plugin speaks the socket
+protocol directly.
 
 ## CLI
 
@@ -234,14 +247,18 @@ omavry status                      # D-Bus; key: value lines
 omavry status --json               # the status map as JSON
 omavry rescan                      # rescan all roots (D-Bus, polkit)
 omavry rescan --root /home/sam     # rescan one configured root
+omavry volumes [--json]            # detected volumes and their status
 omavry mount <uuid>                # mount + index an NTFS partition (D-Bus, polkit)
+omavry mount-volume <device>       # mount + index any volume (D-Bus, polkit)
+omavry unmount-volume <device>     # unmount a volume and drop its index (D-Bus, polkit)
 omavry config get [--json]         # the current configuration
 omavry config set <key> <value>    # set a value (D-Bus, polkit)
 ```
 
-`search` and `status` are read-only; `rescan`, `mount`, and `config set` for a
-privileged key are gated by the `tech.alatcerdas.omavrything.control` polkit
-action and prompt for authentication. `config set background_opacity` uses the
+`search`, `status`, and `volumes` are read-only; `rescan`, `mount`,
+`mount-volume`, `unmount-volume`, and `config set` for a privileged key are
+gated by the `tech.alatcerdas.omavrything.control` polkit action and prompt for
+authentication. `config set background_opacity` uses the
 `tech.alatcerdas.omavrything.set-config` action and does not prompt. Every
 subcommand exits non-zero on failure, so it composes with shell scripts.
 
@@ -272,21 +289,24 @@ everything. The snapshot is written on a timer (`--snapshot-interval`, default
 serialized between the timer and the shutdown handler, and the index is compacted
 before encoding so tombstones are not persisted and their memory is reclaimed.
 
-The default path is `/var/lib/omavrything/index.snapshot` when running as root
-(the M9 system service) and `$XDG_STATE_HOME/omavrything/index.snapshot`
-(falling back to `$HOME/.local/state/...`) otherwise; override with
-`--snapshot <path>` or disable with `--no-snapshot`.
+The default path is `/var/lib/omavrything/index.snapshot` for the system service
+and `$XDG_STATE_HOME/omavrything/index.snapshot` (falling back to
+`$HOME/.local/state/...`) otherwise; override with `--snapshot <path>` or
+disable with `--no-snapshot`.
 
-The format is versioned and length-prefixed with an FNV-1a checksum. Writes are
+The format is a versioned, directly mappable image (v6): a header, a section
+table, and four 8-byte aligned sections (`ROOTS`, `RECORDS`, `PATHS`,
+`ROOT_STRINGS`), with an FNV-1a checksum. The `RECORDS` section is cast directly
+from the mapping, so loading is an `mmap` plus header validation. Writes are
 atomic (temp file + `rename`) and the previous snapshot is kept as
 `<path>.prev`, so a corrupt or truncated snapshot falls back to the last good
 one and ultimately to a fresh scan.
 
 On load, each root is validated against the mount table and its filesystem
-identity (device plus btrfs subvolume generation). Roots whose identity or
-filesystem kind changed — or that are new — are rescanned; roots that are no
-longer configured are dropped. A snapshot that fails to load triggers a full
-cold scan.
+identity (device, btrfs subvolume generation, and the root directory's mtime as
+a non-btrfs staleness watermark). Roots whose identity or filesystem kind
+changed — or that are new — are rescanned; roots that are no longer configured
+are dropped. A snapshot that fails to load triggers a full cold scan.
 
 ## NTFS
 
@@ -298,9 +318,10 @@ mount is required for indexing. The reader is a pure-Rust implementation in
 record to obtain the MFT's run list, then walks every MFT record and
 reconstructs paths from `$FILE_NAME` parent references.
 
-Mounting prefers **udisks2** (`udisksctl mount -o ro`) so the desktop sees the
-partition, and falls back to a private read-only **`ntfs3`** mount at
-`/run/omavrything/ntfs/<uuid>`.
+Mounting prefers the **udisks2 D-Bus API**, falls back to
+`udisksctl mount -o ro`, and finally to a private read-only **`ntfs3`** mount at
+`/run/omavrything/ntfs/<uuid>`. The daemon records the mounts it created in a
+`mounts.state` file and unmounts only those on shutdown.
 
 The **auto-mount policy** remembers previously indexed partitions by UUID in a
 state file (`/var/lib/omavrything/ntfs.state` as root, else
@@ -311,18 +332,21 @@ indexed on demand via `MountNtfs`. `--no-ntfs` disables detection entirely.
 ## NTFS indexing and the index lock
 
 NTFS volumes are indexed by reading the MFT directly from the raw device, which
-requires root. The MFT read and parse is the expensive half of NTFS indexing
-(seconds on a multi-million-record volume), so it runs **outside** the index
-lock: [`enumerate_device`](../crates/omavrythingd/src/ntfs.rs) reads the MFT,
-then [`apply_entries`](../crates/omavrythingd/src/ntfs.rs) inserts the result
-under a brief write lock. This mirrors the `plan_rescan`/`apply_rescan` split, so
-searches keep serving at full speed while a volume is being indexed. Run the
-daemon as root with `scripts/restart-all.sh --sudo` to index NTFS.
+requires raw-device read access (`CAP_DAC_READ_SEARCH`). The system service has
+that capability; a user-run daemon needs root. The MFT read and parse is the
+expensive half of NTFS indexing (seconds on a multi-million-record volume), so
+it runs **outside** the index lock: [`enumerate_device`](../crates/omavrythingd/src/ntfs.rs)
+reads the MFT, then [`apply_entries`](../crates/omavrythingd/src/ntfs.rs)
+inserts the result under a brief write lock. This mirrors the
+`plan_rescan`/`apply_rescan` split, so searches keep serving at full speed while
+a volume is being indexed. For a dev checkout, `scripts/restart-all.sh --sudo`
+runs the daemon as root.
 
 ## Profiling query performance
 
-Search is a linear scan over every record, so its cost is proportional to the
-index size. Three tools measure it:
+Search scans the index, narrowed by the candidate index when the query allows
+it; a broad query that cannot be narrowed still scales with the index size.
+Three tools measure it:
 
 - **End-to-end benchmark** — [`scripts/benchmark.sh`](../scripts/benchmark.sh)
   drives a real daemon over the Unix socket and reports wall-clock latency
@@ -349,8 +373,8 @@ index size. Three tools measure it:
   ```
 
   Always pass `--release`: a debug build is 10-50x slower and the example warns
-  when it detects one. On a 1M-record index a query is ~6-18 ms; the cost scales
-  linearly (1M ≈ 6 ms, 2M ≈ 12 ms, 3M ≈ 18 ms).
+  when it detects one. On a 1M-record index a broad query is ~6-18 ms; selective
+  queries are narrowed by the candidate index and are much faster.
 
 - **Daemon query profiler** — set `OMAVRYTHING_PROFILE=1` when starting the
   daemon and every search logs a breakdown to stderr:
@@ -375,8 +399,8 @@ runs the release binary.
   well-known name, which the bus policy permits for the `omavrything` user (or
   root); a user-run daemon therefore serves the socket search path but not D-Bus
   control.
-- NTFS live updates use the periodic rescan; USN journal parsing is deferred to
-  v0.2 ([ADR-006](decisions.md#adr-006)).
+- NTFS live updates use the periodic rescan; USN journal parsing is implemented
+  but not yet wired into the index ([ADR-006](decisions.md#adr-006)).
 - An NTFS root is validated by its mount point's device identity, so if the
   partition is not mounted at startup its MFT-indexed entries are dropped and
   re-indexed when it is mounted again.

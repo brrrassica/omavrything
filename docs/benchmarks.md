@@ -119,8 +119,9 @@ candidate index. Its per-component breakdown (F11) is reported by
 | Per-record offsets | ~4 MB | ~6 |
 
 These figures predate the F12 stop-list, which drops the posting lists of the most
-frequent trigrams and so bounds the postings (the dominant component). The F10
-config key (planned) can cap or disable the index on very large indexes.
+frequent trigrams and so bounds the postings (the dominant component). The
+`candidate_index` config key can disable the index on very large indexes, at the
+cost of a linear scan per query.
 
 ### Hermetic daemon (synthetic tree, 52,000 entries)
 
@@ -144,8 +145,9 @@ is 2x the p50 one) and the cold scan must stay above 50,000 entries/s. CI runs
 
 - **Cold scan** is the indexing throughput: entries walked and inserted per
   second. It is I/O- and CPU-bound and scales with the tree.
-- **Idle search latency** is the interactive cost: what a keystroke pays. It is
-  a linear scan, so it scales with the index size.
+- **Idle search latency** is the interactive cost: what a keystroke pays.
+  Selective queries are narrowed by the candidate index; a broad query that
+  cannot be narrowed is a linear scan and scales with the index size.
 - **During-indexing latency** is the same query while the index is being
   mutated. The write lock is held only while a batch is applied, so the
   increase is small; a large p99 here would indicate lock contention.
