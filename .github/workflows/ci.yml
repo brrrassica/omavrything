@@ -83,6 +83,13 @@ jobs:
       issues: write
     steps:
       - uses: actions/checkout@v4
+
+      # The hosted ubuntu-latest image ships Rust preinstalled, but the
+      # self-hosted runner does not, so rustsec/audit-check needs the
+      # toolchain installed explicitly (as the other jobs already do).
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
