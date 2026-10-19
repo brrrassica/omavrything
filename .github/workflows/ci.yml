@@ -53,6 +53,14 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      # The build output lives in the runner's persistent cache, but the
+      # repo's own scripts (scripts/build.sh, ci-smoke.sh, package-release.sh)
+      # reference ./target, so link it back to the cache.
+      - name: Point target/ at the persistent local cache
+        run: |
+          mkdir -p "$CARGO_TARGET_DIR"
+          rm -rf target
+          ln -s "$CARGO_TARGET_DIR" target
       - name: Install Rust toolchain (reused from RUSTUP_HOME)
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -98,6 +106,14 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      # The build output lives in the runner's persistent cache, but the
+      # repo's own scripts (scripts/build.sh, ci-smoke.sh, package-release.sh)
+      # reference ./target, so link it back to the cache.
+      - name: Point target/ at the persistent local cache
+        run: |
+          mkdir -p "$CARGO_TARGET_DIR"
+          rm -rf target
+          ln -s "$CARGO_TARGET_DIR" target
       # cargo-fuzz keeps its artifacts in fuzz/target, which lives in the
       # (throw-away) checkout. Point it at the persistent local cache instead.
       - name: Point the fuzz target dir at the local cache
@@ -131,10 +147,6 @@ jobs:
       issues: write
     steps:
       - uses: actions/checkout@v4
-
-      # The hosted ubuntu-latest image ships Rust preinstalled, but the
-      # self-hosted runner does not, so rustsec/audit-check needs the
-      # toolchain installed explicitly (as the other jobs already do).
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -168,6 +180,14 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      # The build output lives in the runner's persistent cache, but the
+      # repo's own scripts (scripts/build.sh, ci-smoke.sh, package-release.sh)
+      # reference ./target, so link it back to the cache.
+      - name: Point target/ at the persistent local cache
+        run: |
+          mkdir -p "$CARGO_TARGET_DIR"
+          rm -rf target
+          ln -s "$CARGO_TARGET_DIR" target
       - name: Install Rust toolchain (reused from RUSTUP_HOME)
         uses: dtolnay/rust-toolchain@stable
 
@@ -200,6 +220,14 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      # The build output lives in the runner's persistent cache, but the
+      # repo's own scripts (scripts/build.sh, ci-smoke.sh, package-release.sh)
+      # reference ./target, so link it back to the cache.
+      - name: Point target/ at the persistent local cache
+        run: |
+          mkdir -p "$CARGO_TARGET_DIR"
+          rm -rf target
+          ln -s "$CARGO_TARGET_DIR" target
       - name: Install Rust toolchain (reused from RUSTUP_HOME)
         uses: dtolnay/rust-toolchain@stable
 

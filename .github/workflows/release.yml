@@ -51,6 +51,15 @@ jobs:
           # Check out the tag being released, not the default branch.
           ref: ${{ github.event.inputs.tag || github.ref }}
 
+
+      # The build output lives in the runner's persistent cache, but the
+      # repo's own scripts (scripts/build.sh, ci-smoke.sh, package-release.sh)
+      # reference ./target, so link it back to the cache.
+      - name: Point target/ at the persistent local cache
+        run: |
+          mkdir -p "$CARGO_TARGET_DIR"
+          rm -rf target
+          ln -s "$CARGO_TARGET_DIR" target
       - name: Install Rust toolchain (reused from RUSTUP_HOME)
         uses: dtolnay/rust-toolchain@stable
 
