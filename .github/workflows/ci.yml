@@ -13,7 +13,7 @@ jobs:
   # the toolchain, glibc, and package availability identical to what users run.
   build:
     name: fmt, clippy, test, build (Arch)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, opencode-sam]
     container: archlinux:base-devel
     steps:
       - name: Install dependencies
@@ -46,7 +46,7 @@ jobs:
 
   fuzz:
     name: fuzz (smoke, Arch)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, opencode-sam]
     container: archlinux:base-devel
     steps:
       - name: Install dependencies
@@ -74,11 +74,10 @@ jobs:
         run: cargo fuzz run protocol_parse -- -max_total_time=60 -rss_limit_mb=2048
 
   # Dependency advisories are platform-independent (they only read Cargo.lock),
-  # so this job stays on the default runner where the rustsec action is designed
-  # to run.
+  # so this job runs on the self-hosted runner alongside the rest.
   audit:
     name: cargo audit
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, opencode-sam]
     permissions:
       contents: read
       issues: write
@@ -90,7 +89,7 @@ jobs:
 
   smoke:
     name: install/uninstall smoke (Arch)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, opencode-sam]
     container: archlinux:base-devel
     needs: build
     steps:
@@ -110,7 +109,7 @@ jobs:
 
   bench:
     name: performance budgets (Arch)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, opencode-sam]
     container: archlinux:base-devel
     needs: build
     steps:
@@ -133,7 +132,7 @@ jobs:
 
   package:
     name: package release archive (Arch)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, opencode-sam]
     container: archlinux:base-devel
     needs: build
     steps:
