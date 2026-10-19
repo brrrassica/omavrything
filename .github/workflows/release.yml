@@ -6,7 +6,9 @@ name: Release
 #
 # The archive is built inside an official Arch container so the shipped binaries
 # are linked against the same glibc and toolchain as the target platform
-# (Omarchy Quattro / Arch Linux).
+# (Omarchy Quattro / Arch Linux). The container bind-mounts the runner's local
+# package cache, so pacman, the Rust toolchain, crates and build artifacts are
+# reused instead of being re-downloaded for every release.
 on:
   push:
     tags:
@@ -24,21 +26,33 @@ jobs:
   release:
     name: build and publish release (Arch)
     runs-on: [self-hosted, opencode-sam]
-    container: archlinux:base-devel
+    container:
+      image: archlinux:base-devel
+      volumes:
+        - /home/github-runner/ci-cache/pacman-pkg:/var/cache/pacman/pkg
+        - /home/github-runner/ci-cache/cargo:/ci/cache/cargo
+        - /home/github-runner/ci-cache/rustup:/ci/cache/rustup
+        - /home/github-runner/ci-cache/targets:/ci/cache/targets
+        - /home/github-runner/ci-cache/locks:/ci/cache/locks
+    env:
+      CARGO_HOME: /ci/cache/cargo
+      RUSTUP_HOME: /ci/cache/rustup
+      RUSTUP_TOOLCHAIN: stable
+      CARGO_TARGET_DIR: /ci/cache/targets/${{ github.repository }}/${{ github.job }}
     steps:
-      - name: Install dependencies
-        run: pacman -Syu --noconfirm --needed --overwrite '*' git curl zip
+      - name: Install dependencies (from the local pacman cache)
+        run: |
+          mkdir -p "$CARGO_TARGET_DIR"
+          flock /ci/cache/locks/pacman.lock \
+            pacman -Syu --noconfirm --needed --overwrite '*' git curl zip
 
       - uses: actions/checkout@v4
         with:
           # Check out the tag being released, not the default branch.
           ref: ${{ github.event.inputs.tag || github.ref }}
 
-      - name: Install Rust toolchain
+      - name: Install Rust toolchain (reused from RUSTUP_HOME)
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
 
       - name: Resolve the release tag
         id: tag
