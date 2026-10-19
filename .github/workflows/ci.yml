@@ -145,6 +145,9 @@ jobs:
     permissions:
       contents: read
       issues: write
+      # rustsec/audit-check reports unmaintained-crate warnings as a check run,
+      # which fails with "Resource not accessible by integration" without this.
+      checks: write
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
