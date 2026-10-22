@@ -33,10 +33,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v7
-        with:
-          python-version: '3.12'
-
       - name: Install build dependencies
         run: pip install -r site/requirements.txt
 
