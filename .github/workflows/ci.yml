@@ -7,27 +7,64 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# ---------------------------------------------------------------------------
+# Local package caches
+#
+# Every job that runs inside a container bind-mounts subdirectories of
+# /home/github-runner/ci-cache on the runner host:
+#
+#   pacman-pkg -> /var/cache/pacman/pkg   downloaded Arch packages
+#   cargo      -> $CARGO_HOME             the crates.io registry + cargo binaries
+#   rustup     -> $RUSTUP_HOME            installed Rust toolchains
+#   targets    -> $CARGO_TARGET_DIR       compiled build artifacts
+#   locks      -> serialises pacman/apt   so parallel runners cannot corrupt it
+#
+# The first run after this change downloads everything once; every run after it
+# is served entirely from the runner's own disk, with no internet fetches for
+# packages, crates or toolchains.
+# ---------------------------------------------------------------------------
+
 jobs:
   # The target platform is Arch/Omarchy, so the build, test, and package jobs run
   # inside an official Arch container rather than on the Ubuntu host. This keeps
   # the toolchain, glibc, and package availability identical to what users run.
   build:
     name: fmt, clippy, test, build (Arch)
-    runs-on: ubuntu-latest
-    container: archlinux:base-devel
+    runs-on: [self-hosted, opencode-sam]
+    container:
+      image: archlinux:base-devel
+      volumes:
+        - /home/github-runner/ci-cache/pacman-pkg:/var/cache/pacman/pkg
+        - /home/github-runner/ci-cache/cargo:/ci/cache/cargo
+        - /home/github-runner/ci-cache/rustup:/ci/cache/rustup
+        - /home/github-runner/ci-cache/targets:/ci/cache/targets
+        - /home/github-runner/ci-cache/locks:/ci/cache/locks
+    env:
+      CARGO_HOME: /ci/cache/cargo
+      RUSTUP_HOME: /ci/cache/rustup
+      RUSTUP_TOOLCHAIN: stable
+      CARGO_TARGET_DIR: /ci/cache/targets/${{ github.repository }}/${{ github.job }}
     steps:
-      - name: Install dependencies
-        run: pacman -Syu --noconfirm --needed --overwrite '*' git curl
+      - name: Install dependencies (from the local pacman cache)
+        run: |
+          mkdir -p "$CARGO_TARGET_DIR"
+          flock /ci/cache/locks/pacman.lock \
+            pacman -Syu --noconfirm --needed --overwrite '*' git curl
 
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
+      # The build output lives in the runner's persistent cache, but the
+      # repo's own scripts (scripts/build.sh, ci-smoke.sh, package-release.sh)
+      # reference ./target, so link it back to the cache.
+      - name: Point target/ at the persistent local cache
+        run: |
+          mkdir -p "$CARGO_TARGET_DIR"
+          rm -rf target
+          ln -s "$CARGO_TARGET_DIR" target
+      - name: Install Rust toolchain (reused from RUSTUP_HOME)
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -46,23 +83,48 @@ jobs:
 
   fuzz:
     name: fuzz (smoke, Arch)
-    runs-on: ubuntu-latest
-    container: archlinux:base-devel
+    runs-on: [self-hosted, opencode-sam]
+    container:
+      image: archlinux:base-devel
+      volumes:
+        - /home/github-runner/ci-cache/pacman-pkg:/var/cache/pacman/pkg
+        - /home/github-runner/ci-cache/cargo:/ci/cache/cargo
+        - /home/github-runner/ci-cache/rustup:/ci/cache/rustup
+        - /home/github-runner/ci-cache/targets:/ci/cache/targets
+        - /home/github-runner/ci-cache/locks:/ci/cache/locks
+    env:
+      CARGO_HOME: /ci/cache/cargo
+      RUSTUP_HOME: /ci/cache/rustup
+      RUSTUP_TOOLCHAIN: nightly
+      CARGO_TARGET_DIR: /ci/cache/targets/${{ github.repository }}/${{ github.job }}
     steps:
-      - name: Install dependencies
-        run: pacman -Syu --noconfirm --needed --overwrite '*' git curl
+      - name: Install dependencies (from the local pacman cache)
+        run: |
+          mkdir -p "$CARGO_TARGET_DIR"
+          flock /ci/cache/locks/pacman.lock \
+            pacman -Syu --noconfirm --needed --overwrite '*' git curl
 
       - uses: actions/checkout@v4
 
-      - name: Install nightly toolchain
+      # The build output lives in the runner's persistent cache, but the
+      # repo's own scripts (scripts/build.sh, ci-smoke.sh, package-release.sh)
+      # reference ./target, so link it back to the cache.
+      - name: Point target/ at the persistent local cache
+        run: |
+          mkdir -p "$CARGO_TARGET_DIR"
+          rm -rf target
+          ln -s "$CARGO_TARGET_DIR" target
+      # cargo-fuzz keeps its artifacts in fuzz/target, which lives in the
+      # (throw-away) checkout. Point it at the persistent local cache instead.
+      - name: Point the fuzz target dir at the local cache
+        run: |
+          rm -rf fuzz/target
+          ln -s "$CARGO_TARGET_DIR" fuzz/target
+
+      - name: Install nightly toolchain (reused from RUSTUP_HOME)
         uses: dtolnay/rust-toolchain@nightly
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: fuzz
-
-      - name: Install cargo-fuzz
+      - name: Install cargo-fuzz (reused from CARGO_HOME)
         run: cargo install cargo-fuzz --locked
 
       - name: Fuzz the snapshot loader
@@ -74,56 +136,103 @@ jobs:
         run: cargo fuzz run protocol_parse -- -max_total_time=60 -rss_limit_mb=2048
 
   # Dependency advisories are platform-independent (they only read Cargo.lock),
-  # so this job stays on the default runner where the rustsec action is designed
-  # to run.
+  # so this job runs on the self-hosted runner alongside the rest. It executes on
+  # the host rather than in a container, where ~/.cargo and ~/.rustup are already
+  # persistent, so its crates and toolchain are cached locally too.
   audit:
     name: cargo audit
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, opencode-sam]
     permissions:
       contents: read
       issues: write
+      # rustsec/audit-check reports unmaintained-crate warnings as a check run,
+      # which fails with "Resource not accessible by integration" without this.
+      checks: write
     steps:
       - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   smoke:
     name: install/uninstall smoke (Arch)
-    runs-on: ubuntu-latest
-    container: archlinux:base-devel
+    runs-on: [self-hosted, opencode-sam]
+    container:
+      image: archlinux:base-devel
+      volumes:
+        - /home/github-runner/ci-cache/pacman-pkg:/var/cache/pacman/pkg
+        - /home/github-runner/ci-cache/cargo:/ci/cache/cargo
+        - /home/github-runner/ci-cache/rustup:/ci/cache/rustup
+        - /home/github-runner/ci-cache/targets:/ci/cache/targets
+        - /home/github-runner/ci-cache/locks:/ci/cache/locks
+    env:
+      CARGO_HOME: /ci/cache/cargo
+      RUSTUP_HOME: /ci/cache/rustup
+      RUSTUP_TOOLCHAIN: stable
+      CARGO_TARGET_DIR: /ci/cache/targets/${{ github.repository }}/${{ github.job }}
     needs: build
     steps:
-      - name: Install dependencies
-        run: pacman -Syu --noconfirm --needed --overwrite '*' git curl zip
+      - name: Install dependencies (from the local pacman cache)
+        run: |
+          mkdir -p "$CARGO_TARGET_DIR"
+          flock /ci/cache/locks/pacman.lock \
+            pacman -Syu --noconfirm --needed --overwrite '*' git curl zip
 
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
+      # The build output lives in the runner's persistent cache, but the
+      # repo's own scripts (scripts/build.sh, ci-smoke.sh, package-release.sh)
+      # reference ./target, so link it back to the cache.
+      - name: Point target/ at the persistent local cache
+        run: |
+          mkdir -p "$CARGO_TARGET_DIR"
+          rm -rf target
+          ln -s "$CARGO_TARGET_DIR" target
+      - name: Install Rust toolchain (reused from RUSTUP_HOME)
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
 
       - name: Run the install/uninstall smoke test
         run: scripts/ci-smoke.sh
 
   package:
     name: package release archive (Arch)
-    runs-on: ubuntu-latest
-    container: archlinux:base-devel
+    runs-on: [self-hosted, opencode-sam]
+    container:
+      image: archlinux:base-devel
+      volumes:
+        - /home/github-runner/ci-cache/pacman-pkg:/var/cache/pacman/pkg
+        - /home/github-runner/ci-cache/cargo:/ci/cache/cargo
+        - /home/github-runner/ci-cache/rustup:/ci/cache/rustup
+        - /home/github-runner/ci-cache/targets:/ci/cache/targets
+        - /home/github-runner/ci-cache/locks:/ci/cache/locks
+    env:
+      CARGO_HOME: /ci/cache/cargo
+      RUSTUP_HOME: /ci/cache/rustup
+      RUSTUP_TOOLCHAIN: stable
+      CARGO_TARGET_DIR: /ci/cache/targets/${{ github.repository }}/${{ github.job }}
     needs: build
     steps:
-      - name: Install dependencies
-        run: pacman -Syu --noconfirm --needed --overwrite '*' git curl zip
+      - name: Install dependencies (from the local pacman cache)
+        run: |
+          mkdir -p "$CARGO_TARGET_DIR"
+          flock /ci/cache/locks/pacman.lock \
+            pacman -Syu --noconfirm --needed --overwrite '*' git curl zip
 
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
+      # The build output lives in the runner's persistent cache, but the
+      # repo's own scripts (scripts/build.sh, ci-smoke.sh, package-release.sh)
+      # reference ./target, so link it back to the cache.
+      - name: Point target/ at the persistent local cache
+        run: |
+          mkdir -p "$CARGO_TARGET_DIR"
+          rm -rf target
+          ln -s "$CARGO_TARGET_DIR" target
+      - name: Install Rust toolchain (reused from RUSTUP_HOME)
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
 
       - name: Build the release archive
         run: scripts/package-release.sh
