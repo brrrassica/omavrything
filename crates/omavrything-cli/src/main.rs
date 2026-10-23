@@ -36,10 +36,28 @@ fn main() {
             let root = parse_root(&rest);
             std::process::exit(rescan(root.as_deref()));
         }
+        "volumes" => {
+            let json = rest.iter().any(|a| a == "--json");
+            std::process::exit(volumes(json));
+        }
         "mount" => match rest.iter().find(|a| !a.starts_with("--")) {
             Some(uuid) => std::process::exit(mount(uuid)),
             None => {
                 eprintln!("usage: omavry mount <uuid>");
+                std::process::exit(2);
+            }
+        },
+        "mount-volume" => match rest.iter().find(|a| !a.starts_with("--")) {
+            Some(device) => std::process::exit(mount_volume(device)),
+            None => {
+                eprintln!("usage: omavry mount-volume <device>");
+                std::process::exit(2);
+            }
+        },
+        "unmount-volume" => match rest.iter().find(|a| !a.starts_with("--")) {
+            Some(device) => std::process::exit(unmount_volume(device)),
+            None => {
+                eprintln!("usage: omavry unmount-volume <device>");
                 std::process::exit(2);
             }
         },
@@ -116,12 +134,23 @@ fn search(query: &str, json: bool) -> i32 {
         }
     };
 
-    let response = match client.search(query, 50, 0) {
-        Ok(response) => response,
-        Err(err) => {
-            eprintln!("search failed: {err}");
-            return 1;
+    // The daemon evicts the index when idle; a query while evicted returns
+    // `state: "loading"` and starts a background materialization. Retry briefly
+    // so the command returns results instead of a misleading empty page,
+    // matching the overlay's reload behavior.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let response = loop {
+        let response = match client.search(query, 50, 0) {
+            Ok(response) => response,
+            Err(err) => {
+                eprintln!("search failed: {err}");
+                return 1;
+            }
+        };
+        if !response.is_loading() || std::time::Instant::now() >= deadline {
+            break response;
         }
+        std::thread::sleep(std::time::Duration::from_millis(200));
     };
 
     if let Some(err) = &response.error {
@@ -209,6 +238,92 @@ fn rescan(root: Option<&str>) -> i32 {
                 }
                 Err(err) => {
                     eprintln!("rescan failed: {err}");
+                    1
+                }
+            }
+        })
+    })
+}
+
+fn volumes(json: bool) -> i32 {
+    with_runtime(|runtime| {
+        runtime.block_on(async {
+            let client = match DbusClient::connect().await {
+                Ok(client) => client,
+                Err(err) => {
+                    eprintln!("cannot connect to the D-Bus interface: {err}");
+                    return 1;
+                }
+            };
+            match client.volumes().await {
+                Ok(volumes) => {
+                    if json {
+                        match serde_json::to_string(&volumes) {
+                            Ok(text) => print_line(&text),
+                            Err(err) => {
+                                eprintln!("volumes failed: {err}");
+                                return 1;
+                            }
+                        }
+                    } else {
+                        for volume in &volumes {
+                            let label = volume.get("label").map(String::as_str).unwrap_or("");
+                            let fstype = volume.get("fstype").map(String::as_str).unwrap_or("");
+                            let status = volume.get("status").map(String::as_str).unwrap_or("");
+                            let device = volume.get("device").map(String::as_str).unwrap_or("");
+                            let name = if label.is_empty() { device } else { label };
+                            print_line(&format!("{name} ({fstype}) {status}"));
+                        }
+                    }
+                    0
+                }
+                Err(err) => {
+                    eprintln!("volumes failed: {err}");
+                    1
+                }
+            }
+        })
+    })
+}
+
+fn mount_volume(device: &str) -> i32 {
+    with_runtime(|runtime| {
+        runtime.block_on(async {
+            let client = match DbusClient::connect().await {
+                Ok(client) => client,
+                Err(err) => {
+                    eprintln!("cannot connect to the D-Bus interface: {err}");
+                    return 1;
+                }
+            };
+            match client.mount_volume(device).await {
+                Ok(mount_point) => {
+                    print_line(&mount_point);
+                    0
+                }
+                Err(err) => {
+                    eprintln!("mount failed: {err}");
+                    1
+                }
+            }
+        })
+    })
+}
+
+fn unmount_volume(device: &str) -> i32 {
+    with_runtime(|runtime| {
+        runtime.block_on(async {
+            let client = match DbusClient::connect().await {
+                Ok(client) => client,
+                Err(err) => {
+                    eprintln!("cannot connect to the D-Bus interface: {err}");
+                    return 1;
+                }
+            };
+            match client.unmount_volume(device).await {
+                Ok(()) => 0,
+                Err(err) => {
+                    eprintln!("unmount failed: {err}");
                     1
                 }
             }
@@ -324,7 +439,10 @@ fn print_help() {
            search [--json] <query>   Search the index (Unix socket)\n\
            status [--json]           Show daemon status (D-Bus)\n\
            rescan [--root <path>]    Rescan all roots or one root (D-Bus, polkit)\n\
+           volumes [--json]          List detected volumes and their status (D-Bus)\n\
            mount <uuid>              Mount and index an NTFS partition (D-Bus, polkit)\n\
+           mount-volume <device>     Mount and index any volume (D-Bus, polkit)\n\
+           unmount-volume <device>   Unmount a volume and drop its index (D-Bus, polkit)\n\
            config get [--json]       Show the daemon configuration (D-Bus)\n\
            config set <key> <val>    Set a configuration value (D-Bus, polkit)\n\
            help                      Show this help\n\

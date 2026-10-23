@@ -60,6 +60,7 @@ install -m755 "$here/bin/omavry" "$stage/bin/omavry"
 # PKGBUILD can share it.
 install -Dm644 data/systemd/omavrythingd.service "$stage/data/systemd/omavrythingd.service"
 install -Dm644 data/sysusers/omavrything.conf "$stage/data/sysusers/omavrything.conf"
+install -Dm644 data/tmpfiles/omavrything.conf "$stage/data/tmpfiles/omavrything.conf"
 install -Dm644 data/dbus/tech.alatcerdas.omavrything.conf "$stage/data/dbus/tech.alatcerdas.omavrything.conf"
 install -Dm644 data/polkit/tech.alatcerdas.omavrything.policy "$stage/data/polkit/tech.alatcerdas.omavrything.policy"
 install -Dm644 data/config/config.toml "$stage/data/config/config.toml"

@@ -13,3 +13,6 @@ omavrything-core.workspace = true
 serde_json = { workspace = true }
 zbus = { workspace = true }
 tokio = { workspace = true }
+
+[lints]
+workspace = true

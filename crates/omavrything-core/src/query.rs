@@ -53,12 +53,38 @@ impl Term {
         }
     }
 
+    /// The lowercased ASCII needle, or `None` for a non-ASCII term.
+    ///
+    /// Used by the candidate index to derive trigrams and token prefixes.
+    pub fn ascii(&self) -> Option<&[u8]> {
+        self.ascii.as_deref()
+    }
+
     /// The earliest byte position where this term matches `hay`, if any.
     pub fn find(&self, hay: &[u8]) -> Option<usize> {
         if let Some(needle) = &self.ascii {
             find_ascii_ci(hay, needle)
         } else if let Some(needle) = &self.unicode {
             String::from_utf8_lossy(hay)
+                .to_lowercase()
+                .find(needle.as_str())
+        } else {
+            None
+        }
+    }
+
+    /// The earliest byte position where this term matches an already
+    /// ASCII-lowercased haystack, if any.
+    ///
+    /// The candidate index stores each path ASCII-lowercased, so an ASCII term
+    /// is a plain byte search (no per-byte case folding) and a non-ASCII term
+    /// falls back to the Unicode-aware comparison. Positions are identical to
+    /// [`Term::find`] because ASCII-lowercasing is byte-preserving.
+    pub fn find_lower(&self, lower: &[u8]) -> Option<usize> {
+        if let Some(needle) = &self.ascii {
+            find_bytes(lower, needle)
+        } else if let Some(needle) = &self.unicode {
+            String::from_utf8_lossy(lower)
                 .to_lowercase()
                 .find(needle.as_str())
         } else {
@@ -85,6 +111,30 @@ impl Term {
             best = Some(best.map_or(pos, |b| b.min(pos)));
         }
         best
+    }
+
+    /// The earliest position where this term matches `parent` + `/` + `name`,
+    /// and whether it matched within `name` (for ranking), for an
+    /// already-lowercased `parent` and `name` (the candidate index's deduped
+    /// arena, A). Positions are identical to [`Term::find_in_file_path`] because
+    /// ASCII-lowercasing is byte-preserving.
+    pub fn find_in_file_path_lower(
+        &self,
+        parent: &[u8],
+        name: &[u8],
+        sep: &[u8],
+    ) -> Option<(usize, bool)> {
+        let parent_pos = self.find_lower(parent);
+        let name_pos = self.find_lower(name);
+        let name_match = name_pos.is_some();
+        // The parent precedes the name, so a parent match is the earliest; the
+        // boundary (only reachable for a term containing `/`) precedes the name.
+        let pos = match (parent_pos, name_pos) {
+            (Some(p), _) => p,
+            (None, Some(p)) => parent.len() + sep.len() + p,
+            (None, None) => self.find_boundary(parent, name, sep)?,
+        };
+        Some((pos, name_match))
     }
 
     /// The position where this term spans the `parent`/`name` separator, if any.
@@ -152,6 +202,27 @@ pub fn find_ascii_ci(hay: &[u8], needle: &[u8]) -> Option<usize> {
     None
 }
 
+/// Plain byte-substring search over an already-lowercased haystack.
+///
+/// Uses `memchr::memmem`, whose substring search is SIMD-accelerated (F8), so
+/// the hot matching loop over the lowercased path arena runs at memory speed.
+/// Allocates nothing.
+pub fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    if needle.len() > hay.len() {
+        return None;
+    }
+    // A single-byte needle is a plain `memchr`, which avoids `memmem`'s
+    // substring-search setup. This is the common case for a one-character query,
+    // which is also the full-scan case the candidate index cannot narrow.
+    if needle.len() == 1 {
+        return memchr::memchr(needle[0], hay);
+    }
+    memchr::memmem::find(hay, needle)
+}
+
 /// A match score. `Ord` orders **better** matches as **greater**, so a
 /// `BinaryHeap` of `Reverse<Rank>` keeps the worst of the current top-N at the
 /// root.
@@ -189,6 +260,22 @@ impl PartialOrd for Rank {
     }
 }
 
+impl Rank {
+    /// Pack the rank into a single `u64` sort key (larger is better) so the
+    /// top-N heap compares one integer instead of a multi-field struct. The
+    /// fields are saturated to fit: `first_pos` and `path_len` to 12 bits
+    /// (4095), `depth` to 6 bits (63), and `mtime` to 33 bits. The saturation
+    /// only affects paths longer than 4 KiB, which are rare.
+    pub fn key(&self) -> u64 {
+        let name = (self.name_match as u64) << 63;
+        let pos = 4095u64 - self.first_pos.min(4095) as u64;
+        let len = 4095u64 - self.path_len.min(4095) as u64;
+        let dep = 63u64 - self.depth.min(63) as u64;
+        let mt = self.mtime.max(0) as u64 & 0x1_FFFF_FFFF;
+        name | (pos << 51) | (len << 39) | (dep << 33) | mt
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,6 +304,17 @@ mod tests {
         // The only 'a' is at the very end, where the needle cannot fit.
         assert_eq!(find_ascii_ci(b"xxxxa", b"ab"), None);
         assert_eq!(find_ascii_ci(b"xxxxab", b"ab"), Some(4));
+    }
+
+    #[test]
+    fn find_bytes_locates_substrings() {
+        // F8: the SIMD (memmem) substring search must be correct.
+        assert_eq!(find_bytes(b"/home/sam/report.pdf", b"report"), Some(10));
+        assert_eq!(find_bytes(b"abc", b"abc"), Some(0));
+        assert_eq!(find_bytes(b"abc", b"abcd"), None);
+        assert_eq!(find_bytes(b"abc", b""), Some(0));
+        assert_eq!(find_bytes(b"abcabc", b"cab"), Some(2));
+        assert_eq!(find_bytes(b"abc", b"zzz"), None);
     }
 
     #[test]

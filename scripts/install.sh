@@ -87,12 +87,19 @@ fi
 # OMARCHY_PATH is required by the `omarchy` dispatcher and its subcommands
 # (e.g. `omarchy plugin enable` fails with "OMARCHY_PATH is not set" without
 # it); the user's login shell exports it, but `runuser` does not inherit it.
+#
+# A UTF-8 locale is set explicitly: without one, Qt (omarchy-shell) prints a
+# locale warning to stdout, which `omarchy plugin enable` captures and compares
+# against "ok", so the enable spuriously fails even though the plugin is
+# enabled.
 as_user() {
   [[ -n "$target_user" ]] || return 1
   runuser -u "$target_user" -- env \
     HOME="$user_home" \
     USER="$target_user" \
     LOGNAME="$target_user" \
+    LANG="C.UTF-8" \
+    LC_ALL="C.UTF-8" \
     XDG_RUNTIME_DIR="/run/user/$user_uid" \
     DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$user_uid/bus" \
     OMARCHY_PATH="/usr/share/omarchy" \
@@ -124,6 +131,8 @@ install -Dm644 "$here/data/systemd/omavrythingd.service" \
   /usr/lib/systemd/system/omavrythingd.service
 install -Dm644 "$here/data/sysusers/omavrything.conf" \
   /usr/lib/sysusers.d/omavrything.conf
+install -Dm644 "$here/data/tmpfiles/omavrything.conf" \
+  /usr/lib/tmpfiles.d/omavrything.conf
 install -Dm644 "$here/data/dbus/tech.alatcerdas.omavrything.conf" \
   /usr/share/dbus-1/system.d/tech.alatcerdas.omavrything.conf
 install -Dm644 "$here/data/polkit/tech.alatcerdas.omavrything.policy" \
@@ -164,6 +173,14 @@ done
 log "creating the omavrything user"
 if ! systemd-sysusers; then
   die "systemd-sysusers failed; the omavrything user/group was not created"
+fi
+# Create /run/omavrything and /var/lib/omavrything now (the unit no longer uses
+# RuntimeDirectory=/StateDirectory=, which would give the service its own mount
+# namespace and hide its NTFS mounts from the desktop); tmpfiles.d recreates
+# them on every boot. /var/lib/omavrything holds the index snapshot and the
+# state config, so the daemon (running as `omavrything`) can write both.
+if ! systemd-tmpfiles --create /usr/lib/tmpfiles.d/omavrything.conf; then
+  die "systemd-tmpfiles failed; /run/omavrything or /var/lib/omavrything was not created"
 fi
 systemctl daemon-reload >/dev/null 2>&1 || true
 

@@ -29,7 +29,7 @@
 #   makepkg --printsrcinfo > .SRCINFO
 
 pkgname=omavrything
-pkgver=0.1.11
+pkgver=0.2.0rc10
 pkgrel=1
 pkgdesc="Instant, index-backed file search for Omarchy Quattro, inspired by Voidtools Everything"
 arch=('x86_64' 'aarch64')
@@ -76,6 +76,8 @@ package() {
     "$pkgdir/usr/lib/systemd/system/omavrythingd.service"
   install -Dm644 data/sysusers/omavrything.conf \
     "$pkgdir/usr/lib/sysusers.d/omavrything.conf"
+  install -Dm644 data/tmpfiles/omavrything.conf \
+    "$pkgdir/usr/lib/tmpfiles.d/omavrything.conf"
 
   # D-Bus system-bus policy and the polkit control action.
   install -Dm644 data/dbus/tech.alatcerdas.omavrything.conf \

@@ -158,6 +158,31 @@ pub fn is_pseudo_fs(fs_type: &str) -> bool {
     )
 }
 
+/// Whether a filesystem type is a network/remote filesystem (A6). Traversal of
+/// these is time-boxed so a stalled mount cannot block a scan.
+pub fn is_network_fs(fs_type: &str) -> bool {
+    matches!(
+        fs_type,
+        "nfs"
+            | "nfs4"
+            | "cifs"
+            | "smb3"
+            | "smbfs"
+            | "9p"
+            | "ceph"
+            | "cephfs"
+            | "glusterfs"
+            | "afs"
+            | "davfs"
+            | "davfs2"
+            | "ncpfs"
+            | "fuse.sshfs"
+            | "fuse.rclone"
+            | "fuse.smbnetfs"
+            | "fuse.gocryptfs"
+    )
+}
+
 /// Whether a mount point is a pseudo path that should not be indexed.
 pub fn is_pseudo_mount_point(path: &Path) -> bool {
     // `/run` is deliberately *not* excluded: udisks2 mounts removable media
@@ -167,6 +192,20 @@ pub fn is_pseudo_mount_point(path: &Path) -> bool {
     PSEUDO
         .iter()
         .any(|p| path == Path::new(p) || path.starts_with(p))
+}
+
+/// The root under which udisks2 mounts removable media.
+pub const REMOVABLE_MEDIA_ROOT: &str = "/run/media";
+
+/// Whether `path` is under the removable-media root (`/run/media`).
+///
+/// The generic walker must not descend into `/run/media`: removable media
+/// (including NTFS) is indexed by the daemon through the NTFS MFT path, which
+/// mounts the volume read-only first. Letting the walker index it too would
+/// double-index the volume and, for a writable mount, contradict the daemon's
+/// read-only invariant (B12).
+pub fn is_removable_media_path(path: &Path) -> bool {
+    path.starts_with(REMOVABLE_MEDIA_ROOT)
 }
 
 /// Decode the octal escapes used by `/proc/mounts` (`\040` space, `\011` tab,
@@ -234,6 +273,12 @@ tmpfs /run tmpfs rw,nosuid,nodev,relatime,size=3276800k 0 0
         assert!(is_pseudo_fs("cgroup2"));
         assert!(is_pseudo_fs("nfs"));
         assert!(is_pseudo_fs("cifs"));
+        assert!(is_network_fs("nfs4"));
+        assert!(is_network_fs("cifs"));
+        assert!(is_network_fs("fuse.sshfs"));
+        assert!(!is_network_fs("ext4"));
+        assert!(!is_network_fs("btrfs"));
+        assert!(!is_network_fs("ntfs3"));
         assert!(!is_pseudo_fs("btrfs"));
         assert!(!is_pseudo_fs("ntfs3"));
         assert!(!is_pseudo_fs("zfs"));
@@ -244,6 +289,20 @@ tmpfs /run tmpfs rw,nosuid,nodev,relatime,size=3276800k 0 0
         assert!(!is_pseudo_mount_point(Path::new("/home")));
         // Removable media under /run must remain discoverable.
         assert!(!is_pseudo_mount_point(Path::new("/run/media/sam/MyDrive")));
+    }
+
+    #[test]
+    fn identifies_removable_media_paths() {
+        // The walker must not descend into /run/media: the daemon indexes it
+        // through the NTFS MFT path instead.
+        assert!(is_removable_media_path(Path::new("/run/media")));
+        assert!(is_removable_media_path(Path::new("/run/media/sam/Data")));
+        assert!(is_removable_media_path(Path::new(
+            "/run/media/sam/Data/sub"
+        )));
+        assert!(!is_removable_media_path(Path::new("/run")));
+        assert!(!is_removable_media_path(Path::new("/run/mediax")));
+        assert!(!is_removable_media_path(Path::new("/home/sam")));
     }
 
     #[test]

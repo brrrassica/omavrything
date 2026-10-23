@@ -4,8 +4,9 @@
 # Measures, over the real Unix-socket protocol:
 #   * cold-scan indexing throughput (entries/second),
 #   * search latency on an idle index (selective, broad, no-match),
-#   * search latency while the index is being rebuilt (a rescan), and
+#   * search latency while the index is being rebuilt (a rescan),
 #   * search latency while the index is being updated live (an inotify burst),
+#   * the daemon's resident set size (RSS) and peak RSS (VmHWM), and
 # plus, against the live installed daemon when one is reachable.
 # Optionally runs the Criterion micro-benchmark and the standalone profiler
 # example (both need a source checkout).
@@ -18,6 +19,7 @@
 #   --rescan            Also measure search latency during a periodic rescan
 #                       (idle-gated; usually only fires in an idle session or CI)
 #   --no-live-update    Skip the inotify live-update measurement
+#   --no-memory         Skip the daemon RSS/peak-memory measurement
 #   --criterion         Also run the Criterion micro-benchmark (cargo bench)
 #   --profile           Also run the standalone profiler example
 #   --full              Larger sizes and the rescan measurement
@@ -31,6 +33,15 @@
 #   --socket PATH       Use a specific socket for the live daemon
 #   --json              Emit a single machine-readable JSON object on stdout
 #   --keep              Keep the temporary tree and logs
+#   --budgets           Check the hermetic p50/p95 and cold-scan throughput
+#                       against per-size budgets; exit non-zero on regression
+#   --no-cache          Start the hermetic daemon with --no-query-cache so the
+#                       latency figures are cold-path, not cache hits (F7)
+#   --scaling           Also measure the cold scan with one rayon thread, to
+#                       show the parallel speedup (F8)
+#   --warm-start        Also measure a warm start from a snapshot (F6)
+#   --stop-list-divisor N  Override the F12 stop-list divisor (0 disables; R10)
+#   --no-token-table    Disable the F3 token table (R10)
 #   -h, --help          Show this help
 #
 # The default runs the hermetic benchmark and, if a daemon is reachable, the
@@ -49,10 +60,17 @@ run_live=auto
 run_hermetic=1
 do_indexing=0
 do_live_update=1
+do_memory=1
 do_criterion=0
 do_profile=0
 json=0
 keep=0
+do_budgets=0
+no_cache=0
+do_scaling=0
+do_warm_start=0
+stop_list_divisor=""
+no_token_table=0
 files=5000
 queries=30
 duration=4
@@ -60,7 +78,7 @@ live_queries=3
 records=1000000
 socket_override=""
 
-usage() { sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -68,6 +86,7 @@ while [[ $# -gt 0 ]]; do
     --hermetic) run_live=no; run_hermetic=1 ;;
     --rescan) do_indexing=1 ;;
     --no-live-update) do_live_update=0 ;;
+    --no-memory) do_memory=0 ;;
     --criterion) do_criterion=1 ;;
     --profile) do_profile=1 ;;
     --full) files=50000; queries=100; duration=15; live_queries=20; do_indexing=1 ;;
@@ -81,6 +100,12 @@ while [[ $# -gt 0 ]]; do
     --socket) socket_override="$2"; shift ;;
     --json) json=1 ;;
     --keep) keep=1 ;;
+    --budgets) do_budgets=1 ;;
+    --no-cache) no_cache=1 ;;
+    --scaling) do_scaling=1 ;;
+    --warm-start) do_warm_start=1 ;;
+    --stop-list-divisor) stop_list_divisor="$2"; shift ;;
+    --no-token-table) no_token_table=1 ;;
     -h | --help) usage; exit 0 ;;
     *)
       echo "error: unknown option: $1" >&2
@@ -122,16 +147,177 @@ trap cleanup EXIT
 
 add_result() { printf '%s\t%s\n' "$1" "$2" >> "$results"; }
 
+# ---- memory measurement ----------------------------------------------------
+# The kernel tracks both the current resident set size (VmRSS) and its peak
+# (VmHWM, the high-water mark) in /proc/<pid>/status. VmHWM captures the scan's
+# transient peak even after the daemon trims its heap, so it is the peak-memory
+# figure; VmRSS is the steady-state cost.
+read_mem_kb() {
+  awk -v f="$2:" '$1 == f {print $2}' "/proc/$1/status" 2>/dev/null
+}
+
+# Resolve the daemon PID bound to a socket by matching the socket path in each
+# process's command line (the daemon is started with --socket <path>).
+find_daemon_pid() {
+  local sock="$1" pid
+  for pid in /proc/[0-9]*; do
+    pid="${pid#/proc/}"
+    [[ -r "/proc/$pid/cmdline" ]] || continue
+    if tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -qF -- "$sock"; then
+      printf '%s\n' "$pid"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Record the current and peak RSS of a daemon PID under a result key. When the
+# entry count is known, also report the per-record memory cost: the end-to-end
+# RSS per record, and — when the daemon exposes its index accounting (the live
+# daemon, via D-Bus status) — the index's own bytes per record, i.e. how
+# memory-efficient the in-memory cache is.
+#
+# The RSS is also broken down (rc6 RSS spike) into the resident file-backed
+# pages (the binary's text/data, `RssFile`), the anonymous heap and stacks
+# (`RssAnon`), and the thread count, so the fixed daemon overhead can be
+# separated from the index itself.
+record_memory() {
+  local key="$1" pid="$2" title="${3:-daemon}" entries="${4:-}" index_bytes="${5:-}" index_capacity="${6:-}"
+  [[ "$do_memory" == 1 && -n "$pid" ]] || return 0
+  local rss hwm
+  rss="$(read_mem_kb "$pid" VmRSS)"
+  hwm="$(read_mem_kb "$pid" VmHWM)"
+  [[ -n "$rss" ]] || return 0
+  hwm="${hwm:-$rss}"
+  local rss_anon rss_file rss_shmem threads
+  rss_anon="$(read_mem_kb "$pid" RssAnon)"
+  rss_file="$(read_mem_kb "$pid" RssFile)"
+  rss_shmem="$(read_mem_kb "$pid" RssShmem)"
+  threads="$(read_mem_kb "$pid" Threads)"
+  local msg="memory ($title): rss=$((rss / 1024)) MiB  peak=$((hwm / 1024)) MiB"
+  local jobj="{\"rss_kb\": $rss, \"peak_rss_kb\": $hwm"
+  if [[ -n "$rss_anon" ]]; then
+    msg+="  anon=$((rss_anon / 1024)) MiB file=$((rss_file / 1024)) MiB threads=${threads:-?}"
+    jobj+=", \"rss_anon_kb\": ${rss_anon:-0}, \"rss_file_kb\": ${rss_file:-0}, \"rss_shmem_kb\": ${rss_shmem:-0}, \"threads\": ${threads:-0}"
+  fi
+  if [[ -n "$entries" && "$entries" -gt 0 ]]; then
+    local rss_bpr peak_bpr
+    rss_bpr="$(awk -v r="$rss" -v n="$entries" 'BEGIN { printf "%.1f", r * 1024 / n }')"
+    peak_bpr="$(awk -v r="$hwm" -v n="$entries" 'BEGIN { printf "%.1f", r * 1024 / n }')"
+    msg+="  rss/record=${rss_bpr}B peak/record=${peak_bpr}B (n=$entries)"
+    jobj+=", \"entries\": $entries, \"rss_bytes_per_record\": $rss_bpr, \"peak_rss_bytes_per_record\": $peak_bpr"
+  fi
+  if [[ -n "$index_bytes" && "$index_bytes" -gt 0 && -n "$entries" && "$entries" -gt 0 ]]; then
+    local idx_bpr
+    idx_bpr="$(awk -v b="$index_bytes" -v n="$entries" 'BEGIN { printf "%.1f", b / n }')"
+    msg+="  index/record=${idx_bpr}B"
+    jobj+=", \"index_bytes\": $index_bytes, \"index_bytes_per_record\": $idx_bpr"
+    # rc7: the overhead is RSS minus the index accounting; this is the figure the
+    # <100 B/record target must drive down alongside the index itself.
+    local overhead_bpr
+    overhead_bpr="$(awk -v r="$rss" -v b="$index_bytes" -v n="$entries" 'BEGIN { printf "%.1f", (r * 1024 - b) / n }')"
+    msg+="  overhead/record=${overhead_bpr}B"
+    jobj+=", \"overhead_bytes_per_record\": $overhead_bpr"
+  fi
+  # rc7: the index's resident (capacity) figure. The gap to the used accounting
+  # is reclaimable slack that RSS still pays for.
+  if [[ -n "$index_capacity" && "$index_capacity" -gt 0 && -n "$index_bytes" && "$index_bytes" -gt 0 && -n "$entries" && "$entries" -gt 0 ]]; then
+    local slack_bpr
+    slack_bpr="$(awk -v c="$index_capacity" -v b="$index_bytes" -v n="$entries" 'BEGIN { printf "%.1f", (c - b) / n }')"
+    msg+="  slack/record=${slack_bpr}B"
+    jobj+=", \"index_capacity_bytes\": $index_capacity, \"index_slack_bytes_per_record\": $slack_bpr"
+  fi
+  jobj+="}"
+  say "$msg"
+  add_result "$key" "$jobj"
+}
+
+# ---- performance budgets (F9) ----------------------------------------------
+# Compare the hermetic p50/p95 and cold-scan throughput against per-size budgets.
+# The budgets scale with the entry count and are deliberately generous so a slow
+# shared CI runner does not flake, while still catching an order-of-magnitude
+# regression. Exit non-zero on any violation.
+check_budgets() {
+  python3 - "$results" <<'PY'
+import json
+import sys
+
+results_path = sys.argv[1]
+data = {}
+with open(results_path) as f:
+    for line in f:
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        key, _, val = line.partition("\t")
+        try:
+            data[key] = json.loads(val)
+        except Exception:
+            data[key] = val
+
+idx = data.get("indexing")
+entries = idx.get("entries") if isinstance(idx, dict) else None
+if not entries:
+    print("budgets: no hermetic entry count recorded; skipping")
+    sys.exit(0)
+
+
+def find(prefix):
+    for k, v in data.items():
+        if k.startswith(prefix) and isinstance(v, dict):
+            return v
+    return None
+
+
+# p50 budget in ms = base + entries * per_record; the p95 budget is 2x the p50.
+BASE = {"selective": 2.0, "broad": 2.0, "no-match": 2.0}
+PER = {"selective": 0.00005, "broad": 0.0001, "no-match": 0.00005}
+MIN_ENTRIES_PER_SEC = 50000
+
+failures = []
+for kind in ("selective", "broad", "no-match"):
+    s = find(f"latency:{kind}")
+    if not s:
+        continue
+    p50 = s["wall_ms"]["p50"]
+    p95 = s["wall_ms"]["p95"]
+    b50 = BASE[kind] + entries * PER[kind]
+    b95 = b50 * 2
+    ok = p50 <= b50 and p95 <= b95
+    print(
+        f"  budget {kind:9} p50={p50:8.3f}ms (<= {b50:7.2f})  "
+        f"p95={p95:8.3f}ms (<= {b95:7.2f})  {'ok' if ok else 'FAIL'}"
+    )
+    if not ok:
+        failures.append(kind)
+
+if isinstance(idx, dict):
+    eps = idx.get("entries_per_sec", 0)
+    ok = eps >= MIN_ENTRIES_PER_SEC
+    print(
+        f"  budget cold-scan {eps:,.0f} entries/s (>= {MIN_ENTRIES_PER_SEC:,})  "
+        f"{'ok' if ok else 'FAIL'}"
+    )
+    if not ok:
+        failures.append("cold-scan")
+
+if failures:
+    print(f"budget check FAILED: {', '.join(failures)}", file=sys.stderr)
+    sys.exit(1)
+print("budget check passed")
+PY
+}
+
 # ---- locate the binaries ---------------------------------------------------
 daemon_bin=""
-for cand in "$here/bin/omavrythingd" /usr/bin/omavrythingd; do
+for cand in "$here/bin/omavrythingd" "$here/target/release/omavrythingd" /usr/bin/omavrythingd; do
   if [[ -x "$cand" ]]; then
     daemon_bin="$cand"
     break
   fi
 done
 cli_bin=""
-for cand in "$here/bin/omavry" /usr/bin/omavry; do
+for cand in "$here/bin/omavry" "$here/target/release/omavry" /usr/bin/omavry; do
   if [[ -x "$cand" ]]; then
     cli_bin="$cand"
     break
@@ -156,6 +342,7 @@ import json
 import os
 import socket
 import statistics
+import sys
 import time
 
 
@@ -215,15 +402,17 @@ def summarize(wall_ms, took_ms):
 
 
 def emit_latency(title, s):
+    # Human-readable output goes to stderr so stdout stays clean for --json.
     if not s:
-        print(f"  {title}: no samples")
+        print(f"  {title}: no samples", file=sys.stderr)
         return
     w, t = s["wall_ms"], s["took_ms"]
     print(
         f"  {title}: n={s['count']}  "
         f"wall p50={w['p50']}ms p95={w['p95']}ms p99={w['p99']}ms "
         f"max={w['max']}ms mean={w['mean']}ms  |  "
-        f"daemon took_ms p50={t['p50']} p95={t['p95']} max={t['max']}"
+        f"daemon took_ms p50={t['p50']} p95={t['p95']} max={t['max']}",
+        file=sys.stderr,
     )
 
 
@@ -241,8 +430,8 @@ def cmd_latency(a):
     s = summarize(wall, took)
     if a.json:
         print(json.dumps(s))
-    else:
-        emit_latency(a.title or a.query, s)
+    if a.title:
+        emit_latency(a.title, s)
 
 
 def cmd_record(a):
@@ -308,17 +497,20 @@ def cmd_report(a):
     }
     if a.json:
         print(json.dumps(result))
-    else:
-        print(f"  windows observed: {result['windows']}  samples: {result['total']}")
-        if result["windows"] == 0:
-            print(
-                "  note: no indexing window was observed. The periodic rescan is "
-                "idle-gated (load, CPU idle, and the login1 idle hint), so an "
-                "active desktop session vetoes it; it runs in an idle session or "
-                "in CI. The live-update burst is not gated."
-            )
-        emit_latency("idle  ", result["idle"])
-        emit_latency("during", result["during"])
+    print(
+        f"  windows observed: {result['windows']}  samples: {result['total']}",
+        file=sys.stderr,
+    )
+    if result["windows"] == 0:
+        print(
+            "  note: no indexing window was observed. The periodic rescan is "
+            "idle-gated (load, CPU idle, and the login1 idle hint), so an "
+            "active desktop session vetoes it; it runs in an idle session or "
+            "in CI. The live-update burst is not gated.",
+            file=sys.stderr,
+        )
+    emit_latency("idle  ", result["idle"])
+    emit_latency("during", result["during"])
 
 
 def main():
@@ -367,9 +559,7 @@ say "version: $version"
 say "cpu:     $cpus cores"
 say "daemon:  $daemon_bin"
 say "cli:     ${cli_bin:-not found}"
-if [[ "$json" == 1 ]]; then
-  add_result "environment" "$(python3 -c 'import json,sys; print(json.dumps({"version": sys.argv[1], "cpus": sys.argv[2], "daemon": sys.argv[3]}))' "$version" "$cpus" "$daemon_bin")"
-fi
+add_result "environment" "$(python3 -c 'import json,sys; print(json.dumps({"version": sys.argv[1], "cpus": sys.argv[2], "daemon": sys.argv[3]}))' "$version" "$cpus" "$daemon_bin")"
 
 # ---- latency measurement helper -------------------------------------------
 measure_latency() {
@@ -378,13 +568,17 @@ measure_latency() {
   # index costs hundreds of milliseconds, so a fixed 20-query warmup would
   # dominate the run.
   local warmup=$((count < 20 ? count : 20))
-  if [[ "$json" == 1 ]]; then
-    local out
-    out="$(python3 "$py" latency --socket "$sock" --query "$query" --count "$count" --warmup "$warmup" --json)"
-    add_result "latency:$title" "$out"
-  else
-    python3 "$py" latency --socket "$sock" --query "$query" --count "$count" --warmup "$warmup" --title "$title" >&2
+  # Always measure once and record the JSON result (the budget check reads it);
+  # the human-readable line is written to stderr by the Python helper.
+  local out
+  out="$(python3 "$py" latency --socket "$sock" --query "$query" --count "$count" --warmup "$warmup" --json --title "$title")"
+  # F7: with --no-cache the daemon has no memoization cache, so the figures are
+  # cold-path; tag the key so the two runs are distinguishable in --json.
+  local suffix=""
+  if [[ "$no_cache" == 1 ]]; then
+    suffix=":cold"
   fi
+  add_result "latency:$title$suffix" "$out"
 }
 
 # ---- live daemon -----------------------------------------------------------
@@ -408,20 +602,99 @@ fi
 if [[ "$run_live" == "yes" ]]; then
   section "live daemon ($live_socket)"
   live_entries=""
+  live_index_bytes=""
+  live_index_capacity=""
+  live_candidate=""
+  live_candidate_capacity=""
+  live_candidate_postings=""
+  live_candidate_lower=""
+  live_candidate_tokens=""
+  live_candidate_map=""
+  live_candidate_off=""
+  live_candidate_len=""
+  live_candidate_parent=""
+  live_candidate_subtree=""
+  live_candidate_stop=""
+  live_candidate_lower_cap=""
+  live_candidate_postings_cap=""
+  live_candidate_map_cap=""
+  live_candidate_off_cap=""
+  live_candidate_len_cap=""
+  live_candidate_parent_cap=""
+  live_candidate_subtree_cap=""
+  live_candidate_stack_cap=""
+  live_records_cap=""
+  live_paths_cap=""
+  live_map_cap_bytes=""
   if [[ -n "$cli_bin" ]]; then
-    live_entries="$("$cli_bin" status 2>/dev/null | sed -n 's/^entries: //p' || true)"
+    live_status="$("$cli_bin" status 2>/dev/null || true)"
+    live_entries="$(sed -n 's/^entries: //p' <<<"$live_status")"
+    live_index_bytes="$(sed -n 's/^memory_bytes: //p' <<<"$live_status")"
+    live_index_capacity="$(sed -n 's/^memory_capacity_bytes: //p' <<<"$live_status")"
+    live_records_cap="$(sed -n 's/^records_cap: //p' <<<"$live_status")"
+    live_paths_cap="$(sed -n 's/^paths_cap: //p' <<<"$live_status")"
+    live_map_cap_bytes="$(sed -n 's/^map_cap_bytes: //p' <<<"$live_status")"
+    live_candidate="$(sed -n 's/^candidate_bytes: //p' <<<"$live_status")"
+    live_candidate_capacity="$(sed -n 's/^candidate_capacity_bytes: //p' <<<"$live_status")"
+    live_candidate_postings="$(sed -n 's/^candidate_postings: //p' <<<"$live_status")"
+    live_candidate_lower="$(sed -n 's/^candidate_lower: //p' <<<"$live_status")"
+    live_candidate_tokens="$(sed -n 's/^candidate_tokens: //p' <<<"$live_status")"
+    live_candidate_map="$(sed -n 's/^candidate_map: //p' <<<"$live_status")"
+    live_candidate_off="$(sed -n 's/^candidate_off: //p' <<<"$live_status")"
+    live_candidate_len="$(sed -n 's/^candidate_len: //p' <<<"$live_status")"
+    live_candidate_parent="$(sed -n 's/^candidate_parent: //p' <<<"$live_status")"
+    live_candidate_subtree="$(sed -n 's/^candidate_subtree: //p' <<<"$live_status")"
+    live_candidate_stop="$(sed -n 's/^candidate_stop: //p' <<<"$live_status")"
+    live_candidate_lower_cap="$(sed -n 's/^candidate_lower_cap: //p' <<<"$live_status")"
+    live_candidate_postings_cap="$(sed -n 's/^candidate_postings_cap: //p' <<<"$live_status")"
+    live_candidate_map_cap="$(sed -n 's/^candidate_map_cap: //p' <<<"$live_status")"
+    live_candidate_off_cap="$(sed -n 's/^candidate_off_cap: //p' <<<"$live_status")"
+    live_candidate_len_cap="$(sed -n 's/^candidate_len_cap: //p' <<<"$live_status")"
+    live_candidate_parent_cap="$(sed -n 's/^candidate_parent_cap: //p' <<<"$live_status")"
+    live_candidate_subtree_cap="$(sed -n 's/^candidate_subtree_cap: //p' <<<"$live_status")"
+    live_candidate_stack_cap="$(sed -n 's/^candidate_stack_cap: //p' <<<"$live_status")"
   fi
   if [[ -n "$live_entries" ]]; then
     say "index entries: $live_entries"
-    if [[ "$json" == 1 ]]; then
-      add_result "live" "$(python3 -c 'import json,sys; print(json.dumps({"socket": sys.argv[1], "entries": int(sys.argv[2])}))' "$live_socket" "$live_entries")"
-    fi
+    add_result "live" "$(python3 -c 'import json,sys; print(json.dumps({"socket": sys.argv[1], "entries": int(sys.argv[2])}))' "$live_socket" "$live_entries")"
   fi
   # The live index is large (millions of entries) and a broad query scans all of
   # it, so the live phase uses a smaller sample count than the hermetic one.
   for q in "a" "config" "zzz-no-such-file-zzzz"; do
     measure_latency "live \"$q\"" "$q" "$live_socket" "$live_queries"
   done
+  if [[ "$do_memory" == 1 ]]; then
+    live_pid="$(find_daemon_pid "$live_socket" || true)"
+    if [[ -n "$live_pid" ]]; then
+      say "daemon pid: $live_pid"
+      record_memory "memory:live" "$live_pid" "live" "$live_entries" "$live_index_bytes" "$live_index_capacity"
+    else
+      say "memory: could not resolve the live daemon pid for $live_socket"
+    fi
+  fi
+  # Capacity-vs-length report (rc6 RSS spike): the index's own accounting counts
+  # used bytes, so any gap between capacity and length is resident slack that the
+  # per-record figure does not capture.
+  if [[ -n "$live_records_cap" && -n "$live_entries" && "$live_entries" -gt 0 ]]; then
+    say "index capacity: records_cap=${live_records_cap} paths_cap=${live_paths_cap} map_cap_bytes=${live_map_cap_bytes} index_capacity_bytes=${live_index_capacity}"
+    add_result "capacity:live" "$(python3 -c 'import json,sys; i=lambda x: int(x) if x else 0; print(json.dumps({"records_cap": i(sys.argv[1]), "paths_cap": i(sys.argv[2]), "map_cap_bytes": i(sys.argv[3]), "index_capacity_bytes": i(sys.argv[4])}))' "$live_records_cap" "$live_paths_cap" "$live_map_cap_bytes" "$live_index_capacity")"
+  fi
+  # rc7: the candidate-index capacity breakdown, so the reclaimable slack in each
+  # arena is visible next to its used size.
+  if [[ -n "$live_candidate_capacity" && "$live_candidate_capacity" -gt 0 && -n "$live_entries" && "$live_entries" -gt 0 ]]; then
+    say "candidate capacity: total=${live_candidate_capacity} lower_cap=${live_candidate_lower_cap} postings_cap=${live_candidate_postings_cap} map_cap=${live_candidate_map_cap} off_cap=${live_candidate_off_cap} len_cap=${live_candidate_len_cap} parent_cap=${live_candidate_parent_cap} subtree_cap=${live_candidate_subtree_cap} stack_cap=${live_candidate_stack_cap}"
+    add_result "candidate_capacity:live" "$(python3 -c 'import json,sys; i=lambda x: int(x) if x else 0; print(json.dumps({"bytes": i(sys.argv[1]), "lower_cap": i(sys.argv[2]), "postings_cap": i(sys.argv[3]), "map_cap": i(sys.argv[4]), "off_cap": i(sys.argv[5]), "len_cap": i(sys.argv[6]), "parent_cap": i(sys.argv[7]), "subtree_cap": i(sys.argv[8]), "stack_cap": i(sys.argv[9])}))' "$live_candidate_capacity" "$live_candidate_lower_cap" "$live_candidate_postings_cap" "$live_candidate_map_cap" "$live_candidate_off_cap" "$live_candidate_len_cap" "$live_candidate_parent_cap" "$live_candidate_subtree_cap" "$live_candidate_stack_cap")"
+  fi
+  # Per-component candidate-index breakdown (F11), from the daemon's own
+  # accounting. This is the memory the n-gram index costs, split by component.
+  if [[ -n "$live_candidate" && "$live_candidate" -gt 0 && -n "$live_entries" && "$live_entries" -gt 0 ]]; then
+    cand_bpr="$(awk -v b="$live_candidate" -v n="$live_entries" 'BEGIN { printf "%.1f", b / n }')"
+    say "candidate index: ${live_candidate} B (${cand_bpr} B/record)  postings=${live_candidate_postings} lower=${live_candidate_lower} tokens=${live_candidate_tokens} map=${live_candidate_map} off=${live_candidate_off} len=${live_candidate_len} stop=${live_candidate_stop}"
+    # A component may be absent (rc5 dropped the token table, so
+    # `candidate_tokens` is empty); coerce an empty field to 0 rather than
+    # failing the int() conversion.
+    add_result "candidate:live" "$(python3 -c 'import json,sys; i=lambda x: int(x) if x else 0; print(json.dumps({"bytes": i(sys.argv[1]), "bytes_per_record": float(sys.argv[2]), "postings": i(sys.argv[3]), "lower": i(sys.argv[4]), "tokens": i(sys.argv[5]), "map": i(sys.argv[6]), "off": i(sys.argv[7]), "len": i(sys.argv[8]), "stop": i(sys.argv[9])}))' "$live_candidate" "$cand_bpr" "$live_candidate_postings" "$live_candidate_lower" "$live_candidate_tokens" "$live_candidate_map" "$live_candidate_off" "$live_candidate_len" "$live_candidate_stop")"
+  fi
 fi
 
 # ---- hermetic daemon -------------------------------------------------------
@@ -451,12 +724,38 @@ PY
 
   start_daemon() {
     local extra=("$@")
+    # A `--snapshot <path>` in `extra` means the caller wants persistence, so the
+    # default `--no-snapshot` is dropped (F6 warm-start measurement).
+    local snap_flag=(--no-snapshot)
+    local cache_flag=()
+    for a in "${extra[@]}"; do
+      if [[ "$a" == "--snapshot" ]]; then
+        snap_flag=()
+      fi
+    done
+    # F7: --no-cache starts the daemon without the query-result memoization cache
+    # so the latency figures are cold-path.
+    if [[ "$no_cache" == 1 ]]; then
+      cache_flag=(--no-query-cache)
+    fi
+    # R10 measurement knobs: the stop-list divisor and the token table.
+    local env_vars=()
+    if [[ -n "$stop_list_divisor" ]]; then
+      env_vars+=("OMAVRYTHING_STOP_LIST_DIVISOR=$stop_list_divisor")
+    fi
+    if [[ "$no_token_table" == 1 ]]; then
+      env_vars+=("OMAVRYTHING_TOKEN_TABLE=0")
+    fi
+    local env_prefix=()
+    if [[ ${#env_vars[@]} -gt 0 ]]; then
+      env_prefix=(env "${env_vars[@]}")
+    fi
     : > "$log"
     # A previous run leaves its socket file behind; remove it so the wait below
     # cannot be satisfied by a stale, unlistened socket.
     rm -f "$sock"
-    "$daemon_bin" --no-config --root "$root" --socket "$sock" \
-      --no-dbus --no-snapshot --no-ntfs --log-level info "${extra[@]}" \
+    "${env_prefix[@]}" "$daemon_bin" --no-config --root "$root" --socket "$sock" \
+      --no-dbus --no-ntfs --log-level info "${snap_flag[@]}" "${cache_flag[@]}" "${extra[@]}" \
       >"$log" 2>&1 &
     daemon_pid=$!
     for _ in $(seq 1 600); do
@@ -483,9 +782,7 @@ PY
     if [[ -n "$entries" && -n "$elapsed" && "$elapsed" -gt 0 ]]; then
       eps="$(python3 -c "print(round($entries / ($elapsed / 1000.0), 1))")"
       say "cold scan: $entries entries in ${elapsed} ms ($eps entries/s)"
-      if [[ "$json" == 1 ]]; then
-        add_result "indexing" "{\"entries\": $entries, \"elapsed_ms\": $elapsed, \"entries_per_sec\": $eps}"
-      fi
+      add_result "indexing" "{\"entries\": $entries, \"elapsed_ms\": $elapsed, \"entries_per_sec\": $eps}"
     else
       say "cold scan: could not parse the scan line"
     fi
@@ -502,18 +799,40 @@ PY
         --log "$log" --windows-out "$tmp/windows.txt" &
       rec_pid=$!
       wait "$rec_pid" || true
-      if [[ "$json" == 1 ]]; then
-        out="$(python3 "$py" report --samples "$tmp/samples.txt" --windows "$tmp/windows.txt" --json)"
-        add_result "during_rescan" "$out"
-      else
-        python3 "$py" report --samples "$tmp/samples.txt" --windows "$tmp/windows.txt" >&2
-      fi
+      out="$(python3 "$py" report --samples "$tmp/samples.txt" --windows "$tmp/windows.txt" --json)"
+      add_result "during_rescan" "$out"
     fi
+    record_memory "memory:hermetic" "$daemon_pid" "hermetic" "$entries"
     stop_daemon
   else
     say "error: the hermetic daemon did not start; see $log" >&2
     sed 's/^/  /' "$log" >&2 || true
   fi
+
+  # --- run E: empty-index baseline (fixed daemon overhead) -----------------
+  # Start the daemon on an empty root so the RSS is the pure fixed overhead
+  # (binary text/data, runtimes, thread stacks) with zero records. This is the
+  # intercept of the RSS-vs-N line (rc6 RSS spike), and it is what the per-record
+  # figure at a small tree size is dominated by.
+  empty_root="$tmp/empty"
+  mkdir -p "$empty_root"
+  say "empty-index baseline (fixed daemon overhead):"
+  rm -f "$sock"
+  "$daemon_bin" --no-config --root "$empty_root" --socket "$sock" \
+    --no-dbus --no-ntfs --no-snapshot --log-level error \
+    >"$tmp/empty.log" 2>&1 &
+  daemon_pid=$!
+  for _ in $(seq 1 600); do
+    [[ -S "$sock" ]] && break
+    kill -0 "$daemon_pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  if [[ -S "$sock" ]]; then
+    record_memory "memory:empty" "$daemon_pid" "empty-index" "0"
+  else
+    say "empty-index baseline: daemon did not start"
+  fi
+  stop_daemon
 
   # --- run B: live-update burst --------------------------------------------
   if [[ "$do_live_update" == 1 ]]; then
@@ -521,6 +840,10 @@ PY
       burst_files=$((files / 5))
       [[ "$burst_files" -lt 1000 ]] && burst_files=1000
       burst_duration=$duration
+      # The index holds the cold-scan entries plus the burst files once the
+      # watcher has applied them, so the per-record figure uses that total.
+      burst_entries="$(sed -n 's/.*entries=\([0-9]*\).*/\1/p' <<<"$(grep -m1 'indexed entries=' "$log" || true)")"
+      [[ -n "$burst_entries" ]] && burst_entries=$((burst_entries + burst_files))
       say "search latency during live index updates (inotify burst of $burst_files files), ${burst_duration}s:"
       python3 "$py" record --socket "$sock" --query "file-0001234" \
         --duration "$burst_duration" --out "$tmp/burst-samples.txt" &
@@ -544,17 +867,67 @@ PY
       burst_end="$(python3 -c 'import time; print(time.time() * 1e3 + 1000)')"
       printf '%s %s\n' "$burst_start" "$burst_end" > "$tmp/burst-windows.txt"
       wait "$rec_pid" || true
-      if [[ "$json" == 1 ]]; then
-        out="$(python3 "$py" report --samples "$tmp/burst-samples.txt" --windows "$tmp/burst-windows.txt" --json)"
-        add_result "during_live_update" "$out"
-      else
-        python3 "$py" report --samples "$tmp/burst-samples.txt" --windows "$tmp/burst-windows.txt" >&2
-      fi
+      out="$(python3 "$py" report --samples "$tmp/burst-samples.txt" --windows "$tmp/burst-windows.txt" --json)"
+      add_result "during_live_update" "$out"
+      record_memory "memory:hermetic_live_update" "$daemon_pid" "hermetic live-update" "$burst_entries"
       stop_daemon
     else
       say "error: the hermetic daemon did not start for the live-update run" >&2
     fi
   fi
+
+  # --- run C: single-thread cold scan (F8 scaling) -------------------------
+  if [[ "$do_scaling" == 1 ]]; then
+    say "cold scan with one rayon thread (F8 scaling):"
+    if RAYON_NUM_THREADS=1 start_daemon --scan-interval 0; then
+      scan_line="$(grep -m1 'indexed entries=' "$log" || true)"
+      entries1="$(sed -n 's/.*entries=\([0-9]*\).*/\1/p' <<<"$scan_line")"
+      elapsed1="$(sed -n 's/.*elapsed_ms=\([0-9]*\).*/\1/p' <<<"$scan_line")"
+      if [[ -n "$entries1" && -n "$elapsed1" && "$elapsed1" -gt 0 ]]; then
+        eps1="$(python3 -c "print(round($entries1 / ($elapsed1 / 1000.0), 1))")"
+        say "cold scan (1 thread): $entries1 entries in ${elapsed1} ms ($eps1 entries/s)"
+        add_result "indexing_1thread" "{\"entries\": $entries1, \"elapsed_ms\": $elapsed1, \"entries_per_sec\": $eps1}"
+      else
+        say "cold scan (1 thread): could not parse the scan line"
+      fi
+      stop_daemon
+    else
+      say "error: the single-thread hermetic daemon did not start" >&2
+    fi
+  fi
+
+  # --- run D: warm start from a snapshot (F6) ------------------------------
+  if [[ "$do_warm_start" == 1 ]]; then
+    snap="$tmp/index.snapshot"
+    say "warm start from a snapshot (F6):"
+    # The first run writes the snapshot on clean shutdown; the second loads it.
+    if start_daemon --scan-interval 0 --snapshot "$snap" --snapshot-interval 0; then
+      stop_daemon
+      if [[ -f "$snap" ]]; then
+        if start_daemon --scan-interval 0 --snapshot "$snap" --snapshot-interval 0; then
+          warm_line="$(grep -m1 'warm-started from snapshot' "$log" || true)"
+          warm_ms="$(sed -n 's/.*elapsed_ms=\([0-9]*\).*/\1/p' <<<"$warm_line")"
+          if [[ -n "$warm_ms" ]]; then
+            say "warm start: ${warm_ms} ms"
+            add_result "warm_start" "{\"elapsed_ms\": $warm_ms}"
+          else
+            say "warm start: could not parse the warm-start line"
+          fi
+          stop_daemon
+        fi
+      else
+        say "warm start: no snapshot was written"
+      fi
+    else
+      say "error: the hermetic daemon did not start for the warm-start run" >&2
+    fi
+  fi
+fi
+
+# ---- performance budgets (F9) ----------------------------------------------
+if [[ "$do_budgets" == 1 ]]; then
+  section "performance budgets"
+  check_budgets
 fi
 
 # ---- optional: Criterion micro-benchmark ----------------------------------

@@ -93,12 +93,19 @@ fi
 # root, so drop to the target user with runuser and set the session bus and
 # runtime dir explicitly (omarchy talks to the running shell over them).
 # OMARCHY_PATH is required by the `omarchy` dispatcher and its subcommands.
+#
+# A UTF-8 locale is set explicitly: without one, Qt (omarchy-shell) prints a
+# locale warning to stdout, which `omarchy plugin remove` captures and compares
+# against "ok", so the removal spuriously fails even though the plugin is
+# removed.
 as_user() {
   [[ -n "$target_user" ]] || return 1
   runuser -u "$target_user" -- env \
     HOME="$user_home" \
     USER="$target_user" \
     LOGNAME="$target_user" \
+    LANG="C.UTF-8" \
+    LC_ALL="C.UTF-8" \
     XDG_RUNTIME_DIR="/run/user/$user_uid" \
     DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$user_uid/bus" \
     OMARCHY_PATH="/usr/share/omarchy" \
@@ -138,6 +145,7 @@ rm -f /usr/bin/omavrythingd
 rm -f /usr/bin/omavry
 rm -f /usr/lib/systemd/system/omavrythingd.service
 rm -f /usr/lib/sysusers.d/omavrything.conf
+rm -f /usr/lib/tmpfiles.d/omavrything.conf
 rm -f /usr/share/dbus-1/system.d/tech.alatcerdas.omavrything.conf
 rm -f /usr/share/polkit-1/actions/tech.alatcerdas.omavrything.policy
 # Pre-rename (<= 0.1.4) bus/polkit names, so an upgrade from an old install
@@ -222,25 +230,44 @@ fi
 # snapshot under /var/lib/omavrything is the only persistent state, so
 # --keep-state preserves it (and the runtime dir is always removed).
 #
-# Diagnostics: the daemon does not unmount the private NTFS mounts it created
-# (a known defect, see plans/risks.md R13). A live mount under
-# /run/omavrything/ntfs would be recursed into by the `rm -rf` below, so log
-# what is still mounted before removing the directory.
-if command -v findmnt >/dev/null 2>&1; then
-  live_ntfs="$(findmnt -rn -o TARGET,SOURCE,FSTYPE,OPTIONS | grep '^/run/omavrything/ntfs' || true)"
-  if [[ -n "$live_ntfs" ]]; then
-    warn "live NTFS mounts under /run/omavrything (the daemon does NOT unmount these):"
-    printf '%s\n' "$live_ntfs" | sed 's/^/       /'
+# Safety: the daemon mounts NTFS volumes read-only under
+# /run/omavrything/ntfs/<uuid>. A plain `rm -rf /run/omavrything` recurses into
+# a live mount: on a read-only mount that fails noisily, and on a writable one
+# it would delete the user's files. Unmount every mount under the runtime dir
+# first, then remove it with --one-file-system so a mount that could not be
+# unmounted is still never crossed.
+unmount_runtime_mounts() {
+  local target
+  local -a targets=()
+  if command -v findmnt >/dev/null 2>&1; then
+    mapfile -t targets < <(findmnt -rn -o TARGET | grep '^/run/omavrything/' | sort -r)
+  else
+    # Fallback for a minimal system without util-linux's findmnt.
+    mapfile -t targets < <(awk '$2 ~ /^\/run\/omavrything\// { print $2 }' /proc/mounts | sort -r)
   fi
-fi
+  # Deepest first, so a nested mount is unmounted before its parent.
+  for target in "${targets[@]}"; do
+    [[ -n "$target" ]] || continue
+    log "unmounting $target"
+    if ! umount "$target" 2>/dev/null; then
+      umount -l "$target" 2>/dev/null ||
+        warn "could not unmount $target; it will be left in place"
+    fi
+  done
+}
+unmount_runtime_mounts
+
 if [[ "$keep_state" == 1 ]]; then
   log "keeping /var/lib/omavrything (index snapshot)"
-  rm -rf /run/omavrything
 else
   log "removing runtime and state directories"
-  rm -rf /run/omavrything
   rm -rf /var/lib/omavrything
 fi
+# The runtime dir is always removed. --one-file-system guarantees a mount that
+# could not be unmounted is never crossed; a leftover mount makes rm report
+# EBUSY on the mount point, which is expected and non-fatal.
+rm -rf --one-file-system /run/omavrything ||
+  warn "could not fully remove /run/omavrything (a mount may still be present)"
 
 # 7. Remove the dedicated user and group created by the sysusers drop-in.
 if [[ "$keep_user" == 1 ]]; then

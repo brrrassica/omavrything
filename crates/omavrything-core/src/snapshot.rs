@@ -1,25 +1,37 @@
-//! Versioned, length-prefixed binary snapshot of the index.
+//! Versioned, directly-mappable binary image of the index (v6).
 //!
 //! The format is:
 //!
 //! ```text
-//! magic:      [u8; 8]  = b"OMAVSNAP"
-//! version:    u32 LE
-//! roots:      u32 count, then per root:
-//!               fs_kind:    u8
-//!               device:     u64
-//!               generation: u64
-//!               path:       u32 len + bytes
-//! records:    u32 count, then per record:
-//!               size, mtime, parent, path_off: u32
-//!               path_len: u16, depth: u8, flags: u8
-//! paths:      u32 len + bytes
-//! checksum:   u64 LE (FNV-1a over everything before it)
+//! magic:         [u8; 8]  = b"OMAVIMG\0"
+//! version:       u32 LE   (see [`VERSION`] / [`format_version`])
+//! header_len:    u32 LE   (offset of the first section, 8-byte aligned)
+//! section_count: u32 LE
+//! section table: per section { kind: u32, _pad: u32, offset: u64, len: u64 }
+//!   kind 1 = ROOTS        (root count u32, then per root:
+//!                            fs_kind u8, _pad[7], device u64, generation u64,
+//!                            mtime u64, path_off u64, path_len u32, _pad[4])
+//!   kind 2 = RECORDS      (record count u32, _pad[4], then a contiguous array
+//!                            of #[repr(C)] FileRecord)
+//!   kind 3 = PATHS        (raw byte arena)
+//!   kind 4 = ROOT_STRINGS (raw byte arena for root paths)
+//! checksum:      u64 LE   (FNV-1a over everything before it)
 //! ```
 //!
-//! Writes are atomic (temp file + `rename`) and the previous snapshot is kept as
-//! `<path>.prev`, so a corrupt or truncated snapshot falls back to the last good
-//! one and ultimately to a fresh scan.
+//! Every section starts on an 8-byte boundary, so the `RECORDS` array is cast
+//! directly from the mapping: loading is an `mmap` plus header validation, with
+//! no decode and no rebuild. The `PATHS` and `ROOT_STRINGS` arenas are raw
+//! bytes; records reference them by `path_off`/`path_len`.
+//!
+//! The format is explicitly versioned: [`IndexImage::from_bytes`] rejects any
+//! version other than [`VERSION`] rather than misreading a future or past
+//! layout. Writes are atomic (temp file + `rename`) and the previous snapshot is
+//! kept as `<path>.prev`, so a corrupt or truncated snapshot falls back to the
+//! last good one and ultimately to a fresh scan.
+//!
+//! A snapshot can be loaded either by reading the whole file into memory
+//! ([`load`]) or by memory-mapping it ([`load_mmap`], F6); the latter avoids the
+//! intermediate read buffer. [`warm_start_with`] selects between them.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -27,11 +39,39 @@ use std::io::{self, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use crate::index::{FileRecord, FsKind, Index, Root};
+use crate::index::{FileRecord, FsKind, Index, Root, SearchOutcome};
 use crate::scan::{ScanConfig, ScanReport, resolve_roots, scan, scan_into_index};
 
-const MAGIC: &[u8; 8] = b"OMAVSNAP";
-const VERSION: u32 = 4;
+const MAGIC: &[u8; 8] = b"OMAVIMG\0";
+/// The current snapshot format version. Bump it whenever the on-disk layout
+/// changes; [`IndexImage::from_bytes`] rejects any other version rather than
+/// misreading it.
+pub const VERSION: u32 = 6;
+
+/// Section kind: the root table (fs kind, identity, and path range).
+const SECTION_ROOTS: u32 = 1;
+/// Section kind: the contiguous `#[repr(C)]` record array.
+const SECTION_RECORDS: u32 = 2;
+/// Section kind: the raw path arena.
+const SECTION_PATHS: u32 = 3;
+/// Section kind: the raw root-path string arena.
+const SECTION_ROOT_STRINGS: u32 = 4;
+
+/// The fixed part of the header: magic(8) + version(4) + header_len(4) +
+/// section_count(4).
+const HEADER_FIXED: usize = 20;
+/// One section-table entry: kind(4) + pad(4) + offset(8) + len(8).
+const SECTION_ENTRY: usize = 24;
+/// One root entry: fs_kind(1) + pad(7) + device(8) + generation(8) +
+/// mtime(8) + path_off(8) + path_len(4) + pad(4).
+const ROOT_ENTRY: usize = 48;
+/// The serialized size of a `FileRecord`.
+const RECORD_BYTES: usize = std::mem::size_of::<FileRecord>();
+
+/// The snapshot format version this build reads and writes.
+pub fn format_version() -> u32 {
+    VERSION
+}
 
 /// A snapshot error.
 #[derive(Debug)]
@@ -75,6 +115,27 @@ pub struct RootIdentity {
     pub device: u64,
     /// btrfs subvolume generation, or 0 when unavailable.
     pub generation: u64,
+    /// A4: the root directory's mtime at scan time (Unix seconds), for the
+    /// non-btrfs staleness watermark. 0 when unavailable.
+    ///
+    /// On ext4/xfs/f2fs there is no cheap generation counter, so a warm start
+    /// compares this watermark against the root's current mtime: a root whose
+    /// mtime moved forward while the daemon was down had an entry created,
+    /// removed, or renamed directly in it, so its snapshot subtree is stale and
+    /// must be rescanned. A root whose mtime is unchanged may still have had
+    /// deeper changes, but those are covered by the periodic idle rescan.
+    pub mtime: u64,
+}
+
+/// How a warm start loads the snapshot (F6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SnapshotLoad {
+    /// Read the whole file into memory, then decode.
+    #[default]
+    Read,
+    /// Memory-map the file and decode from the mapping, avoiding the
+    /// intermediate read buffer.
+    Mmap,
 }
 
 /// The outcome of a warm start.
@@ -103,6 +164,14 @@ pub fn root_identity(path: &Path) -> Option<RootIdentity> {
     Some(RootIdentity {
         device: meta.dev(),
         generation: btrfs_generation(path).unwrap_or(0),
+        // A4: the root's mtime is the non-btrfs staleness watermark. Clamp to
+        // 0 for a pre-epoch timestamp, matching the record's mtime handling.
+        mtime: meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
     })
 }
 
@@ -140,29 +209,40 @@ fn btrfs_generation(path: &Path) -> Option<u64> {
     Some(u64::from_ne_bytes(generation_bytes))
 }
 
-/// Serialize `index` and its root identities into a snapshot byte string.
+/// Serialize `index` and its root identities into a v6 image.
+///
+/// The image is directly mappable: the `RECORDS` section is a bulk copy of the
+/// live `FileRecord` array (with `parent` links remapped past tombstones), and
+/// the `PATHS`/`ROOT_STRINGS` sections are raw arenas. No per-field
+/// serialization is performed.
 pub fn encode(index: &Index, identities: &[RootIdentity]) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(MAGIC);
-    put_u32(&mut out, VERSION);
-
     let roots = index.roots();
-    put_u32(&mut out, roots.len() as u32);
+
+    // ROOT_STRINGS arena and the ROOTS section.
+    let mut root_strings: Vec<u8> = Vec::new();
+    let mut roots_section: Vec<u8> = Vec::new();
+    put_u32(&mut roots_section, roots.len() as u32);
     for (i, root) in roots.iter().enumerate() {
         let id = identities.get(i).copied().unwrap_or(RootIdentity {
             device: 0,
             generation: 0,
+            mtime: 0,
         });
-        put_u8(&mut out, fs_kind_code(root.fs_kind));
-        put_u64(&mut out, id.device);
-        put_u64(&mut out, id.generation);
-        put_bytes(&mut out, root.path.as_bytes());
+        let path_off = root_strings.len() as u64;
+        root_strings.extend_from_slice(root.path.as_bytes());
+        put_u8(&mut roots_section, fs_kind_code(root.fs_kind));
+        roots_section.extend_from_slice(&[0u8; 7]);
+        put_u64(&mut roots_section, id.device);
+        put_u64(&mut roots_section, id.generation);
+        put_u64(&mut roots_section, id.mtime);
+        put_u64(&mut roots_section, path_off);
+        put_u32(&mut roots_section, root.path.len() as u32);
+        roots_section.extend_from_slice(&[0u8; 4]);
     }
 
+    // RECORDS section: compacted live records with remapped parents. Tombstones
+    // are not persisted, so the image stays proportional to the live set.
     let records = index.records();
-    // Tombstones are not persisted, so the snapshot stays proportional to the
-    // live set. Build a remap so `parent` links stay valid in the compacted
-    // record list.
     let mut remap = vec![u32::MAX; records.len()];
     let mut live = 0u32;
     for (i, rec) in records.iter().enumerate() {
@@ -171,7 +251,9 @@ pub fn encode(index: &Index, identities: &[RootIdentity]) -> Vec<u8> {
             live += 1;
         }
     }
-    put_u32(&mut out, live);
+    let mut records_section: Vec<u8> = Vec::with_capacity(8 + live as usize * RECORD_BYTES);
+    put_u32(&mut records_section, live);
+    records_section.extend_from_slice(&[0u8; 4]);
     for rec in records.iter() {
         if rec.is_deleted() {
             continue;
@@ -181,90 +263,314 @@ pub fn encode(index: &Index, identities: &[RootIdentity]) -> Vec<u8> {
         } else {
             remap[rec.parent as usize]
         };
-        put_u32(&mut out, rec.size);
-        put_u32(&mut out, rec.mtime);
-        put_u32(&mut out, parent);
-        put_u32(&mut out, rec.path_off);
-        put_u16(&mut out, rec.path_len);
-        put_u8(&mut out, rec.depth);
-        put_u8(&mut out, rec.flags);
+        let out = FileRecord {
+            size: rec.size,
+            mtime: rec.mtime,
+            parent,
+            path_off: rec.path_off,
+            path_len: rec.path_len,
+            depth: rec.depth,
+            flags: rec.flags,
+        };
+        records_section.extend_from_slice(record_bytes(&out));
     }
 
-    put_bytes(&mut out, index.paths());
+    let paths_section = index.paths();
 
+    let sections: [(u32, &[u8]); 4] = [
+        (SECTION_ROOTS, roots_section.as_slice()),
+        (SECTION_RECORDS, records_section.as_slice()),
+        (SECTION_PATHS, paths_section),
+        (SECTION_ROOT_STRINGS, root_strings.as_slice()),
+    ];
+    let section_count = sections.len();
+    let header_len = align8(HEADER_FIXED + section_count * SECTION_ENTRY);
+
+    // Section offsets, each 8-byte aligned.
+    let mut offsets = [0usize; 4];
+    let mut cursor = header_len;
+    for (i, (_, data)) in sections.iter().enumerate() {
+        offsets[i] = cursor;
+        cursor = align8(cursor + data.len());
+    }
+
+    let mut out = Vec::with_capacity(cursor + 8);
+    out.extend_from_slice(MAGIC);
+    put_u32(&mut out, VERSION);
+    put_u32(&mut out, header_len as u32);
+    put_u32(&mut out, section_count as u32);
+    for (i, (kind, data)) in sections.iter().enumerate() {
+        put_u32(&mut out, *kind);
+        put_u32(&mut out, 0);
+        put_u64(&mut out, offsets[i] as u64);
+        put_u64(&mut out, data.len() as u64);
+    }
+    out.resize(header_len, 0);
+    for (i, (_, data)) in sections.iter().enumerate() {
+        debug_assert_eq!(out.len(), offsets[i]);
+        out.extend_from_slice(data);
+        out.resize(align8(out.len()), 0);
+    }
     let checksum = fnv1a64(&out);
     put_u64(&mut out, checksum);
     out
 }
 
 /// Deserialize a snapshot, returning the index and its root identities.
+///
+/// This materializes an owned [`Index`] from the image; the daemon's evicted
+/// path uses [`IndexImage::from_bytes`] directly to avoid the copy.
 pub fn decode(bytes: &[u8]) -> Result<(Index, Vec<RootIdentity>), SnapshotError> {
-    if bytes.len() < MAGIC.len() + 4 + 8 {
-        return Err(SnapshotError::Truncated);
-    }
-    if &bytes[..MAGIC.len()] != MAGIC {
-        return Err(SnapshotError::BadMagic);
-    }
+    let image = IndexImage::from_bytes(bytes)?;
+    let identities = image.identities().to_vec();
+    Ok((image.to_index(), identities))
+}
 
-    let (body, tail) = bytes.split_at(bytes.len() - 8);
-    let expected = u64::from_le_bytes(tail.try_into().unwrap());
-    let actual = fnv1a64(body);
-    if expected != actual {
-        return Err(SnapshotError::ChecksumMismatch { expected, actual });
-    }
+/// A borrowed view over a v6 snapshot image.
+///
+/// The image is byte-identical to the on-disk snapshot: `records` and `paths`
+/// borrow directly from the mapping (no decode, no rebuild), so loading is an
+/// `mmap` plus header validation. `roots` and `identities` are parsed from the
+/// small `ROOTS`/`ROOT_STRINGS` sections.
+pub struct IndexImage<'a> {
+    records: Records<'a>,
+    paths: &'a [u8],
+    roots: Vec<Root>,
+    identities: Vec<RootIdentity>,
+    live: usize,
+}
 
-    let mut r = Reader::new(body);
-    r.skip(MAGIC.len())?;
-    let version = r.u32()?;
-    if version != VERSION {
-        return Err(SnapshotError::UnsupportedVersion(version));
-    }
+/// The record array of an image: borrowed from the mapping when the backing
+/// buffer is 8-byte aligned, or an owned copy otherwise (the read path).
+enum Records<'a> {
+    Borrowed(&'a [FileRecord]),
+    Owned(Vec<FileRecord>),
+}
 
-    let root_count = r.u32()? as usize;
-    let mut roots = Vec::with_capacity(root_count.min(4096));
-    let mut identities = Vec::with_capacity(root_count.min(4096));
-    for _ in 0..root_count {
-        let fs_kind = fs_kind_from_code(r.u8()?);
-        let device = r.u64()?;
-        let generation = r.u64()?;
-        let path = r.string()?;
-        roots.push(Root { path, fs_kind });
-        identities.push(RootIdentity { device, generation });
-    }
-
-    let record_count = r.u32()? as usize;
-    // Each record is 4+4+4+4+2+1+1 = 20 bytes. Reject a count that cannot fit in
-    // the remaining bytes before allocating, so a corrupt snapshot cannot force a
-    // huge allocation; then pre-size exactly so the vector does not double.
-    const RECORD_BYTES: usize = 20;
-    if record_count.saturating_mul(RECORD_BYTES) > r.remaining() {
-        return Err(SnapshotError::Truncated);
-    }
-    let mut records = Vec::with_capacity(record_count);
-    for _ in 0..record_count {
-        records.push(FileRecord {
-            size: r.u32()?,
-            mtime: r.u32()?,
-            parent: r.u32()?,
-            path_off: r.u32()?,
-            path_len: r.u16()?,
-            depth: r.u8()?,
-            flags: r.u8()?,
-        });
-    }
-
-    let paths = r.bytes()?.to_vec();
-
-    // Validate arena offsets so a corrupt snapshot cannot cause out-of-bounds
-    // reads later.
-    for rec in &records {
-        let path_end = rec.path_off as usize + rec.path_len as usize;
-        if path_end > paths.len() {
-            return Err(SnapshotError::Truncated);
+impl Records<'_> {
+    fn as_slice(&self) -> &[FileRecord] {
+        match self {
+            Records::Borrowed(s) => s,
+            Records::Owned(v) => v,
         }
     }
+}
 
-    Ok((Index::from_parts(records, paths, roots), identities))
+impl<'a> IndexImage<'a> {
+    /// Parse and validate a v6 image from `bytes`.
+    ///
+    /// The record and path arenas are borrowed from `bytes` (no allocation, no
+    /// rebuild); only the small `ROOTS`/`ROOT_STRINGS` sections are parsed into
+    /// owned vectors.
+    pub fn from_bytes(bytes: &'a [u8]) -> Result<Self, SnapshotError> {
+        if bytes.len() < HEADER_FIXED + 8 {
+            return Err(SnapshotError::Truncated);
+        }
+        if &bytes[..8] != MAGIC {
+            return Err(SnapshotError::BadMagic);
+        }
+        let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        if version != VERSION {
+            return Err(SnapshotError::UnsupportedVersion(version));
+        }
+        let header_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        let section_count = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+
+        // The checksum covers everything before the trailing 8 bytes.
+        let (body, tail) = bytes.split_at(bytes.len() - 8);
+        let expected = u64::from_le_bytes(tail.try_into().unwrap());
+        let actual = fnv1a64(body);
+        if expected != actual {
+            return Err(SnapshotError::ChecksumMismatch { expected, actual });
+        }
+
+        // Section table.
+        let table_end = HEADER_FIXED
+            .checked_add(
+                section_count
+                    .checked_mul(SECTION_ENTRY)
+                    .ok_or(SnapshotError::Truncated)?,
+            )
+            .ok_or(SnapshotError::Truncated)?;
+        if table_end > body.len() || header_len < table_end || header_len % 8 != 0 {
+            return Err(SnapshotError::Truncated);
+        }
+        let mut sections: [Option<(usize, usize)>; 4] = [None; 4];
+        for i in 0..section_count {
+            let base = HEADER_FIXED + i * SECTION_ENTRY;
+            let kind = u32::from_le_bytes(body[base..base + 4].try_into().unwrap());
+            let offset = u64::from_le_bytes(body[base + 8..base + 16].try_into().unwrap()) as usize;
+            let len = u64::from_le_bytes(body[base + 16..base + 24].try_into().unwrap()) as usize;
+            let end = offset.checked_add(len).ok_or(SnapshotError::Truncated)?;
+            if offset % 8 != 0 || end > body.len() {
+                return Err(SnapshotError::Truncated);
+            }
+            let slot = match kind {
+                SECTION_ROOTS => 0,
+                SECTION_RECORDS => 1,
+                SECTION_PATHS => 2,
+                SECTION_ROOT_STRINGS => 3,
+                _ => continue,
+            };
+            sections[slot] = Some((offset, len));
+        }
+        let (roots_off, roots_len) = sections[0].ok_or(SnapshotError::Truncated)?;
+        let (records_off, records_len) = sections[1].ok_or(SnapshotError::Truncated)?;
+        let (paths_off, paths_len) = sections[2].ok_or(SnapshotError::Truncated)?;
+        let (root_strings_off, root_strings_len) = sections[3].ok_or(SnapshotError::Truncated)?;
+
+        let root_strings = &body[root_strings_off..root_strings_off + root_strings_len];
+        let paths = &body[paths_off..paths_off + paths_len];
+
+        // ROOTS section.
+        if roots_len < 4 {
+            return Err(SnapshotError::Truncated);
+        }
+        let root_count =
+            u32::from_le_bytes(body[roots_off..roots_off + 4].try_into().unwrap()) as usize;
+        let roots_body = &body[roots_off + 4..roots_off + roots_len];
+        if root_count
+            .checked_mul(ROOT_ENTRY)
+            .is_none_or(|n| n > roots_body.len())
+        {
+            return Err(SnapshotError::Truncated);
+        }
+        let mut roots = Vec::with_capacity(root_count.min(4096));
+        let mut identities = Vec::with_capacity(root_count.min(4096));
+        for i in 0..root_count {
+            let e = &roots_body[i * ROOT_ENTRY..(i + 1) * ROOT_ENTRY];
+            let fs_kind = fs_kind_from_code(e[0]);
+            let device = u64::from_le_bytes(e[8..16].try_into().unwrap());
+            let generation = u64::from_le_bytes(e[16..24].try_into().unwrap());
+            let mtime = u64::from_le_bytes(e[24..32].try_into().unwrap());
+            let path_off = u64::from_le_bytes(e[32..40].try_into().unwrap()) as usize;
+            let path_len = u32::from_le_bytes(e[40..44].try_into().unwrap()) as usize;
+            let end = path_off
+                .checked_add(path_len)
+                .ok_or(SnapshotError::Truncated)?;
+            if end > root_strings.len() {
+                return Err(SnapshotError::Truncated);
+            }
+            let path = std::str::from_utf8(&root_strings[path_off..end])
+                .map_err(|_| SnapshotError::InvalidUtf8)?
+                .to_string();
+            roots.push(Root { path, fs_kind });
+            identities.push(RootIdentity {
+                device,
+                generation,
+                mtime,
+            });
+        }
+
+        // RECORDS section.
+        if records_len < 8 {
+            return Err(SnapshotError::Truncated);
+        }
+        let record_count =
+            u32::from_le_bytes(body[records_off..records_off + 4].try_into().unwrap()) as usize;
+        let records_bytes = &body[records_off + 8..records_off + records_len];
+        if record_count.checked_mul(RECORD_BYTES) != Some(records_bytes.len()) {
+            return Err(SnapshotError::Truncated);
+        }
+        let records = if records_bytes.as_ptr() as usize % std::mem::align_of::<FileRecord>() == 0 {
+            // SAFETY: the slice is 8-byte aligned and its length is an exact
+            // multiple of `size_of::<FileRecord>()` (checked above).
+            Records::Borrowed(unsafe { records_from_bytes(records_bytes) })
+        } else {
+            // The read path's buffer is not guaranteed 8-byte aligned; copy.
+            let mut v = Vec::with_capacity(record_count);
+            for chunk in records_bytes.chunks_exact(RECORD_BYTES) {
+                v.push(read_record(chunk));
+            }
+            Records::Owned(v)
+        };
+
+        // Validate every record's path range and count the live records.
+        let mut live = 0usize;
+        for rec in records.as_slice() {
+            let end = rec.path_off as usize + rec.path_len as usize;
+            if end > paths.len() {
+                return Err(SnapshotError::Truncated);
+            }
+            if !rec.is_deleted() {
+                live += 1;
+            }
+        }
+
+        Ok(IndexImage {
+            records,
+            paths,
+            roots,
+            identities,
+            live,
+        })
+    }
+
+    /// The raw record array.
+    pub fn records(&self) -> &[FileRecord] {
+        self.records.as_slice()
+    }
+
+    /// The path arena.
+    pub fn paths(&self) -> &[u8] {
+        self.paths
+    }
+
+    /// The parsed roots.
+    pub fn roots(&self) -> &[Root] {
+        &self.roots
+    }
+
+    /// The root identities, aligned with [`IndexImage::roots`].
+    pub fn identities(&self) -> &[RootIdentity] {
+        &self.identities
+    }
+
+    /// The number of live (non-deleted) records.
+    pub fn len(&self) -> usize {
+        self.live
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.live == 0
+    }
+
+    /// An estimate of the resident bytes held by the image's data. The pages are
+    /// file-backed and reclaimable when the image borrows a mapping.
+    pub fn memory_bytes(&self) -> u64 {
+        (self.records.as_slice().len() * RECORD_BYTES + self.paths.len()) as u64
+    }
+
+    /// Run a query against the image via the storage-agnostic linear scan.
+    pub fn search(&self, query: &str, limit: usize, offset: usize) -> SearchOutcome {
+        crate::index::search_image(self.records.as_slice(), self.paths, query, limit, offset)
+    }
+
+    /// Materialize an owned [`Index`] from the image.
+    ///
+    /// This copies the record and path arenas and rebuilds the derived path map
+    /// and candidate index, so it is the expensive path; the daemon uses it only
+    /// when it must mutate the loaded image.
+    pub fn to_index(&self) -> Index {
+        Index::from_parts(
+            self.records.as_slice().to_vec(),
+            self.paths.to_vec(),
+            self.roots.clone(),
+        )
+    }
+}
+
+/// Parse a `FileRecord` from its 20 serialized bytes.
+fn read_record(b: &[u8]) -> FileRecord {
+    FileRecord {
+        size: u32::from_le_bytes(b[0..4].try_into().unwrap()),
+        mtime: u32::from_le_bytes(b[4..8].try_into().unwrap()),
+        parent: u32::from_le_bytes(b[8..12].try_into().unwrap()),
+        path_off: u32::from_le_bytes(b[12..16].try_into().unwrap()),
+        path_len: u16::from_le_bytes(b[16..18].try_into().unwrap()),
+        depth: b[18],
+        flags: b[19],
+    }
 }
 
 /// Write a snapshot atomically, keeping the previous one as `<path>.prev`.
@@ -339,14 +645,53 @@ fn load_one(path: &Path) -> Result<(Index, Vec<RootIdentity>), SnapshotError> {
     decode(&bytes)
 }
 
+/// Load a snapshot by memory-mapping the file (F6), falling back to `<path>.prev`
+/// and then to a plain read if the mapping is unavailable.
+///
+/// The mapping is parsed as an [`IndexImage`] and then materialized into an
+/// owned [`Index`]; the daemon's evicted path keeps the mapping instead.
+pub fn load_mmap(path: &Path) -> Result<(Index, Vec<RootIdentity>), SnapshotError> {
+    match mmap_one(path) {
+        Ok(loaded) => Ok(loaded),
+        Err(_) => match mmap_one(&with_suffix(path, ".prev")) {
+            Ok(loaded) => Ok(loaded),
+            Err(_) => load(path),
+        },
+    }
+}
+
+fn mmap_one(path: &Path) -> Result<(Index, Vec<RootIdentity>), SnapshotError> {
+    let file = File::open(path)?;
+    // SAFETY: snapshots are written atomically (a temp file is renamed into
+    // place), so a mapped file is never mutated in place; a concurrent writer
+    // publishes a new inode rather than editing the mapped one.
+    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    let image = IndexImage::from_bytes(&mmap)?;
+    let identities = image.identities().to_vec();
+    Ok((image.to_index(), identities))
+}
+
 /// Build an index, warm-starting from `snapshot_path` when possible.
 ///
 /// Roots whose identity or filesystem kind changed (or that are new) are
 /// rescanned; roots that are no longer configured are dropped.
 pub fn warm_start(config: &ScanConfig, snapshot_path: &Path) -> WarmStartResult {
+    warm_start_with(config, snapshot_path, SnapshotLoad::Read)
+}
+
+/// Like [`warm_start`], but selects how the snapshot is loaded (F6).
+pub fn warm_start_with(
+    config: &ScanConfig,
+    snapshot_path: &Path,
+    load_mode: SnapshotLoad,
+) -> WarmStartResult {
     let roots = resolve_roots(config);
 
-    let Ok((mut index, stored_ids)) = load(snapshot_path) else {
+    let loaded = match load_mode {
+        SnapshotLoad::Read => load(snapshot_path),
+        SnapshotLoad::Mmap => load_mmap(snapshot_path),
+    };
+    let Ok((mut index, stored_ids)) = loaded else {
         let (index, report) = scan(config);
         let identities = roots
             .iter()
@@ -393,6 +738,7 @@ pub fn warm_start(config: &ScanConfig, snapshot_path: &Path) -> WarmStartResult 
                 excludes: config.excludes.clone(),
                 skip_pseudo: config.skip_pseudo,
                 metadata: config.metadata,
+                allow_removable: config.allow_removable,
             };
             let sub_report = scan_into_index(&mut index, &sub);
             report.entries += sub_report.entries;
@@ -428,6 +774,7 @@ pub fn warm_start(config: &ScanConfig, snapshot_path: &Path) -> WarmStartResult 
             id_by_path.get(&root.path).copied().unwrap_or(RootIdentity {
                 device: 0,
                 generation: 0,
+                mtime: 0,
             })
         })
         .collect();
@@ -479,10 +826,6 @@ fn put_u8(out: &mut Vec<u8>, v: u8) {
     out.push(v);
 }
 
-fn put_u16(out: &mut Vec<u8>, v: u16) {
-    out.extend_from_slice(&v.to_le_bytes());
-}
-
 fn put_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
 }
@@ -491,9 +834,42 @@ fn put_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 
-fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
-    put_u32(out, bytes.len() as u32);
-    out.extend_from_slice(bytes);
+/// Round `n` up to the next multiple of 8.
+fn align8(n: usize) -> usize {
+    (n + 7) & !7
+}
+
+/// View a `FileRecord` as its raw bytes.
+fn record_bytes(rec: &FileRecord) -> &[u8] {
+    // SAFETY: `FileRecord` is `#[repr(C)]` and exactly 20 bytes with no padding
+    // (asserted at compile time), and every bit pattern is a valid `u8`.
+    unsafe {
+        std::slice::from_raw_parts(
+            rec as *const FileRecord as *const u8,
+            std::mem::size_of::<FileRecord>(),
+        )
+    }
+}
+
+/// View a byte slice as `[FileRecord]`.
+///
+/// # Safety
+/// `bytes` must be 8-byte aligned and its length an exact multiple of
+/// `size_of::<FileRecord>()`.
+unsafe fn records_from_bytes(bytes: &[u8]) -> &[FileRecord] {
+    debug_assert_eq!(
+        bytes.as_ptr() as usize % std::mem::align_of::<FileRecord>(),
+        0
+    );
+    debug_assert_eq!(bytes.len() % std::mem::size_of::<FileRecord>(), 0);
+    // SAFETY: the caller guarantees `bytes` is 8-byte aligned and its length an
+    // exact multiple of `size_of::<FileRecord>()`.
+    unsafe {
+        std::slice::from_raw_parts(
+            bytes.as_ptr() as *const FileRecord,
+            bytes.len() / std::mem::size_of::<FileRecord>(),
+        )
+    }
 }
 
 /// FNV-1a 64-bit checksum.
@@ -504,63 +880,6 @@ fn fnv1a64(data: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
-}
-
-/// A bounds-checked cursor over a snapshot body.
-struct Reader<'a> {
-    buf: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Reader<'a> {
-    fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
-    }
-
-    /// The number of bytes left to read.
-    fn remaining(&self) -> usize {
-        self.buf.len() - self.pos
-    }
-
-    fn take(&mut self, n: usize) -> Result<&'a [u8], SnapshotError> {
-        let end = self.pos.checked_add(n).ok_or(SnapshotError::Truncated)?;
-        if end > self.buf.len() {
-            return Err(SnapshotError::Truncated);
-        }
-        let slice = &self.buf[self.pos..end];
-        self.pos = end;
-        Ok(slice)
-    }
-
-    fn skip(&mut self, n: usize) -> Result<(), SnapshotError> {
-        self.take(n).map(|_| ())
-    }
-
-    fn u8(&mut self) -> Result<u8, SnapshotError> {
-        Ok(self.take(1)?[0])
-    }
-
-    fn u16(&mut self) -> Result<u16, SnapshotError> {
-        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
-    }
-
-    fn u32(&mut self) -> Result<u32, SnapshotError> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
-    }
-
-    fn u64(&mut self) -> Result<u64, SnapshotError> {
-        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
-    }
-
-    fn bytes(&mut self) -> Result<&'a [u8], SnapshotError> {
-        let len = self.u32()? as usize;
-        self.take(len)
-    }
-
-    fn string(&mut self) -> Result<String, SnapshotError> {
-        let bytes = self.bytes()?;
-        String::from_utf8(bytes.to_vec()).map_err(|_| SnapshotError::InvalidUtf8)
-    }
 }
 
 #[cfg(test)]
@@ -614,6 +933,7 @@ mod tests {
         let ids = vec![RootIdentity {
             device: 42,
             generation: 99,
+            mtime: 0,
         }];
         let bytes = encode(&index, &ids);
         let (back, back_ids) = decode(&bytes).unwrap();
@@ -636,6 +956,7 @@ mod tests {
         let ids = vec![RootIdentity {
             device: 1,
             generation: 0,
+            mtime: 0,
         }];
         let good = encode(&index, &ids);
 
@@ -677,6 +998,7 @@ mod tests {
         let ids = vec![RootIdentity {
             device: 7,
             generation: 3,
+            mtime: 0,
         }];
 
         save(&index, &ids, &path).unwrap();
@@ -694,6 +1016,7 @@ mod tests {
         let ids = vec![RootIdentity {
             device: 1,
             generation: 0,
+            mtime: 0,
         }];
 
         let mut index = Index::new();
@@ -798,6 +1121,7 @@ mod tests {
         let ids = vec![RootIdentity {
             device: 1,
             generation: 0,
+            mtime: 0,
         }];
         let bytes = encode(&index, &ids);
         let (back, _) = decode(&bytes).unwrap();
@@ -862,5 +1186,266 @@ mod tests {
         assert_eq!(warm.identities.len(), warm.index.roots().len());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn format_version_is_reported() {
+        assert_eq!(format_version(), VERSION);
+    }
+
+    #[test]
+    fn warm_start_finds_a_file_created_while_down_on_non_btrfs() {
+        // M17 (A4): on ext4/xfs/f2fs there is no generation counter, so the
+        // root's mtime is the staleness watermark. A file created directly in
+        // the root while the daemon was down bumps the root's mtime, so the
+        // warm start must rescan and find it.
+        let dir = temp_dir("warm-stale");
+        let data = dir.join("data");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("a.txt"), b"x").unwrap();
+        let snap = dir.join("index.snapshot");
+        let config = ScanConfig::with_roots(vec![data.clone()]);
+
+        let cold = warm_start(&config, &snap);
+        save(&cold.index, &cold.identities, &snap).unwrap();
+
+        // "The daemon is down": a file appears in the root after the snapshot
+        // was written. This bumps the root directory's mtime. The mtime is
+        // set explicitly because the test runs within the same second the
+        // snapshot was taken, and the watermark's granularity is 1 s.
+        fs::write(data.join("offline.txt"), b"y").unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        let f = File::open(&data).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(later))
+            .unwrap();
+        drop(f);
+
+        let warm = warm_start(&config, &snap);
+        assert_eq!(
+            warm.outcome,
+            WarmStart::Partial { rescanned: 1 },
+            "a root whose mtime moved forward must be rescanned"
+        );
+        assert!(warm.index.find(&data.join("offline.txt")).is_some());
+        assert!(warm.index.find(&data.join("a.txt")).is_some());
+
+        // A second warm start with no further changes is a snapshot hit: the
+        // watermark was refreshed by the rescan's identities.
+        save(&warm.index, &warm.identities, &snap).unwrap();
+        let warm2 = warm_start(&config, &snap);
+        assert_eq!(warm2.outcome, WarmStart::Snapshot);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn warm_start_watermark_survives_a_snapshot_round_trip() {
+        // The mtime watermark must be persisted in the ROOTS section and
+        // restored by decode, so a warm start compares against the scan-time
+        // value rather than 0.
+        let dir = temp_dir("warm-watermark");
+        let data = dir.join("data");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("a.txt"), b"x").unwrap();
+        let snap = dir.join("index.snapshot");
+        let config = ScanConfig::with_roots(vec![data.clone()]);
+
+        let cold = warm_start(&config, &snap);
+        save(&cold.index, &cold.identities, &snap).unwrap();
+
+        let (_, ids) = load(&snap).unwrap();
+        let current = root_identity(&data).unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0].device, current.device);
+        assert_eq!(
+            ids[0].mtime, current.mtime,
+            "the persisted watermark must match the root's mtime"
+        );
+        assert!(ids[0].mtime > 0, "the watermark must be a real timestamp");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mmap_load_round_trips() {
+        // F6: the mmap load path must decode the same index as the read path.
+        let dir = temp_dir("mmap");
+        let path = dir.join("index.snapshot");
+        let index = sample_index();
+        let ids = vec![RootIdentity {
+            device: 5,
+            generation: 2,
+            mtime: 0,
+        }];
+        save(&index, &ids, &path).unwrap();
+
+        let (back, back_ids) = load_mmap(&path).unwrap();
+        assert_eq!(back.len(), index.len());
+        assert_eq!(back_ids, ids);
+        assert_eq!(back.search("report", 10, 0).hits.len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mmap_load_falls_back_to_prev() {
+        let dir = temp_dir("mmap-prev");
+        let path = dir.join("index.snapshot");
+        let ids = vec![RootIdentity {
+            device: 1,
+            generation: 0,
+            mtime: 0,
+        }];
+        let mut index = Index::new();
+        index.add_root(Path::new("/"), FsKind::Other);
+        index.insert(Path::new("/a.txt"), false, 1, 0);
+        save(&index, &ids, &path).unwrap();
+        index.insert(Path::new("/b.txt"), false, 2, 0);
+        save(&index, &ids, &path).unwrap();
+
+        // Corrupt the primary; the mmap loader must fall back to `.prev`.
+        fs::write(&path, b"garbage").unwrap();
+        let (loaded, _) = load_mmap(&path).unwrap();
+        assert!(loaded.find(Path::new("/a.txt")).is_some());
+        assert!(loaded.find(Path::new("/b.txt")).is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn warm_start_with_mmap_matches_read() {
+        let dir = temp_dir("warm-mmap");
+        let data = dir.join("data");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("a.txt"), b"x").unwrap();
+        let snap = dir.join("index.snapshot");
+        let config = ScanConfig::with_roots(vec![data.clone()]);
+
+        let cold = warm_start(&config, &snap);
+        save(&cold.index, &cold.identities, &snap).unwrap();
+
+        let read = warm_start_with(&config, &snap, SnapshotLoad::Read);
+        let mmap = warm_start_with(&config, &snap, SnapshotLoad::Mmap);
+        assert_eq!(read.outcome, WarmStart::Snapshot);
+        assert_eq!(mmap.outcome, WarmStart::Snapshot);
+        assert_eq!(read.index.len(), mmap.index.len());
+        assert!(mmap.index.find(&data.join("a.txt")).is_some());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn image_round_trips_and_searches() {
+        let index = sample_index();
+        let ids = vec![RootIdentity {
+            device: 42,
+            generation: 99,
+            mtime: 0,
+        }];
+        let bytes = encode(&index, &ids);
+        let image = IndexImage::from_bytes(&bytes).unwrap();
+
+        assert_eq!(image.len(), index.len());
+        assert_eq!(image.roots().len(), 1);
+        assert_eq!(image.roots()[0].fs_kind, FsKind::Btrfs);
+        assert_eq!(image.identities(), ids.as_slice());
+
+        let out = image.search("report", 10, 0);
+        assert_eq!(out.hits.len(), 1);
+        assert_eq!(out.hits[0].path, "/home/sam/report.pdf");
+        assert_eq!(out.hits[0].size, 1234);
+        assert_eq!(out.hits[0].mtime, 42);
+    }
+
+    #[test]
+    fn image_search_matches_owned_index() {
+        let mut index = Index::new();
+        index.add_root(Path::new("/"), FsKind::Other);
+        for i in 0..500 {
+            index.insert(
+                Path::new(&format!("/home/sam/dir-{}/file-{i}.txt", i % 7)),
+                false,
+                i as u64,
+                i as i64,
+            );
+        }
+        index.insert(
+            Path::new("/home/sam/Documents/report-2024.pdf"),
+            false,
+            1,
+            0,
+        );
+        // The image has no candidate index, so compare against the owned index
+        // with the candidate index disabled (the linear-scan path).
+        index.set_candidate_enabled(false);
+
+        let bytes = encode(&index, &[]);
+        let image = IndexImage::from_bytes(&bytes).unwrap();
+
+        for q in [
+            "report",
+            "file-1",
+            "dir-3",
+            "txt",
+            "documents",
+            "nomatch-xyz",
+        ] {
+            let owned = index.search(q, 20, 0);
+            let viewed = image.search(q, 20, 0);
+            assert_eq!(owned.total, viewed.total, "total mismatch for {q:?}");
+            assert_eq!(owned.hits, viewed.hits, "hits mismatch for {q:?}");
+        }
+    }
+
+    #[test]
+    fn image_rejects_corruption() {
+        let index = sample_index();
+        let good = encode(&index, &[]);
+
+        // Bad magic.
+        let mut bad = good.clone();
+        bad[0] = b'X';
+        assert!(matches!(
+            IndexImage::from_bytes(&bad),
+            Err(SnapshotError::BadMagic)
+        ));
+
+        // Truncated header.
+        assert!(matches!(
+            IndexImage::from_bytes(&good[..10]),
+            Err(SnapshotError::Truncated)
+        ));
+
+        // Flipped payload byte -> checksum mismatch.
+        let mut flipped = good.clone();
+        let mid = flipped.len() / 2;
+        flipped[mid] ^= 0xff;
+        assert!(matches!(
+            IndexImage::from_bytes(&flipped),
+            Err(SnapshotError::ChecksumMismatch { .. })
+        ));
+
+        // A section table that points out of bounds is rejected even with a
+        // valid checksum: rewrite the first section's offset, then fix the
+        // checksum so the section-table check is reached.
+        let mut oob = good.clone();
+        let off = HEADER_FIXED + 8;
+        oob[off..off + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        let body_len = oob.len() - 8;
+        let checksum = fnv1a64(&oob[..body_len]);
+        oob[body_len..].copy_from_slice(&checksum.to_le_bytes());
+        assert!(matches!(
+            IndexImage::from_bytes(&oob),
+            Err(SnapshotError::Truncated)
+        ));
+    }
+
+    #[test]
+    fn image_memory_bytes_reports_data() {
+        let index = sample_index();
+        let bytes = encode(&index, &[]);
+        let image = IndexImage::from_bytes(&bytes).unwrap();
+        let expected = (std::mem::size_of_val(image.records()) + image.paths().len()) as u64;
+        assert_eq!(image.memory_bytes(), expected);
     }
 }

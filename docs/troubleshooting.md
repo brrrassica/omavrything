@@ -105,8 +105,9 @@ A **user-run** daemon cannot own the name at all (the policy only permits the
 `omavrything` user and root), so it serves the socket search path but not D-Bus
 control. Use the system service for `status`/`config`/`rescan`/`mount`.
 
-`Rescan` and `MountNtfs`, and the privileged `SetConfig` keys (`excludes`,
-`ntfs`, `scan_interval`, `snapshot_interval`, `log_level`), are gated by the
+`Rescan`, `MountNtfs`, `MountVolume`, `UnmountVolume`, and the privileged
+`SetConfig` keys (`excludes`, `ntfs`, `scan_interval`, `snapshot_interval`,
+`evict_idle_secs`, `log_level`, `candidate_index`), are gated by the
 `tech.alatcerdas.omavrything.control` polkit action (`auth_admin_keep`) and
 prompt for authentication. The cosmetic `background_opacity` key uses the
 separate `tech.alatcerdas.omavrything.set-config` action (`allow_active=yes`), so
@@ -174,10 +175,14 @@ capability; a user-run daemon does not.
 
 4. **Mounting.** Mounting prefers **udisks2** (`udisksctl mount -o ro`) so the
    desktop sees the partition, and falls back to a private read-only **`ntfs3`**
-   mount at `/run/omavrything/ntfs/<uuid>`. If neither works, indexing still
-   succeeds (the MFT is read from the raw device) but the files are not mounted
-   for opening. Check that `udisks2` is installed and running, and that the
-   `ntfs3` kernel module is available (`modprobe ntfs3`).
+   mount at `/run/omavrything/ntfs/<uuid>`. A pre-existing mount that is
+   writable (a udisks2 auto-mount at login) is **remounted read-only and kept
+   read-only**, so the MFT read cannot set the volume's dirty bit; the desktop
+   then has no write access to that partition while the daemon runs. If neither
+   mount works, indexing still succeeds (the MFT is read from the raw device)
+   but the files are not mounted for opening. Check that `udisks2` is installed
+   and running, and that the `ntfs3` kernel module is available
+   (`modprobe ntfs3`).
 
 5. **Auto-mount policy.** Previously indexed partitions are remembered by UUID in
    a state file (`/var/lib/omavrything/ntfs.state` as root, else
@@ -197,11 +202,11 @@ capability; a user-run daemon does not.
 7. **Diagnostics.** At `info` the daemon logs each NTFS mount attempt and result,
    whether the mount was reused or daemon-created, and the `$Volume` dirty flag
    (a volume Windows did not unmount cleanly is replayed by the kernel `ntfs3`
-   driver on mount). On shutdown it warns with the list of daemon-created mounts
-   it does not unmount (a known defect tracked for v0.2.0), and
-   `scripts/uninstall.sh` warns about any live mounts under
-   `/run/omavrything/ntfs` before removing the runtime directory. Run with
-   `--log-level info` (or `OMAVRYTHING_LOG=omavrythingd=info`) to see them.
+   driver on mount). On shutdown it unmounts the private mounts it created and
+   logs any it could not release, and `scripts/uninstall.sh` warns about any
+   live mounts under `/run/omavrything/ntfs` before removing the runtime
+   directory. Run with `--log-level info` (or
+   `OMAVRYTHING_LOG=omavrythingd=info`) to see them.
 
 ## Search feels slow
 
@@ -223,10 +228,12 @@ OMAVRYTHING_PROFILE=1 scripts/run-daemon.sh
 # search "report": total=0.87ms parse=0.00ms scan=0.85ms sort=0.01ms materialize=0.01ms scanned=50401 matched=50000 parallel
 ```
 
-The `scan` stage dominates and scales linearly with the index size (1M records
-≈ 6 ms, 2M ≈ 12 ms, 3M ≈ 18 ms). If `total` is far above that, the daemon is
-likely a debug build or the index is much larger than expected. See
-[`daemon.md`](daemon.md#profiling-query-performance) for the standalone profiler.
+The `scan` stage dominates. A broad query that cannot be narrowed scales with
+the index size (1M records ≈ 6 ms, 2M ≈ 12 ms, 3M ≈ 18 ms); selective queries
+are narrowed by the candidate index and are much faster. If `total` is far above
+that, the daemon is likely a debug build or the index is much larger than
+expected. See [`daemon.md`](daemon.md#profiling-query-performance) for the
+standalone profiler.
 
 ## The index is stale or wrong
 
@@ -280,7 +287,8 @@ omarchy-shell tech.alatcerdas.omavrything ping
 - **`Permission denied` on the socket or snapshot path.** A root-owned socket or
   lock is blocking a user-run daemon; remove it with `sudo` (see above). The
   system service uses `/run/omavrything` and `/var/lib/omavrything`, created by
-  `RuntimeDirectory=`/`StateDirectory=`.
+  the installer and the tmpfiles.d drop-in (not `RuntimeDirectory=`/
+  `StateDirectory=`, which would give the service its own mount namespace).
 - **Config rejected.** Unknown keys in `/etc/omavrything/config.toml` are
   rejected so a typo is reported rather than silently ignored. The error names
   the offending key. See [`daemon.md`](daemon.md#configuration-file) for the

@@ -11,9 +11,9 @@ The plugin lives in `shell/omavrything/` and is installed to
 
 | Kind | Entry point | Role |
 | --- | --- | --- |
-| `bar-widget` | `SearchBar.qml` | Persistent search bar in the bar's center section. |
-| `overlay` | `SearchOverlay.qml` | Focusable input + floating results window. |
-| `service` | `Service.qml` | Owns the persistent `tech.alatcerdas.omavrything` IPC target. |
+| `bar-widget` | `shell/omavrything/SearchBar.qml` | Persistent search bar in the bar's center section. |
+| `overlay` | `shell/omavrything/SearchOverlay.qml` | Focusable input + floating results window. |
+| `service` | `shell/omavrything/Service.qml` | Owns the persistent `tech.alatcerdas.omavrything` IPC target. |
 
 ## The focus constraint (why the input is in the overlay)
 
@@ -26,14 +26,12 @@ The design therefore splits the search bar in two:
 
 - **`SearchBar.qml`** is a *visual mirror*: it renders the search bar in the bar
   and summons the overlay on click. It does not host the input.
-- **`SearchOverlay.qml`** hosts the real `TextInput` and the results list. It is
+- **`SearchOverlay.qml`** hosts the real search input and the results list. It is
   a `PanelWindow` with `WlrLayershell.keyboardFocus: WlrKeyboardFocus.Exclusive`
   while open, rendered as a **centered scratchpad tile** (~70% x 70%, high
   transparency) rather than a dropdown under the bar.
 
-This is the fallback recorded in [ADR-008](decisions.md#adr-008); the primary
-design (a bar widget hosting the input) was ruled out by an early feasibility
-spike.
+
 
 ## IPC
 
@@ -134,8 +132,10 @@ daemon returns; clearing the sort (a fresh query) restores the daemon's ranking.
 `maxHeight`, `maxResults`, and `backgroundOpacity`. The settings menu (gear
 button) reads the daemon's config with `omavry config get --json` and writes
 changes back through `omavry config set` (the polkit-gated D-Bus `SetConfig`),
-so the tile opacity, NTFS toggle, snapshot interval, and log level persist in
-the daemon's state config rather than the plugin's `shell.json` entry.
+so the tile opacity, NTFS toggle, snapshot interval, idle-eviction period, and
+log level persist in the daemon's state config rather than the plugin's
+`shell.json` entry. The same panel lists detected volumes with mount/unmount
+actions.
 
 ## Daemon socket
 

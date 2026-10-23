@@ -17,3 +17,6 @@ omavrything-core.workspace = true
 omavrything-client.workspace = true
 serde_json = { workspace = true }
 tokio = { workspace = true }
+
+[lints]
+workspace = true

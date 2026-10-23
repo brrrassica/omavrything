@@ -15,6 +15,7 @@ memchr = { workspace = true }
 rayon = { workspace = true }
 inotify = { workspace = true }
 libc = { workspace = true }
+memmap2 = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
@@ -23,3 +24,6 @@ criterion = { workspace = true }
 name = "search"
 harness = false
 test = false
+
+[lints]
+workspace = true
