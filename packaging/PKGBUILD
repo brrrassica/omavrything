@@ -29,7 +29,7 @@
 #   makepkg --printsrcinfo > .SRCINFO
 
 pkgname=omavrything
-pkgver=0.2.0rc11
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="Instant, index-backed file search for Omarchy Quattro, inspired by Voidtools Everything"
 arch=('x86_64' 'aarch64')
@@ -42,9 +42,9 @@ conflicts=('omavrything-git')
 options=('!lto')
 install="$pkgname.install"
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-# TODO(release): the hash below is still the v0.1.0 tarball. The v0.2.0-rc11
+# TODO(release): the hash below is still the v0.1.0 tarball. The v0.2.0
 # sources hash cannot be computed before the tag exists, so run `updpkgsums`
-# after pushing v0.2.0-rc11 and before the package is published to the AUR. It
+# after pushing v0.2.0 and before the package is published to the AUR. It
 # is not on the AUR yet.
 sha256sums=('62757fe2452bc1471188e206c78bdb465adb37d04c372ee297ce45000de89d73')
 

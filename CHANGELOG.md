@@ -4,10 +4,10 @@ Notable changes to `omavrything`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.0-rc11] — 2026-10-23
+## [0.2.0] — 2026-10-23
 
-A release candidate for v0.2.0. It rolls up the release candidates
-`0.2.0-rc1` … `0.2.0-rc10`; see those sections below for the per-candidate
+The v0.2.0 release. It rolls up the release candidates
+`0.2.0-rc1` … `0.2.0-rc11`; see those sections below for the per-candidate
 detail. The theme is robust indexing, mounting, and setup.
 
 ### Added
@@ -58,7 +58,7 @@ detail. The theme is robust indexing, mounting, and setup.
   idle, at the cost of a reload on the next query. Set `evict_idle_secs` to a
   positive number of seconds to opt in. See
   [`docs/memory-optimization.md`](docs/memory-optimization.md).
-- **Version bumped to `0.2.0-rc11`.** The shell plugin manifest and the AUR
+- **Version bumped to `0.2.0`.** The shell plugin manifest and the AUR
   `PKGBUILD` are updated to match.
 
 ### Fixed
