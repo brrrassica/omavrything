@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use inotify::{EventMask, Inotify, WatchDescriptor, WatchMask};
 
+use crate::glob::GlobSet;
 use crate::live::FsEvent;
 
 /// How long to wait for a `MOVED_TO` to pair with a `MOVED_FROM` before treating
@@ -42,6 +43,10 @@ pub struct Watcher {
     dirs: HashMap<WatchDescriptor, PathBuf>,
     pending_moves: HashMap<u32, (PathBuf, Instant)>,
     failed: Vec<PathBuf>,
+    /// Subtrees the scanner never indexes. They are not watched at all: watching
+    /// them only floods the watcher with events that `apply_event` then
+    /// discards, burning CPU under the index write lock (see `watch_dir`).
+    excludes: GlobSet,
 }
 
 impl Watcher {
@@ -51,7 +56,14 @@ impl Watcher {
             dirs: HashMap::new(),
             pending_moves: HashMap::new(),
             failed: Vec::new(),
+            excludes: GlobSet::default(),
         })
+    }
+
+    /// Set the exclude globs. Directories matching one are not watched and are
+    /// not descended into, mirroring the scanner's traversal pruning.
+    pub fn set_excludes(&mut self, excludes: GlobSet) {
+        self.excludes = excludes;
     }
 
     /// Recursively watch `dir` and all of its subdirectories.
@@ -60,6 +72,11 @@ impl Watcher {
     pub fn watch_dir(&mut self, dir: &Path) -> io::Result<()> {
         let mut stack = vec![dir.to_path_buf()];
         while let Some(current) = stack.pop() {
+            // Skip excluded subtrees: the scanner never indexes them, so
+            // watching them would only deliver events `apply_event` discards.
+            if !self.excludes.is_empty() && self.excludes.matches(&current) {
+                continue;
+            }
             match self.inotify.watches().add(&current, watch_mask()) {
                 Ok(wd) => {
                     self.dirs.insert(wd, current.clone());
@@ -307,5 +324,42 @@ mod tests {
 
         let _ = fs::remove_dir_all(&base);
         let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn excluded_subtrees_are_not_watched() {
+        let base =
+            std::env::temp_dir().join(format!("omavrything-watch-excl-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join(".cache")).unwrap();
+        fs::create_dir_all(base.join("keep")).unwrap();
+
+        let mut watcher = Watcher::new().unwrap();
+        watcher.set_excludes(GlobSet::new(&["**/.cache/**".to_string()]));
+        watcher.watch_dir(&base).unwrap();
+
+        // Only `base` and `keep` are watched; the excluded `.cache` subtree is
+        // skipped during the recursive descent.
+        assert_eq!(
+            watcher.watch_count(),
+            2,
+            "expected base + keep to be watched, not .cache"
+        );
+
+        // A change in the excluded subtree produces no event (it is not watched),
+        // so the watcher is not flooded by churn the scanner discards.
+        fs::create_dir_all(base.join(".cache/sub")).unwrap();
+        fs::write(base.join(".cache/sub/f.txt"), b"x").unwrap();
+
+        let mut buffer = [0u8; 4096];
+        let events = watcher
+            .read_events(&mut buffer, Duration::from_millis(300))
+            .unwrap();
+        assert!(
+            !events.iter().any(|e| format!("{e:?}").contains(".cache")),
+            "no event from an excluded subtree should be delivered: {events:?}"
+        );
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

@@ -1071,11 +1071,19 @@ impl Index {
     pub fn shrink_if_slack(&mut self) -> bool {
         let records_slack = self.records.capacity().saturating_sub(self.records.len());
         let paths_slack = self.paths.capacity().saturating_sub(self.paths.len());
-        // Reclaim when the spare capacity is at least a quarter of the used size.
+        // Reclaim only when the capacity is at least double the used size (slack
+        // >= used). A looser 25% threshold oscillates with appends: a `Vec` that
+        // was just shrunk to `len` doubles its capacity on the next push, which
+        // immediately satisfies a quarter-slack test again, so every following
+        // batch would `shrink_to_fit` a multi-hundred-MB arena under the write
+        // lock. Requiring slack >= len means a vec that is growing in use is
+        // never shrink-churned; only genuine overshoot (a settled scan or a
+        // shrink in length) is reclaimed, which still covers the 2x-capacity
+        // case the rc6 RSS work targeted.
         let records_used = self.records.len().max(1);
         let paths_used = self.paths.len().max(1);
         let mut shrank = false;
-        if records_slack * 4 >= records_used || paths_slack * 4 >= paths_used {
+        if records_slack >= records_used || paths_slack >= paths_used {
             self.invalidate_cache();
             self.records.shrink_to_fit();
             self.paths.shrink_to_fit();
@@ -1805,12 +1813,63 @@ impl Index {
         )
     }
 
+    /// Full linear scan for a query the candidate index cannot narrow (a term
+    /// shorter than three bytes).
+    ///
+    /// With the candidate index enabled, match through the contiguous,
+    /// deduplicated, ASCII-lowercased candidate arena ([`Index::match_record`])
+    /// rather than the storage-agnostic [`match_record_original`]. The latter
+    /// reconstructs each path from its parent record and the original-case path
+    /// arena, which is a cache miss per record and regressed the full scan ~1.7x
+    /// when rc7 shared it with the evicted image. Matching the lowercased arena
+    /// is byte-equivalent for ASCII and restores the pre-rc7 owned scan speed.
+    /// With the candidate index disabled (F10) there is no lowercased arena, so
+    /// fall back to the storage-agnostic original-case scan.
     fn scan_sequential(&self, q: &Query, want: usize) -> (usize, TopN) {
-        scan_image(&self.records, &self.paths, q, want)
+        if !self.candidate_enabled {
+            return scan_image(&self.records, &self.paths, q, want);
+        }
+        let mut top = TopN::new(want);
+        let mut total = 0usize;
+        for (i, rec) in self.records.iter().enumerate() {
+            if let Some(key) = self.match_record(i as u32, rec, q) {
+                total += 1;
+                top.push(i as u32, key);
+            }
+        }
+        (total, top)
     }
 
+    /// Parallel variant of [`Index::scan_sequential`].
     fn scan_parallel(&self, q: &Query, want: usize) -> (usize, TopN) {
-        scan_image_parallel(&self.records, &self.paths, q, want)
+        if !self.candidate_enabled {
+            return scan_image_parallel(&self.records, &self.paths, q, want);
+        }
+        self.records
+            .par_chunks(PARALLEL_CHUNK)
+            .enumerate()
+            .fold(
+                || (0usize, TopN::new(want)),
+                |(count, mut top), (chunk_i, chunk)| {
+                    let base = chunk_i * PARALLEL_CHUNK;
+                    let mut count = count;
+                    for (j, rec) in chunk.iter().enumerate() {
+                        let i = (base + j) as u32;
+                        if let Some(key) = self.match_record(i, rec, q) {
+                            top.push(i, key);
+                            count += 1;
+                        }
+                    }
+                    (count, top)
+                },
+            )
+            .reduce(
+                || (0usize, TopN::new(want)),
+                |(c1, mut t1), (c2, t2)| {
+                    t1.merge(t2);
+                    (c1 + c2, t1)
+                },
+            )
     }
 
     /// Scan only the candidate records, verifying each with the exact matcher.

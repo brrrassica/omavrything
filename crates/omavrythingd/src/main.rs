@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use omavrything_core::VERSION;
+use omavrything_core::glob::GlobSet;
 use omavrything_core::idle::{IdleMonitor, IdleThresholds, RescanScheduler};
 use omavrything_core::index::Index;
 use omavrything_core::live::FsEvent;
@@ -622,6 +623,11 @@ fn run_watcher(
         }
     };
 
+    // Do not watch excluded subtrees. The scanner prunes them, so watching them
+    // only delivers events `apply_event` discards; a churning excluded directory
+    // (e.g. `~/.cache`) then floods the watcher under the index write lock.
+    watcher.set_excludes(GlobSet::new(&config.scan().excludes));
+
     let roots: Vec<PathBuf> = index
         .roots()
         .iter()
@@ -652,13 +658,17 @@ fn run_watcher(
                     continue;
                 }
                 let scan = config.scan();
+                let mut changed = false;
                 for event in &batch {
-                    index.apply_event(event, &scan);
+                    changed |= index.apply_event(event, &scan);
                 }
                 // Reclaim the doubling slack the inserts left, so a long-running
-                // daemon does not hold 2x capacity forever (rc6 RSS spike). A
-                // no-op when the index is evicted or the slack is small.
-                if index.shrink_if_owned() {
+                // daemon does not hold 2x capacity forever (rc6 RSS spike). Only
+                // run it when the batch actually changed the index: a batch of
+                // no-op events (excluded paths, metadata noise) leaves no slack,
+                // so shrinking on every batch is pure write-lock churn. A no-op
+                // when the index is evicted or the slack is small.
+                if changed && index.shrink_if_owned() {
                     // The shrink freed pages; return them to the OS rather than
                     // leaving them in the glibc arena (rc6 RSS spike).
                     trim_heap();

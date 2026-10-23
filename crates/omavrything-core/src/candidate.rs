@@ -847,16 +847,50 @@ impl CandidateIndex {
     }
 }
 
-/// Shrink a `Vec` when its spare capacity is at least a quarter of its length
-/// (rc7). A no-op when the slack is small, so a small live-update batch does not
-/// trigger a reallocation on every event.
+/// Shrink a `Vec` when its capacity is at least double its length (slack >=
+/// len), i.e. it holds as much free space as used (rc7, tightened in rc11).
+///
+/// A looser quarter-slack test oscillates with appends: `shrink_to_fit` leaves
+/// `capacity == len`, the next push doubles the capacity, and the quarter-slack
+/// test then passes again -- so a live-update batch would reallocate the whole
+/// arena (`lower` is >100 MB on a real index) on every batch, under the index
+/// write lock. Requiring `slack >= len` means a vec that is growing in use is
+/// never shrink-churned; only genuine overshoot (a settled scan, or a vec that
+/// shrank in length) is reclaimed, which still covers the 2x-capacity case the
+/// rc6 RSS work targeted. A no-op when the slack is small, so a small
+/// live-update batch does not trigger a reallocation on every event.
 fn shrink_vec_if_slack<T>(v: &mut Vec<T>) -> bool {
     let slack = v.capacity().saturating_sub(v.len());
-    if slack * 4 >= v.len().max(1) {
+    if slack >= v.len().max(1) {
         v.shrink_to_fit();
         true
     } else {
         false
+    }
+}
+
+#[cfg(test)]
+mod shrink_tests {
+    use super::shrink_vec_if_slack;
+
+    #[test]
+    fn reclaims_overshoot_but_does_not_oscillate_with_appends() {
+        // Capacity >= 2x length is genuine overshoot: reclaimed.
+        let mut v: Vec<u8> = vec![0u8; 100];
+        v.reserve(900);
+        assert!(v.capacity() >= 200);
+        assert!(shrink_vec_if_slack(&mut v), "overshoot should be reclaimed");
+        assert_eq!(v.capacity(), v.len(), "shrink_to_fit leaves cap == len");
+
+        // A single append doubles the capacity again, but the shrink must not
+        // fire: the vec is now in use, not slack. This is what stops a live
+        // update batch from reallocating a >100 MB arena on every event.
+        v.push(1);
+        assert!(v.capacity() > v.len());
+        assert!(
+            !shrink_vec_if_slack(&mut v),
+            "one append must not re-trigger a shrink"
+        );
     }
 }
 
