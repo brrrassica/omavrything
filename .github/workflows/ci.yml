@@ -22,6 +22,14 @@ env:
 # The first run after this change downloads everything once; every run after it
 # is served entirely from the runner's own disk, with no internet fetches for
 # packages, crates or toolchains.
+#
+# Toolchains are PINNED: both the `RUSTUP_TOOLCHAIN` env and the `toolchain:`
+# input below name an exact release (stable 1.99.1, nightly-2026-10-22) instead
+# of the floating `stable`/`nightly` channels. A floating channel makes rustup
+# re-resolve the channel over the network on every run, and a nightly newer than
+# the cached one forces a full re-download into the shared RUSTUP_HOME (which is
+# what broke the fuzz job). Bump both values together to move to a newer
+# compiler, then let the first run repopulate the cache.
 # ---------------------------------------------------------------------------
 
 jobs:
@@ -42,7 +50,7 @@ jobs:
     env:
       CARGO_HOME: /ci/cache/cargo
       RUSTUP_HOME: /ci/cache/rustup
-      RUSTUP_TOOLCHAIN: stable
+      RUSTUP_TOOLCHAIN: 1.99.1
       CARGO_TARGET_DIR: /ci/cache/targets/${{ github.repository }}/${{ github.job }}
     steps:
       - name: Install dependencies (from the local pacman cache)
@@ -62,8 +70,9 @@ jobs:
           rm -rf target
           ln -s "$CARGO_TARGET_DIR" target
       - name: Install Rust toolchain (reused from RUSTUP_HOME)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.99.1
           components: rustfmt, clippy
 
       - name: Check formatting
@@ -95,7 +104,7 @@ jobs:
     env:
       CARGO_HOME: /ci/cache/cargo
       RUSTUP_HOME: /ci/cache/rustup
-      RUSTUP_TOOLCHAIN: nightly
+      RUSTUP_TOOLCHAIN: nightly-2026-10-22
       CARGO_TARGET_DIR: /ci/cache/targets/${{ github.repository }}/${{ github.job }}
     steps:
       - name: Install dependencies (from the local pacman cache)
@@ -122,7 +131,9 @@ jobs:
           ln -s "$CARGO_TARGET_DIR" fuzz/target
 
       - name: Install nightly toolchain (reused from RUSTUP_HOME)
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-22
 
       - name: Install cargo-fuzz (reused from CARGO_HOME)
         run: cargo install cargo-fuzz --locked
@@ -151,7 +162,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
 
       - uses: rustsec/audit-check@v2
         with:
@@ -171,7 +184,7 @@ jobs:
     env:
       CARGO_HOME: /ci/cache/cargo
       RUSTUP_HOME: /ci/cache/rustup
-      RUSTUP_TOOLCHAIN: stable
+      RUSTUP_TOOLCHAIN: 1.99.1
       CARGO_TARGET_DIR: /ci/cache/targets/${{ github.repository }}/${{ github.job }}
     needs: build
     steps:
@@ -192,7 +205,9 @@ jobs:
           rm -rf target
           ln -s "$CARGO_TARGET_DIR" target
       - name: Install Rust toolchain (reused from RUSTUP_HOME)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
 
       - name: Run the install/uninstall smoke test
         run: scripts/ci-smoke.sh
@@ -211,7 +226,7 @@ jobs:
     env:
       CARGO_HOME: /ci/cache/cargo
       RUSTUP_HOME: /ci/cache/rustup
-      RUSTUP_TOOLCHAIN: stable
+      RUSTUP_TOOLCHAIN: 1.99.1
       CARGO_TARGET_DIR: /ci/cache/targets/${{ github.repository }}/${{ github.job }}
     needs: build
     steps:
@@ -232,7 +247,9 @@ jobs:
           rm -rf target
           ln -s "$CARGO_TARGET_DIR" target
       - name: Install Rust toolchain (reused from RUSTUP_HOME)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
 
       - name: Build the release archive
         run: scripts/package-release.sh

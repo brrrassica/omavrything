@@ -9,6 +9,10 @@ name: Release
 # (Omarchy Quattro / Arch Linux). The container bind-mounts the runner's local
 # package cache, so pacman, the Rust toolchain, crates and build artifacts are
 # reused instead of being re-downloaded for every release.
+#
+# The Rust toolchain is PINNED to an exact release (1.99.1) rather than the
+# floating `stable` channel, so a release is reproducible and rustup never has
+# to re-resolve the channel over the network.
 on:
   push:
     tags:
@@ -37,7 +41,7 @@ jobs:
     env:
       CARGO_HOME: /ci/cache/cargo
       RUSTUP_HOME: /ci/cache/rustup
-      RUSTUP_TOOLCHAIN: stable
+      RUSTUP_TOOLCHAIN: 1.99.1
       CARGO_TARGET_DIR: /ci/cache/targets/${{ github.repository }}/${{ github.job }}
     steps:
       - name: Install dependencies (from the local pacman cache)
@@ -61,7 +65,9 @@ jobs:
           rm -rf target
           ln -s "$CARGO_TARGET_DIR" target
       - name: Install Rust toolchain (reused from RUSTUP_HOME)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
 
       - name: Resolve the release tag
         id: tag
