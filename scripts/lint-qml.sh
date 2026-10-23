@@ -27,10 +27,16 @@ if ! command -v qmllint >/dev/null 2>&1; then
   exit 1
 fi
 
-# Resolve `import qs.*` to the shell's modules.
+# Resolve `import qs.*` to the shell's modules. On a machine without the omarchy
+# shell (for example a CI container) the modules are absent; qmllint then reports
+# the unresolved `qs.*` imports as warnings, which is expected and harmless.
 shell_dir="${OMARCHY_PATH:-/usr/share/omarchy}/shell"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
-ln -sfn "$shell_dir" "$tmp/qs"
+if [[ -d "$shell_dir" ]]; then
+  ln -sfn "$shell_dir" "$tmp/qs"
+else
+  echo "note: $shell_dir not found; qs.* imports will not resolve" >&2
+fi
 
 qmllint -I "$tmp" -I /usr/lib/qt6/qml shell/omavrything/*.qml

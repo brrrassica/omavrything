@@ -69,8 +69,10 @@ const WATCH_POLL: Duration = Duration::from_millis(500);
 /// Default interval between periodic snapshot writes.
 const DEFAULT_SNAPSHOT_INTERVAL: u64 = 300;
 /// Idle period (seconds) after which the index is evicted to its snapshot image.
-/// The settings menu offers 10-60 s in 10 s steps; 20 s is the default.
-const EVICT_IDLE_SECS: u64 = 20;
+/// Eviction is an optional, experimental memory-saving feature and is disabled
+/// by default (0); the settings menu offers 0 s (disabled) or 10-60 s in 10 s
+/// steps.
+const EVICT_IDLE_SECS: u64 = 0;
 /// The group that may use the system socket.
 const SOCKET_GROUP: &str = "omavrything";
 
@@ -1701,7 +1703,7 @@ fn print_help() {
            --no-snapshot         Disable snapshot persistence\n\
            --snapshot-interval <s>  Snapshot write interval in seconds (0 disables; default 300)\n\
            --evict-idle-secs <s> Idle period before the index is evicted to its\n\
-          \x20                       snapshot image in seconds (0 disables; default 20)\n\
+          \x20                       snapshot image in seconds (0 disables; default 0)\n\
            --no-dbus             Disable the D-Bus control interface\n\
            --no-ntfs             Disable NTFS partition detection and indexing\n\
            --no-metadata         Skip per-file size/mtime stats (names-only; faster scan)\n\

@@ -83,9 +83,10 @@ This is a deliberate trade-off and is left at 500 ms for responsiveness.
 The snapshot writer encodes the index under the write lock, then writes outside
 the lock. Encoding is O(index size) and the write is a few hundred MB at most;
 it runs every `snapshot_interval` (default 300 s), on clean shutdown, and when
-the idle evictor runs. It is not a meaningful idle cost, but on a very large
-index the encode is a brief CPU burst — raise `snapshot_interval` if that is
-undesirable.
+the idle evictor runs (only if the optional, experimental idle eviction is
+enabled; it is disabled by default). It is not a meaningful idle cost, but on a
+very large index the encode is a brief CPU burst — raise `snapshot_interval` if
+that is undesirable.
 
 ## 5. Memory cap behaviour
 

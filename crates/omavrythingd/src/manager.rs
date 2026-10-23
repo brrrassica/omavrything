@@ -155,9 +155,9 @@ impl IndexManager {
     /// Filesystem events never count as activity: "idle" means the user is
     /// not searching, not that the filesystem is quiet. A desktop fires
     /// inotify events (real changes, excluded paths, metadata noise) far more
-    /// often than the default 20 s idle period, and touching on any of them
-    /// starves the idle evictor so the index never evicts and the resident
-    /// set never falls. While evicted, events accumulate in the delta (folded
+    /// often than a typical idle period, and touching on any of them starves
+    /// the idle evictor so the index never evicts and the resident set never
+    /// falls. While evicted, events accumulate in the delta (folded
     /// back when it grows past [`DELTA_FOLD_THRESHOLD`]), so eviction under
     /// churn is safe.
     pub fn apply_event(&self, event: &FsEvent, config: &ScanConfig) -> bool {
