@@ -30,6 +30,19 @@ env:
 # the cached one forces a full re-download into the shared RUSTUP_HOME (which is
 # what broke the fuzz job). Bump both values together to move to a newer
 # compiler, then let the first run repopulate the cache.
+#
+# Two further details make that reuse actually happen:
+#
+#   * Each job puts $CARGO_HOME/bin on PATH before the toolchain step. rustup is
+#     not on PATH inside a bare archlinux container even though the cached shims
+#     live there, so without this dtolnay/rust-toolchain re-downloads the rustup
+#     installer on every run (~1-2 min) and trips over
+#     "HOME differs from euid-obtained home directory".
+#
+#   * The toolchain is installed under flock /ci/cache/locks/rustup.lock. The
+#     push and pull_request runs of the same commit can otherwise install a
+#     not-yet-cached toolchain into the shared downloads dir at the same time,
+#     and one of them dies with "could not rename '...partial' ...".
 # ---------------------------------------------------------------------------
 
 jobs:
@@ -69,6 +82,17 @@ jobs:
           mkdir -p "$CARGO_TARGET_DIR"
           rm -rf target
           ln -s "$CARGO_TARGET_DIR" target
+      - name: Put the cached cargo/rustup shims on PATH
+        run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+
+      # Install under the cache lock so the action below only has to confirm
+      # the toolchain is already present.
+      - name: Pre-install the pinned toolchain under the cache lock
+        run: |
+          flock /ci/cache/locks/rustup.lock \
+            rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update \
+              --component rustfmt --component clippy
+
       - name: Install Rust toolchain (reused from RUSTUP_HOME)
         uses: dtolnay/rust-toolchain@master
         with:
@@ -130,6 +154,16 @@ jobs:
           rm -rf fuzz/target
           ln -s "$CARGO_TARGET_DIR" fuzz/target
 
+      - name: Put the cached cargo/rustup shims on PATH
+        run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+
+      # Install under the cache lock so the action below only has to confirm
+      # the toolchain is already present.
+      - name: Pre-install the pinned toolchain under the cache lock
+        run: |
+          flock /ci/cache/locks/rustup.lock \
+            rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update
+
       - name: Install nightly toolchain (reused from RUSTUP_HOME)
         uses: dtolnay/rust-toolchain@master
         with:
@@ -161,6 +195,11 @@ jobs:
       checks: write
     steps:
       - uses: actions/checkout@v4
+      # This job runs on the host, not in a container, so it uses the runner's
+      # own ~/.cargo and ~/.rustup: there is no shared cache to lock against.
+      - name: Put the cached cargo/rustup shims on PATH
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
@@ -204,6 +243,16 @@ jobs:
           mkdir -p "$CARGO_TARGET_DIR"
           rm -rf target
           ln -s "$CARGO_TARGET_DIR" target
+      - name: Put the cached cargo/rustup shims on PATH
+        run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+
+      # Install under the cache lock so the action below only has to confirm
+      # the toolchain is already present.
+      - name: Pre-install the pinned toolchain under the cache lock
+        run: |
+          flock /ci/cache/locks/rustup.lock \
+            rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update
+
       - name: Install Rust toolchain (reused from RUSTUP_HOME)
         uses: dtolnay/rust-toolchain@master
         with:
@@ -246,6 +295,16 @@ jobs:
           mkdir -p "$CARGO_TARGET_DIR"
           rm -rf target
           ln -s "$CARGO_TARGET_DIR" target
+      - name: Put the cached cargo/rustup shims on PATH
+        run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+
+      # Install under the cache lock so the action below only has to confirm
+      # the toolchain is already present.
+      - name: Pre-install the pinned toolchain under the cache lock
+        run: |
+          flock /ci/cache/locks/rustup.lock \
+            rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update
+
       - name: Install Rust toolchain (reused from RUSTUP_HOME)
         uses: dtolnay/rust-toolchain@master
         with:
