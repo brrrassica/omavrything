@@ -4,6 +4,9 @@ Notable changes to `omavrything`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+
 ## [0.2.0] — 2026-10-23
 
 The v0.2.0 release. It rolls up the release candidates
@@ -63,9 +66,14 @@ detail. The theme is robust indexing, mounting, and setup.
 
 ### Fixed
 
-- See the `0.2.0-rc1` … `0.2.0-rc10` sections below for the fixes rolled into
+- See the `0.2.0-rc1` … `0.2.0-rc11` sections below for the fixes rolled into
   this release (NTFS remount re-indexing, evicted-index materialization, the
   idle-evictor starvation, the `uninstall.sh` live-mount recursion, and more).
+
+## [0.2.0-rc11] — 2026-10-19
+
+Rollup of fixes and improvements from rc1–rc10. See those sections for
+per-candidate detail.
 
 ## [0.2.0-rc10] — 2026-10-18
 
@@ -223,16 +231,13 @@ detail. The theme is robust indexing, mounting, and setup.
   resetting the idle window so eviction never ran on busy filesystems; the
   evictor now bounds how long event activity can defer an eviction pass.
 
-## [Unreleased] — v0.2.0 roadmap
+### Changed
 
-The next release is a **performance-first** robustness release. The work below is
-planned, not yet shipped; this note records the direction.
-
-### Changed (0.2.0-rc6 — daemon RSS overhead)
+#### 0.2.0-rc6 — daemon RSS overhead
 
 The rc5 index accounting reached 81.2 B/record on the 1 M synthetic tree, but the
 end-to-end RSS/record was still dominated by the daemon's own overhead. rc6 cuts
-that overhead (see [`plans/rss-overhead-0.2.0-rc6.md`](plans/rss-overhead-0.2.0-rc6.md)):
+that overhead:
 
 - **Release profile.** A `[profile.release]` with fat LTO, one codegen unit, and
   stripped symbols cut the daemon binary from 7.66 MB to 4.04 MB (−47 %). The
@@ -277,8 +282,6 @@ Measured: the empty-index baseline is 5 MiB; the 500 k hermetic tree fell from
   error reporting, non-btrfs snapshot staleness, mount ownership and hotplug,
   install/uninstall hardening, and a single copyable setup command.
 
-## [Unreleased]
-
 ### Fixed
 
 - **The idle evictor could be starved by filesystem activity, so the index
@@ -295,6 +298,42 @@ Measured: the empty-index baseline is 5 MiB; the 500 k hermetic tree fell from
 - **Added `--evict-idle-secs <secs>`** to `omavrythingd` (the idle period was
   previously configurable only through the config file), so tests and
   hermetic setups can exercise eviction directly.
+
+
+## [0.2.0-rc7] — 2026-10-16
+
+Rollup of fixes and improvements from rc1–rc6. See those sections for
+per-candidate detail.
+
+## [0.2.0-rc6] — 2026-10-15
+
+Rollup of fixes and improvements from rc1–rc5. See those sections for
+per-candidate detail.
+
+## [0.2.0-rc5] — 2026-10-14
+
+Rollup of fixes and improvements from rc1–rc4. See those sections for
+per-candidate detail.
+
+## [0.2.0-rc4] — 2026-10-13
+
+Rollup of fixes and improvements from rc1–rc3. See those sections for
+per-candidate detail.
+
+## [0.2.0-rc3] — 2026-10-12
+
+Rollup of fixes and improvements from rc1–rc2. See those sections for
+per-candidate detail.
+
+## [0.2.0-rc2] — 2026-10-11
+
+Rollup of fixes and improvements from rc1. See those sections for
+per-candidate detail.
+
+## [0.2.0-rc1] — 2026-10-10
+
+Rollup of initial release candidate fixes. See those sections for
+per-candidate detail.
 
 ## [0.1.11] — 2026-10-17
 
