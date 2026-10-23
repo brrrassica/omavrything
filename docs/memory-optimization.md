@@ -222,7 +222,7 @@ The live index itself is ~128 B/record (longer real paths, the `by_path` map),
 so RSS/record under 100 B at 1.4 M still needs the live index to approach the
 synthetic 81.2 B/record; that is a separate lever from the overhead.
 
-## 9. Evictable, image-backed index (v6)
+## 9. Evictable, image-backed index (v6) — optional, experimental
 
 The snapshot format v6 ([`snapshot.rs`](../crates/omavrything-core/src/snapshot.rs))
 is a **directly-mappable image**: a header, a section table, and four 8-byte
@@ -232,6 +232,12 @@ from the mapping — loading is an `mmap` plus header validation, with no decode
 and no rebuild (the v4 warm-start decode was ~580 ms). v6 adds a per-root
 `mtime` watermark to the `ROOTS` section (M17/A4) for non-btrfs staleness
 detection.
+
+**Status: optional and experimental.** Idle eviction is **disabled by default**
+(`evict_idle_secs = 0`). It is a memory-saving feature for very large indexes on
+memory-constrained machines, not part of the default search path; set
+`evict_idle_secs` to a positive number of seconds to opt in. The default keeps
+the index resident so every query is served at full speed.
 
 The daemon's [`IndexManager`](../crates/omavrythingd/src/manager.rs) can **evict**
 the owned index to this image when idle. While evicted, only the mapping (file

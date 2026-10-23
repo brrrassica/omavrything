@@ -353,7 +353,11 @@ of scanning the image, which measured 8–16 s at 1.38 M records.
 rejected (a one-time cold scan after upgrade). Live updates while evicted
 accumulate in a bounded delta that is folded into a new snapshot past a
 threshold. The daemon keeps a resident path -> index map while evicted so the
-watcher can resolve a removed path to its base-image record index.
+watcher can resolve a removed path to its base-image record index. Idle eviction
+is **optional and experimental** and is **disabled by default**
+(`evict_idle_secs = 0`); it is a memory-saving feature for very large indexes on
+memory-constrained machines, and the default keeps the index resident so every
+query is served at full speed.
 
 **Alternatives considered:** Keeping the owned index resident (rejected: no RSS
 reduction); persisting the candidate index in the image (rejected: it is the

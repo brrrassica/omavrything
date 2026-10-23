@@ -81,6 +81,20 @@ jobs:
       - name: Build
         run: cargo build --all-features
 
+  qml:
+    name: qmllint (Arch)
+    runs-on: [self-hosted, opencode-sam]
+    container: archlinux:base-devel
+    needs: build
+    steps:
+      - name: Install dependencies
+        run: pacman -Syu --noconfirm --needed --overwrite '*' git qt6-declarative
+
+      - uses: actions/checkout@v4
+
+      - name: Lint the shell plugin QML
+        run: scripts/lint-qml.sh
+
   fuzz:
     name: fuzz (smoke, Arch)
     runs-on: [self-hosted, opencode-sam]

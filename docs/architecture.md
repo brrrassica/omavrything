@@ -17,9 +17,11 @@ releases.
 - **Performance first.** Compact in-memory records, SIMD-friendly substring
   matching, bounded newline-delimited JSON framing, and idle-gated background
   work.
-- **Bounded idle footprint.** When the user is idle, the daemon evicts the owned
-  index to a memory-mapped snapshot image and keeps only the mapping plus a small
-  delta; the next query materializes it again.
+- **Bounded idle footprint (optional).** An optional, experimental idle-eviction
+  feature can release the in-memory index when the user is idle: it evicts the
+  owned index to a memory-mapped snapshot image and keeps only the mapping plus a
+  small delta, and the next query materializes it again. It is disabled by
+  default (`evict_idle_secs = 0`).
 - **Privilege is isolated to one process.** Only `omavrythingd` runs as a system
   service, and it runs as the dedicated `omavrything` user with a minimal
   capability set rather than full root. The UI and CLI are unprivileged clients.
@@ -224,11 +226,12 @@ flowchart TD
 - **Periodic rescan:** a low-frequency incremental rescan of roots that received
   no inotify coverage or that are known to change without events (e.g. NTFS
   mounted read-only).
-- **Idle eviction:** after `evict_idle_secs` without user activity, the owned
-  index is encoded to the snapshot and replaced by a memory-mapped image plus a
-  resident path map. Filesystem events accumulate in a `DeltaIndex` while
+- **Idle eviction (optional, experimental):** when enabled
+  (`evict_idle_secs > 0`), after that many seconds without user activity the
+  owned index is encoded to the snapshot and replaced by a memory-mapped image
+  plus a resident path map. Filesystem events accumulate in a `DeltaIndex` while
   evicted; a query returns `state: "loading"` and starts a background
-  materialization.
+  materialization. Disabled by default.
 - **udev hotplug:** a netlink monitor wakes the NTFS pass on block-device
   add/remove/change events, with a polling fallback if the socket cannot be
   opened.
@@ -435,7 +438,7 @@ volumes = ["/dev/sda1"]                # volumes mounted through the settings UI
 excludes = ["**/.git/**", "**/node_modules/**", "**/.cache/**"]
 scan_interval = 900                    # idle-gated rescan, seconds (0 disables)
 snapshot_interval = 300                # snapshot write, seconds (0 disables)
-evict_idle_secs = 20                   # idle eviction, seconds (0 disables)
+evict_idle_secs = 0                    # optional idle eviction, seconds (0 disables; default 0)
 watch = true                           # inotify live updates
 dbus = true                            # D-Bus control interface
 ntfs = true                            # detect and index NTFS partitions

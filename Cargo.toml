@@ -20,7 +20,7 @@ manual_is_multiple_of = "allow"
 chunks_exact_to_as_chunks = "allow"
 
 [workspace.package]
-version = "0.2.0-rc10"
+version = "0.2.0-rc11"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"

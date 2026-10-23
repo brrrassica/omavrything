@@ -11,11 +11,15 @@ glibc, and package availability catches problems that an Ubuntu build would miss
 The release archive is built the same way, so the shipped binaries match the
 target platform.
 
-The workflow ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) has four
+The workflow ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) has five
 jobs:
 
 - **build** — `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`
   (debug and release), and `cargo build`.
+- **qml** — `scripts/lint-qml.sh` runs `qmllint` over the shell plugin's QML
+  (`qt6-declarative`). The omarchy shell modules are absent in the container, so
+  the `qs.*` imports are reported as warnings; the job still catches QML syntax
+  and semantic errors.
 - **fuzz** — a short `cargo-fuzz` smoke session of the snapshot and protocol
   targets (nightly toolchain).
 - **audit** — `cargo audit` for dependency advisories. This job stays on the

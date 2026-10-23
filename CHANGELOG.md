@@ -4,6 +4,69 @@ Notable changes to `omavrything`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0-rc11] — 2026-10-23
+
+A release candidate for v0.2.0. It rolls up the release candidates
+`0.2.0-rc1` … `0.2.0-rc10`; see those sections below for the per-candidate
+detail. The theme is robust indexing, mounting, and setup.
+
+### Added
+
+- **Indexing and search performance (M23).** A trigram candidate index narrows a
+  query to a superset of candidates, a compact lowercased name arena is scanned
+  first, and a sorted token table serves single-token prefix queries. The
+  postings are a delta + varint-encoded CSR arena, the most frequent trigrams
+  are stop-listed, and the token table stores one basename entry per record.
+  Rescans apply deltas instead of rebuilding, and the snapshot is a versioned,
+  directly mappable image with an optional mmap load. A `candidate_index` config
+  key (default `true`) can disable the n-gram index and fall back to a linear
+  scan on very large indexes.
+- **NTFS forced-close and shutdown safety (M25).** The daemon unmounts every
+  mount it created on `SIGTERM`/`SIGINT`, retries a busy unmount before a lazy
+  fallback, and reconciles stale daemon-created mounts on startup after a
+  `SIGKILL` or crash. Every mount is verified read-only before indexing.
+- **Mount correctness and hotplug (M19).** Mount and unmount commands are
+  time-boxed; both the udisks2 and private `ntfs3` paths mount
+  `ro,nosuid,nodev,noexec`; a UUID-less volume uses its device basename for the
+  private mount point; and the NTFS policy is written atomically under a lock. A
+  udev netlink monitor wakes the hotplug pass on block-device add/remove/change.
+- **Indexing correctness, observability, and snapshot staleness (M15–M17).** The
+  walker no longer crosses a nested mount that shares the root's device and
+  tracks a visited `(dev, inode)` set to prevent loops. Traversal failures are
+  recorded and surfaced in `GetStatus`; a scan is cancelled promptly on shutdown
+  or when a newer rescan supersedes it; unwatched subtrees are rescanned on a
+  targeted cadence; and network-filesystem traversal is time-boxed. A warm start
+  detects offline changes on ext4/xfs/f2fs via a root mtime watermark.
+- **Install/uninstall completeness and hardening (M13–M14).** The release
+  archive ships `uninstall.sh` and `doctor.sh`; install and uninstall are
+  idempotent; an `omavrythingd(8)` man page is installed; and a CI job exercises
+  install → enable → search → uninstall in the Arch container.
+- **Non-manual setup (M21).** The release archive ships a download-then-run
+  bootstrap script that installs the daemon and plugin, enables the service, and
+  verifies the install.
+- **No-match keeps the last results.** When a query has no matches, the overlay
+  keeps the previous result page visible (dimmed) instead of blanking the list,
+  and tints the input's last character red — mimicking Voidtools Everything. The
+  stale page is display-only: the cursor and Enter are disabled until a query
+  matches again.
+
+### Changed
+
+- **Idle index eviction is now disabled by default.** `evict_idle_secs`
+  defaults to `0` (disabled). Eviction is an **optional, experimental**
+  memory-saving feature: it releases the in-memory index when the desktop is
+  idle, at the cost of a reload on the next query. Set `evict_idle_secs` to a
+  positive number of seconds to opt in. See
+  [`docs/memory-optimization.md`](docs/memory-optimization.md).
+- **Version bumped to `0.2.0-rc11`.** The shell plugin manifest and the AUR
+  `PKGBUILD` are updated to match.
+
+### Fixed
+
+- See the `0.2.0-rc1` … `0.2.0-rc10` sections below for the fixes rolled into
+  this release (NTFS remount re-indexing, evicted-index materialization, the
+  idle-evictor starvation, the `uninstall.sh` live-mount recursion, and more).
+
 ## [0.2.0-rc10] — 2026-10-18
 
 ### Added

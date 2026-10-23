@@ -16,7 +16,7 @@ system daemon (`omavrythingd`) keeps an in-memory index of all mounted
 filesystems — using directory traversal + inotify for Linux filesystems
 (btrfs/ext4/xfs/f2fs) and the MFT for NTFS partitions.
 
-> **Status:** v0.2.0-rc10. See [`docs/`](docs/) and the
+> **Status:** v0.2.0-rc11. See [`docs/`](docs/) and the
 > [changelog](CHANGELOG.md).
 
 ## Install
@@ -89,6 +89,15 @@ reads NTFS partitions from the MFT on the block device.
 (`/run/omavrything/omavrything.sock` for the system service, or
 `$XDG_RUNTIME_DIR/omavrything.sock` for a user-run daemon). There is no network
 client and no telemetry.
+
+## Memory
+
+The daemon keeps the index in RAM so searches are instant. An **optional,
+experimental** idle-eviction feature can release that memory when the desktop is
+idle: it writes the index to a memory-mapped snapshot and drops the in-memory
+copy, and the next query reloads it. It is **disabled by default**
+(`evict_idle_secs = 0`); set it to a positive number of seconds to opt in. See
+[`docs/memory-optimization.md`](docs/memory-optimization.md).
 
 ## Documentation
 

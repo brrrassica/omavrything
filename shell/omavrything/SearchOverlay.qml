@@ -36,6 +36,12 @@ Item {
   // True while the daemon is mapping an evicted index; the empty state shows a
   // "reloading" message and the query is retried.
   property bool indexLoading: false
+  // True when the current query has no matches. The last result page is kept
+  // visible (dimmed) instead of blanking the list, and the input's last
+  // character is tinted red — mimicking Voidtools Everything's "keep the last
+  // results" feel. The stale page is display-only: the cursor and Enter are
+  // disabled until a query matches again.
+  property bool noMatch: false
 
   // Column sorting: "" keeps the daemon's ranking; otherwise the results are
   // re-sorted client-side by the selected column.
@@ -73,8 +79,10 @@ Item {
   }
 
   // Eviction-cadence choices: 0 s (disables eviction) then 10 s to 60 s in 10 s
-  // steps. The daemon evicts the index to its snapshot image after this idle
-  // period, dropping RSS to the mapping plus a small delta; a query reloads it.
+  // steps. Eviction is an optional, experimental memory-saving feature: the
+  // daemon evicts the index to its snapshot image after this idle period,
+  // dropping RSS to the mapping plus a small delta; a query reloads it. It is
+  // disabled by default.
   readonly property var evictionOptions: {
     var opts = [{ value: "0", label: "0 s (disables eviction)" }]
     for (var s = 10; s <= 60; s += 10) opts.push({ value: String(s), label: s + " s" })
@@ -144,6 +152,7 @@ Item {
     root.filterText = ""
     root.selectedIndex = 0
     root.cursorActive = false
+    root.noMatch = false
     root.results = []
     displayModel.clear()
     root.writeQuery("")
@@ -273,6 +282,7 @@ Item {
   // in handleResponse().
   function sendQuery() {
     if (!sock.connected) {
+      root.noMatch = false
       root.results = []
       displayModel.clear()
       return
@@ -302,6 +312,17 @@ Item {
     // unbounded result set (0.1.8 security hardening).
     var results = response.results
     if (results.length > root.maxResults) results = results.slice(0, root.maxResults)
+
+    // No matches for a non-empty query: keep the last result page visible
+    // (dimmed) instead of blanking the list, and flag the no-match state for
+    // the red cue. The stale page is display-only. A cleared query (empty
+    // filterText) does clear the list.
+    if (results.length === 0 && root.filterText !== "") {
+      root.noMatch = true
+      root.cursorActive = false
+      return
+    }
+    root.noMatch = false
 
     root.results = results
     if (root.selectedIndex >= results.length)
@@ -360,14 +381,16 @@ Item {
   }
 
   function select(delta) {
-    if (root.results.length === 0) return
+    if (root.noMatch || root.results.length === 0) return
     root.cursorActive = true
     root.selectedIndex = (root.selectedIndex + delta + root.results.length) % root.results.length
     resultList.positionViewAtIndex(root.selectedIndex, ListView.Contain)
   }
 
   function activate() {
-    if (root.results.length === 0) return
+    // The no-match page is the last result set, not a match for the current
+    // query; do not open a file that does not match what the user typed.
+    if (root.noMatch || root.results.length === 0) return
     // With no explicit cursor, Enter opens the top result (Everything behavior).
     var index = root.cursorActive ? root.selectedIndex : 0
     if (index < 0 || index >= root.results.length) return
@@ -706,6 +729,23 @@ Item {
                 clip: true
               }
 
+              // Reddish cue on the last character when the query has no match
+              // (Everything-style). Only shown when the text is not elided, so
+              // the last character is actually visible.
+              Text {
+                id: lastChar
+                anchors.verticalCenter: parent.verticalCenter
+                x: inputText.contentWidth - lastChar.contentWidth
+                visible: root.noMatch && root.filterText.length > 0
+                  && inputText.contentWidth <= inputText.width
+                text: root.filterText.length > 0
+                  ? root.filterText.charAt(root.filterText.length - 1) : ""
+                textFormat: Text.PlainText
+                color: "#e06c75"
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.heading
+              }
+
               // Caret at the end of the query. The custom field has no in-text
               // cursor movement; the query is edited at its end.
               Rectangle {
@@ -848,6 +888,9 @@ Item {
             id: resultList
             anchors.fill: parent
             visible: root.results.length > 0 && !root.settingsOpen
+            // Dim the stale page while the current query has no match, so it
+            // reads as "last results", not "current results".
+            opacity: root.noMatch ? 0.45 : 1
             model: displayModel
             clip: true
             spacing: 0
@@ -1080,7 +1123,8 @@ Item {
             }
 
             // Eviction cadence: the idle period after which the index is evicted
-            // to its snapshot image (10-60 s in 10 s steps; default 20 s).
+            // to its snapshot image (0 s disables; 10-60 s in 10 s steps; default
+            // 0 s, disabled). Optional, experimental memory-saving feature.
             Item {
               width: parent.width
               height: root.rowHeight
@@ -1101,7 +1145,7 @@ Item {
                 anchors.right: parent.right
                 anchors.verticalCenter: parent.verticalCenter
                 showLabel: false
-                value: root.settingValue("evict_idle_secs", "20")
+                value: root.settingValue("evict_idle_secs", "0")
                 options: root.evictionOptions
                 foreground: root.foreground
                 background: root.background

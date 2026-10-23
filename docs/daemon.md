@@ -61,6 +61,7 @@ auto = true                                    # discover roots from the mount t
 excludes = ["**/.git/**", "**/node_modules/**"]
 scan_interval = 900                            # idle-gated rescan, seconds (0 disables)
 snapshot_interval = 300                        # snapshot write, seconds (0 disables)
+evict_idle_secs = 0                            # optional idle eviction, seconds (0 disables; default 0)
 watch = true                                   # inotify live updates
 dbus = true                                    # D-Bus control interface
 ntfs = true                                    # detect and index NTFS partitions
