@@ -117,11 +117,17 @@ jobs:
   qml:
     name: qmllint (Arch)
     runs-on: [self-hosted, opencode-sam]
-    container: archlinux:base-devel
+    container:
+      image: archlinux:base-devel
+      volumes:
+        - /home/github-runner/ci-cache/pacman-pkg:/var/cache/pacman/pkg
+        - /home/github-runner/ci-cache/locks:/ci/cache/locks
     needs: build
     steps:
-      - name: Install dependencies
-        run: pacman -Syu --noconfirm --needed --overwrite '*' git qt6-declarative
+      - name: Install dependencies (from the local pacman cache)
+        run: |
+          flock /ci/cache/locks/pacman.lock \
+            pacman -Syu --noconfirm --needed --overwrite '*' git qt6-declarative
 
       - uses: actions/checkout@v4
 
