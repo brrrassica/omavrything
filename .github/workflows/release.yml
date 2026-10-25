@@ -96,7 +96,12 @@ jobs:
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: omavrything ${{ steps.tag.outputs.tag }}
-          files: dist/*.zip
+          # The .sha256 asset is required: scripts/fetch-daemon.sh refuses to
+          # install an unverified binary, so the plugin's fetch-on-first-run
+          # bootstrap needs it published alongside the archive.
+          files: |
+            dist/*.zip
+            dist/*.zip.sha256
           fail_on_unmatched_files: true
           generate_release_notes: true
           body: |

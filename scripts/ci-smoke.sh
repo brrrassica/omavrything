@@ -15,7 +15,7 @@
 # Needs root (the system install writes to /usr); this is what the CI smoke job
 # runs inside the Arch container.
 #
-# The installer is the unified, option-free scripts/install.sh: one command
+# The installer is the unified scripts/install.sh: one command
 # installs the system integration, creates the omavrything user, adds the
 # invoking user to the group, reloads D-Bus, enables+starts the daemon, installs
 # and enables the per-user shell plugin, restarts the shell, and applies the ACL
@@ -206,7 +206,8 @@ else
 fi
 
 # 1. System install (idempotent: run twice), then verify what landed. The
-# unified installer takes no options; it does the whole job in one command.
+# unified installer does the whole job in one command (the default, no-option
+# path; --from-plugin/--bindir are the plugin-driven path).
 expect "install.sh succeeds" 0 --grep "installed" -- scripts/install.sh
 expect "install.sh is idempotent" 0 -- scripts/install.sh
 for f in \
@@ -244,7 +245,8 @@ expect_grep "polkit set-config action installed" \
 expect_grep "install.sh adds the user to the group" scripts/install.sh \
   "usermod -aG omavrything"
 expect_grep "install.sh reloads D-Bus" scripts/install.sh "ReloadConfig"
-expect_grep "install.sh is option-free" scripts/install.sh "takes no options"
+expect_grep "install.sh supports --from-plugin" scripts/install.sh "--from-plugin"
+expect_grep "install.sh supports --bindir" scripts/install.sh "--bindir"
 expect_grep "install.sh applies the ACL bridge" scripts/install.sh "setfacl"
 expect_grep "install.sh installs the per-user plugin" scripts/install.sh \
   "plugins/tech.alatcerdas.omavrything"

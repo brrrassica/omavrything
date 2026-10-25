@@ -280,6 +280,49 @@ and that the IPC target responds:
 omarchy-shell tech.alatcerdas.omavrything ping
 ```
 
+## The system-daemon setup prompt does not appear
+
+**Symptom:** after `omarchy plugin add … --enable`, the widget shows "Search
+daemon unavailable" and no authentication dialog appears.
+
+The plugin self-provisions the system daemon on first start by running
+`scripts/bootstrap.sh`, which escalates with `pkexec`. That needs a **polkit
+authentication agent** running in the session. Omarchy ships one as a shell
+plugin (`omarchy.polkit`); it runs inside the `omarchy-shell` process, so it does
+**not** appear as a separate process in `pgrep` — do not conclude "no agent" from
+a process scan.
+
+1. **Retry the prompt.** A dismissed prompt writes a marker so it does not recur
+   on every shell restart. Retry explicitly:
+
+   ```sh
+   omarchy-shell tech.alatcerdas.omavrything setup
+   ```
+
+2. **Check `pkexec`.** It must be present and the agent must be able to show a
+   dialog:
+
+   ```sh
+   command -v pkexec
+   pkexec true        # should raise the GUI prompt
+   ```
+
+   `pkexec` exit codes: **126** = dismissed, **127** = not authorized or the
+   program could not be run.
+
+3. **No polkit agent (headless/offline).** If the session has no polkit agent, or
+   the machine cannot reach the release assets, use the manual path. It does the
+   same work from a local build or a release archive:
+
+   ```sh
+   scripts/build.sh
+   sudo scripts/install.sh
+   ```
+
+   See [`install.md`](install.md) §6. The plugin's `Service.qml` is a no-op once
+   the daemon is installed, so the manual install and the plugin path do not
+   conflict.
+
 ## The daemon will not start
 
 - **`Address already in use` / lock held.** Another daemon owns the socket. Stop
