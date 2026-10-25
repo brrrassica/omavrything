@@ -21,65 +21,59 @@ proposals are **already implemented**. Per live record, steady state:
 Directories store their full path; files store only their basename and reference
 their parent, so a directory's path is not duplicated in every descendant.
 
-The gap to the observed ~700 MB RSS is explained by:
+The gap to the observed RSS is explained by:
 
-- **Transient scan buffer**: [`scan_into_index`](../crates/omavrything-core/src/scan.rs:81)
-  collects every entry into a `Vec<WalkEntry>` of owned `PathBuf`s before
-  inserting. Each `PathBuf` is 24 B + a heap string (~70 B) + allocator header,
-  so ~100 B/file transiently — roughly **300 MB peak for 3M files**. This is the
-  single largest contributor to peak RSS and is **not** in the proposal list.
+- **Transient scan buffer**: the walker now collects into a compact
+  [`WalkBuffer`](../crates/omavrything-core/src/scan.rs) (a single byte arena
+  plus `u32` offsets) instead of a `Vec<PathBuf>`, which removed the per-path
+  heap allocation and cut peak RSS by ~200 MB at 3M files.
 - HashMap capacity slack and glibc arena retention (partly mitigated by
   [`trim_heap`](../crates/omavrythingd/src/main.rs:756)).
 
 ## 2. Feasibility of each proposal
 
 ### Proposal 1 — Flatten data structures (16-byte records)
-**Status: ALREADY DONE (partially).** Records already live in a flat
-`Vec<FileRecord>`; there are no per-record heap allocations. The remaining work
-is shrinking the 48-byte struct toward 16-24 B by compressing fields
-(`depth` u16->u8, `size` u64->u32 KB, `mtime` i64->u32). Feasible, but it forces
-a snapshot format version bump and touches ranking and live updates.
+**Status: DONE.** Records live in a flat `Vec<FileRecord>` with no per-record
+heap allocations, and the struct is now 20 bytes (`size`/`mtime` `u32`,
+`path_len` `u16`, `depth`/`flags` `u8`). The snapshot format was bumped
+accordingly.
 **Complexity: Medium-low. Risk: Low-medium.**
 
 ### Proposal 2 — Monolithic string table / path pooling
-**Status: PARTIALLY DONE.** Names and paths already live in two monolithic byte
-arenas, and [`PathIndex`](../crates/omavrything-core/src/index.rs:164) already
-avoids duplicating path bytes. Two distinct sub-ideas remain:
+**Status: DONE (2a) / NOT RECOMMENDED (2b).** Names and paths live in monolithic
+byte arenas, and [`PathIndex`](../crates/omavrything-core/src/index.rs:164)
+avoids duplicating path bytes.
 
-- **2a. Drop the redundant `names` arena.** The basename is always a suffix of
-  the full path (after the last `/`), so `name_off`/`name_len` are derivable via
-  `memrchr`. This removes ~15 B/file with no search slowdown.
-  **Complexity: Low. Risk: Low.**
+- **2a. Drop the redundant `names` arena.** DONE: the basename is derived from
+  the stored path (after the last `/`), so there is no separate name arena.
 - **2b. Store only basenames + `parent` links, reconstruct full paths on
-  demand.** This eliminates the entire `paths` arena (~70 B/file, the biggest
-  win) but is **radical**: [`match_record`](../crates/omavrything-core/src/index.rs:786)
-  currently scans contiguous path bytes; reconstructing paths per record means
-  pointer-chasing the parent chain for every record on every keystroke, and
-  `PathIndex`, `remove`, `rename`, and the snapshot format all key on full paths.
-  Note Everything itself stores full paths for exactly this speed reason.
-  **Complexity: High. Risk: High. Not recommended as a first step.**
+  demand.** This is the current design for files: directories store their full
+  path and files store only their basename, so a directory's path is not
+  duplicated in every descendant. Search scans the parent path and basename as
+  two slices (plus a boundary check for terms containing `/`), so it stays
+  O(N). Fully reconstructing every path per record would be slower and is not
+  used.
 
 ### Proposal 3 — Bytecode / bitmap filter cache
-**Status: NOT DONE.** The current search is a full linear scan per keystroke
-using a bounded [`TopN`](../crates/omavrything-core/src/index.rs:860) heap, so
-per-query memory is already tiny (the proposal's "avoid allocating result lists"
-premise is largely moot). A bitmap of the previous match set (375 KB for 3M) is
-primarily a **latency** optimization for incremental typing, not a memory one.
+**Status: NOT DONE.** The current search narrows with the candidate index when
+the query allows it and otherwise scans every record, using a bounded
+[`TopN`](../crates/omavrything-core/src/index.rs:860) heap, so per-query memory
+is already tiny (the proposal's "avoid allocating result lists" premise is
+largely moot). A bitmap of the previous match set (375 KB for 3M) is primarily a
+**latency** optimization for incremental typing, not a memory one.
 **Complexity: Medium. Risk: Medium (session state, correctness of incremental
 refinement).**
 
 ### Proposal 4 — 32-bit pointers
 **Status: ALREADY DONE.** All cross-references are `u32` indices
-(`parent`, `name_off`, `path_off`, record indices). No 64-bit pointers are stored
-in the index. **No work required.**
+(`parent`, `path_off`, record indices). No 64-bit pointers are stored in the
+index. **No work required.**
 
 ### Proposal 5 — Ditch `fstat`, use `readdir` `d_type`
-**Status: NOT DONE.** [`walk`](../crates/omavrything-core/src/scan.rs:281) calls
-`entry.metadata()` (an `lstat`) for **every** entry. `DirEntry::file_type()` uses
-the `d_type` field from `readdir` with no extra syscall. However, `size` and
-`mtime` still require a stat, so the win is limited unless metadata is made
-optional/lazy. A pragmatic version: use `file_type()` for the dir/symlink
-decision and only stat non-directories (or only when size/mtime are needed).
+**Status: DONE.** The walker uses `readdir`'s `d_type` for the dir/symlink
+decision and only stats when metadata is needed. `metadata = false` (or
+`--no-metadata`) skips the per-file stat entirely; directories are still stat'd
+so nested mounts are not crossed.
 **Complexity: Low. Risk: Low. Benefit: modest (fewer syscalls, not much RSS).**
 
 ## 3. Additional findings (not in the proposal list)
@@ -126,7 +120,8 @@ retention:
   now calls `mallopt(M_ARENA_MAX, 1)` at startup so a single arena is trimmed.
 
 `FileRecord` was also shrunk from 32 to 20 bytes (`size`/`mtime` to `u32`,
-`path_len` to `u16`, `depth` to `u8`), bumping the snapshot format to v3.
+`path_len` to `u16`, `depth` to `u8`); the snapshot format has since advanced to
+v6.
 
 ### Path dedup (P5)
 
@@ -136,7 +131,8 @@ Directories now store their full path and files store only their basename,
 referencing their parent; a file's full path is reconstructed on demand. Search
 scans the parent path and basename as two slices (plus a boundary check for
 terms containing `/`), so it stays O(N). This cut the arena to ~122 MB and RSS
-from ~593 MB to ~293 MB. The snapshot format is now v4.
+from ~593 MB to ~293 MB. The snapshot format advanced to v4 at that point (it is
+now v6).
 
 ### NTFS MFT streaming
 
@@ -145,7 +141,7 @@ entire MFT into memory (`record_count × record_size`), which peaked at ~4 GB on
 the indexed volumes. It now reads the MFT in bounded 16 MB chunks, carrying a
 partial record across chunk boundaries, cutting the peak to ~836 MB.
 
-## 6. Suggested execution plan
+## 6. Historical execution plan (completed)
 
 1. Add a memory-accounting test/benchmark that reports bytes-per-record for a
    synthetic 3M index, so each change is measured (extend
@@ -157,3 +153,106 @@ partial record across chunk boundaries, cutting the peak to ~836 MB.
 5. Replace the transient `WalkEntry` buffer with a compact arena.
 6. Evaluate the bitmap cache (3) and, only if still needed, the radical path
    dedup (2b).
+
+Items 1–5 are done; item 6 remains an optional latency experiment.
+
+## 7. Candidate-index memory (0.2.0, M23.6)
+
+The M23 candidate index (trigram postings + lowercased arena) dominated the
+index's memory: at rc4 it was 191.4 B/record on the real tree, 76 % of the
+index. The 0.2.0 work (E, A, C, F) shrank it to **35.8 B/record** on the 1 M
+synthetic tree (from 67.1 B/record), bringing the whole index to **81.2
+B/record** — under the ~100 B/record target — while keeping the full scan at
+~4.4 ms (4.2 ns/record).
+
+| Change | What | 1 M synthetic (B/record) |
+| --- | --- | --- |
+| baseline (rc4) | full-path lowercased arena + per-component trigrams + token table | 67.1 |
+| **E** | two-level trigram index: basename trigrams per record + directory-name trigrams per directory, expanded via subtree ranges | postings 12.0 → 9.0 |
+| **A** | dedupe the lowercased arena: basename for files, full path for dirs, parent reference | lower 40.2 → 16.4 |
+| **C** | drop the token table (the trigram set already guarantees completeness) | tokens 8.0 → 0 |
+| **F** | sorted key array + binary search instead of the CSR `slots` HashMap | map 0.03 → 0.02 |
+
+The two-level design (E) requires directory records (the scanner inserts them)
+and a subtree range per directory; the Index derives the ranges from the parent
+links so they are correct even when records are not sorted by path (e.g. after
+live updates). A live record is covered by a small delta overlay holding its
+full-path component trigrams, so the bulk subtree ranges are never consulted for
+it. The subtree ranges are stored sparsely (one `(dir, end)` pair per directory,
+~0.4 B/record) rather than as a dense per-record array.
+
+The remaining candidate-index cost is the lowercased arena (16.4 B/record) and
+the per-record `off`/`len`/`parent` arrays (10 B/record). D (derive `off`/`len`
+from the record's `path_off`/`path_len`) would remove 6 B/record; N (stream
+metadata) and G (drop `PathIndex`) are the base-index fallbacks and are not
+needed now that the target is met.
+
+## 8. Daemon overhead (0.2.0-rc6)
+
+The index accounting (`memory_bytes`) is not the whole RSS: the daemon's own
+overhead — the binary, thread stacks, runtimes, and allocator retention — is the
+rest. At rc5 the live daemon (1.4 M entries) sat at 308 MB RSS against 171 MB of
+index accounting, so ~137 MB was overhead. The rc6 work cut it:
+
+- **Binary size.** A `[profile.release]` with fat LTO, one codegen unit, and
+  stripped symbols cut the daemon binary from 7.66 MB to 4.04 MB (−47 %). The
+  resident text (`RssFile`) is the dominant fixed cost, so this is the largest
+  single win. `panic = "abort"` is deliberately **not** set: it would defeat the
+  NTFS `catch_unwind` containment.
+- **Threads and runtimes.** The rayon global pool is bounded to
+  `min(cores, 4)` (the scan is I/O-bound and scales only ~1.4× from 1 to 16
+  cores), the D-Bus tokio runtime uses 2 worker threads, and the daemon's own
+  threads get explicit 1 MiB (control) / 512 KiB (per-connection) stacks. Thread
+  count fell from 20 to 8.
+- **Allocator.** `M_MMAP_THRESHOLD` and `M_TRIM_THRESHOLD` are lowered to 64 KiB
+  so large transient buffers are mmap'd and returned, and `trim_heap()` is called
+  after the live-update shrink, not only at startup.
+- **Capacity slack.** The record and path vectors were found at **exactly 2×
+  their length** on the live daemon (~75 MB of spare capacity). The live-update
+  and rescan paths never called `shrink()`. A new `Index::shrink_if_slack()`
+  (records and paths only, so it is a memcpy rather than a `HashMap` rehash) is
+  called from the watcher, and the full `shrink()` after a rescan.
+
+Measured: the empty-index baseline is 5 MiB; the 500 k hermetic tree fell from
+115.7 to ~104 B/record; and the live-update burst RSS fell from 104 MiB to
+~33 MiB (451 → ~145 B/record). mimalloc was evaluated as an alternative
+allocator and **rejected** (315 MiB vs 49 MiB at 500 k).
+
+The live index itself is ~128 B/record (longer real paths, the `by_path` map),
+so RSS/record under 100 B at 1.4 M still needs the live index to approach the
+synthetic 81.2 B/record; that is a separate lever from the overhead.
+
+## 9. Evictable, image-backed index (v6) — optional, experimental
+
+The snapshot format v6 ([`snapshot.rs`](../crates/omavrything-core/src/snapshot.rs))
+is a **directly-mappable image**: a header, a section table, and four 8-byte
+aligned sections (`ROOTS`, `RECORDS`, `PATHS`, `ROOT_STRINGS`). The `RECORDS`
+section is a contiguous `#[repr(C)]` `FileRecord` array, so it is cast directly
+from the mapping — loading is an `mmap` plus header validation, with no decode
+and no rebuild (the v4 warm-start decode was ~580 ms). v6 adds a per-root
+`mtime` watermark to the `ROOTS` section (M17/A4) for non-btrfs staleness
+detection.
+
+**Status: optional and experimental.** Idle eviction is **disabled by default**
+(`evict_idle_secs = 0`). It is a memory-saving feature for very large indexes on
+memory-constrained machines, not part of the default search path; set
+`evict_idle_secs` to a positive number of seconds to opt in. The default keeps
+the index resident so every query is served at full speed.
+
+The daemon's [`IndexManager`](../crates/omavrythingd/src/manager.rs) can **evict**
+the owned index to this image when idle. While evicted, only the mapping (file
+backed, reclaimable) and a resident path -> index map (~9 B/record) remain; the
+owned record/path arenas and the candidate index are dropped. A query while
+evicted returns `state: "loading"` and starts a **background materialization**
+of the owned index
+([`IndexManager::ensure_resident`](../crates/omavrythingd/src/manager.rs)),
+folding the [`DeltaIndex`](../crates/omavrything-core/src/index.rs) of live
+updates in; the next query is served at full speed. The watcher records changes
+in the delta; a mutation that needs the owned index materializes it (folding the
+delta) and the idle timer evicts again.
+
+The candidate index is **not** persisted (it is the largest component), so an
+evicted query cannot narrow. It is materialized rather than linear-scanned: a
+scan of the image measured 8–16 s at 1.38 M records, far outside the query
+budget. The candidate index remains available only in the owned (indexing) form.
+See [ADR-017](decisions.md).

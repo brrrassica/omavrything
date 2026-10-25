@@ -80,18 +80,20 @@ This is a deliberate trade-off and is left at 500 ms for responsiveness.
 
 ## 4. Snapshot cost
 
-The snapshot writer compacts the index and encodes it under the read lock, then
-writes outside the lock. Encoding is O(index size) and the write is a few hundred
-MB at most; it runs every `snapshot_interval` (default 300 s) and on clean
-shutdown. It is not a meaningful idle cost, but on a very large index the encode
-is a brief CPU burst — raise `snapshot_interval` if that is undesirable.
+The snapshot writer encodes the index under the write lock, then writes outside
+the lock. Encoding is O(index size) and the write is a few hundred MB at most;
+it runs every `snapshot_interval` (default 300 s), on clean shutdown, and when
+the idle evictor runs (only if the optional, experimental idle eviction is
+enabled; it is disabled by default). It is not a meaningful idle cost, but on a
+very large index the encode is a brief CPU burst — raise `snapshot_interval` if
+that is undesirable.
 
 ## 5. Memory cap behaviour
 
 The daemon's memory is bounded by the systemd unit, not by an in-process cap:
 
-- `MemoryHigh=1200M` — the kernel starts reclaiming and throttling above this.
-- `MemoryMax=1536M` — a hard cap; exceeding it triggers the OOM killer for the
+- `MemoryHigh=3G` — the kernel starts reclaiming and throttling above this.
+- `MemoryMax=4G` — a hard cap; exceeding it triggers the OOM killer for the
   cgroup.
 
 Both values are set from measurement rather than headroom guesswork:
@@ -105,10 +107,23 @@ Both values are set from measurement rather than headroom guesswork:
 `MemoryHigh` deliberately sits above the measured cold-index peak so ordinary
 indexing is never throttled, while `MemoryMax` is the hard ceiling.
 
-The index itself is ~70 B/file steady state (see
-[`memory-optimization.md`](memory-optimization.md)), so 1.5 GB accommodates
-roughly 20 M files at steady state, with the transient scan overhead on top. On a
-much larger index the daemon is killed and restarted by systemd
+The index itself is ~80 B/record on the synthetic tree and ~128 B/record on the
+live index (see [`memory-optimization.md`](memory-optimization.md)), so 3 GB
+accommodates roughly 20 M files at steady state, with the transient scan
+overhead on top. On a much larger index the daemon is killed and restarted by
+systemd
 (`Restart=on-failure`), which then warm-starts from the snapshot. To index more,
 raise `MemoryMax` or reduce the indexed roots/excludes. A user-run daemon has no
 such cap and is limited only by available RAM.
+
+### Daemon overhead (0.2.0-rc6)
+
+The index accounting is not the whole RSS. rc6 cut the daemon's own overhead
+(see [`memory-optimization.md`](memory-optimization.md#8-daemon-overhead-020-rc6)):
+the binary is 47 % smaller (fat LTO + strip), the thread count fell from 20 to 8
+(a bounded rayon pool and a 2-worker D-Bus runtime), the glibc thresholds are
+tuned, and the live-update and rescan paths now reclaim the record/path vector
+doubling slack. The empty-index baseline is 5 MiB, and the live-update burst RSS
+fell from 104 MiB to ~33 MiB. `scripts/benchmark.sh` reports the RSS breakdown
+(`RssAnon`/`RssFile`/`RssShmem`/threads) and an empty-index baseline so the fixed
+overhead is visible separately from the index.

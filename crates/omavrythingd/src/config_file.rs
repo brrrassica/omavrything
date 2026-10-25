@@ -49,6 +49,10 @@ pub struct FileConfig {
     /// Snapshot write interval, in seconds (0 disables).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot_interval: Option<u64>,
+    /// Idle period (seconds) after which the index is evicted to its snapshot
+    /// image (0 disables eviction).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evict_idle_secs: Option<u64>,
     /// Watch roots with inotify.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub watch: Option<bool>,
@@ -68,6 +72,15 @@ pub struct FileConfig {
     /// serves but does not otherwise use.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub background_opacity: Option<f64>,
+    /// Build and consult the n-gram candidate index (F10). Disabling it bounds
+    /// memory on very large indexes at the cost of a linear scan per query.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_index: Option<bool>,
+    /// Block devices mounted through the settings UI. They are mounted and
+    /// indexed again on the next start, so a volume the user mounted persists
+    /// across daemon restarts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volumes: Option<Vec<String>>,
 }
 
 impl FileConfig {
@@ -104,6 +117,13 @@ impl FileConfig {
             for glob in excludes {
                 if glob.trim().is_empty() {
                     return Err("exclude glob is empty".into());
+                }
+            }
+        }
+        if let Some(volumes) = &self.volumes {
+            for volume in volumes {
+                if !Path::new(volume).is_absolute() {
+                    return Err(format!("volume is not absolute: {volume}"));
                 }
             }
         }
@@ -150,6 +170,13 @@ impl FileConfig {
                         .map_err(|_| format!("invalid snapshot_interval: {value}"))?,
                 );
             }
+            "evict_idle_secs" => {
+                self.evict_idle_secs = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("invalid evict_idle_secs: {value}"))?,
+                );
+            }
             "ntfs" => {
                 self.ntfs = Some(parse_bool(value)?);
             }
@@ -165,6 +192,18 @@ impl FileConfig {
                     return Err(format!("background_opacity out of range: {opacity}"));
                 }
                 self.background_opacity = Some(opacity);
+            }
+            "candidate_index" => {
+                self.candidate_index = Some(parse_bool(value)?);
+            }
+            "volumes" => {
+                self.volumes = Some(
+                    value
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect(),
+                );
             }
             other => return Err(format!("unknown config key: {other}")),
         }
@@ -246,6 +285,7 @@ ntfs = true
 metadata = true
 log_level = "debug"
 background_opacity = 0.6
+candidate_index = false
 "#,
         );
         let config = FileConfig::load(&path).unwrap();
@@ -253,6 +293,7 @@ background_opacity = 0.6
         assert_eq!(config.scan_interval, Some(1800));
         assert_eq!(config.log_level(), Some(LogLevel::Debug));
         assert_eq!(config.background_opacity, Some(0.6));
+        assert_eq!(config.candidate_index, Some(false));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -114,6 +114,20 @@ jobs:
       - name: Build
         run: cargo build --all-features
 
+  qml:
+    name: qmllint (Arch)
+    runs-on: [self-hosted, opencode-sam]
+    container: archlinux:base-devel
+    needs: build
+    steps:
+      - name: Install dependencies
+        run: pacman -Syu --noconfirm --needed --overwrite '*' git qt6-declarative
+
+      - uses: actions/checkout@v4
+
+      - name: Lint the shell plugin QML
+        run: scripts/lint-qml.sh
+
   fuzz:
     name: fuzz (smoke, Arch)
     runs-on: [self-hosted, opencode-sam]
@@ -260,6 +274,61 @@ jobs:
 
       - name: Run the install/uninstall smoke test
         run: scripts/ci-smoke.sh
+
+  bench:
+    name: performance budgets (Arch)
+    runs-on: [self-hosted, opencode-sam]
+    container:
+      image: archlinux:base-devel
+      volumes:
+        - /home/github-runner/ci-cache/pacman-pkg:/var/cache/pacman/pkg
+        - /home/github-runner/ci-cache/cargo:/ci/cache/cargo
+        - /home/github-runner/ci-cache/rustup:/ci/cache/rustup
+        - /home/github-runner/ci-cache/targets:/ci/cache/targets
+        - /home/github-runner/ci-cache/locks:/ci/cache/locks
+    env:
+      CARGO_HOME: /ci/cache/cargo
+      RUSTUP_HOME: /ci/cache/rustup
+      RUSTUP_TOOLCHAIN: 1.99.1
+      CARGO_TARGET_DIR: /ci/cache/targets/${{ github.repository }}/${{ github.job }}
+    needs: build
+    steps:
+      - name: Install dependencies (from the local pacman cache)
+        run: |
+          mkdir -p "$CARGO_TARGET_DIR"
+          flock /ci/cache/locks/pacman.lock \
+            pacman -Syu --noconfirm --needed --overwrite '*' git curl python
+
+      - uses: actions/checkout@v4
+
+      # The build output lives in the runner's persistent cache, but the
+      # repo's own scripts (scripts/build.sh, ci-smoke.sh, package-release.sh)
+      # reference ./target, so link it back to the cache.
+      - name: Point target/ at the persistent local cache
+        run: |
+          mkdir -p "$CARGO_TARGET_DIR"
+          rm -rf target
+          ln -s "$CARGO_TARGET_DIR" target
+      - name: Put the cached cargo/rustup shims on PATH
+        run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+
+      # Install under the cache lock so the action below only has to confirm
+      # the toolchain is already present.
+      - name: Pre-install the pinned toolchain under the cache lock
+        run: |
+          flock /ci/cache/locks/rustup.lock \
+            rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update
+
+      - name: Install Rust toolchain (reused from RUSTUP_HOME)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+
+      - name: Build the daemon and CLI (release)
+        run: cargo build --release -p omavrythingd -p omavrything-cli
+
+      - name: Run the performance budgets
+        run: scripts/benchmark.sh --quick --hermetic --budgets
 
   package:
     name: package release archive (Arch)

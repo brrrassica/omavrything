@@ -4,6 +4,334 @@ Notable changes to `omavrything`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] — 2026-10-23
+
+The v0.2.0 release. It rolls up the release candidates
+`0.2.0-rc1` … `0.2.0-rc11`; see those sections below for the per-candidate
+detail. The theme is robust indexing, mounting, and setup.
+
+### Added
+
+- **Indexing and search performance (M23).** A trigram candidate index narrows a
+  query to a superset of candidates, a compact lowercased name arena is scanned
+  first, and a sorted token table serves single-token prefix queries. The
+  postings are a delta + varint-encoded CSR arena, the most frequent trigrams
+  are stop-listed, and the token table stores one basename entry per record.
+  Rescans apply deltas instead of rebuilding, and the snapshot is a versioned,
+  directly mappable image with an optional mmap load. A `candidate_index` config
+  key (default `true`) can disable the n-gram index and fall back to a linear
+  scan on very large indexes.
+- **NTFS forced-close and shutdown safety (M25).** The daemon unmounts every
+  mount it created on `SIGTERM`/`SIGINT`, retries a busy unmount before a lazy
+  fallback, and reconciles stale daemon-created mounts on startup after a
+  `SIGKILL` or crash. Every mount is verified read-only before indexing.
+- **Mount correctness and hotplug (M19).** Mount and unmount commands are
+  time-boxed; both the udisks2 and private `ntfs3` paths mount
+  `ro,nosuid,nodev,noexec`; a UUID-less volume uses its device basename for the
+  private mount point; and the NTFS policy is written atomically under a lock. A
+  udev netlink monitor wakes the hotplug pass on block-device add/remove/change.
+- **Indexing correctness, observability, and snapshot staleness (M15–M17).** The
+  walker no longer crosses a nested mount that shares the root's device and
+  tracks a visited `(dev, inode)` set to prevent loops. Traversal failures are
+  recorded and surfaced in `GetStatus`; a scan is cancelled promptly on shutdown
+  or when a newer rescan supersedes it; unwatched subtrees are rescanned on a
+  targeted cadence; and network-filesystem traversal is time-boxed. A warm start
+  detects offline changes on ext4/xfs/f2fs via a root mtime watermark.
+- **Install/uninstall completeness and hardening (M13–M14).** The release
+  archive ships `uninstall.sh` and `doctor.sh`; install and uninstall are
+  idempotent; an `omavrythingd(8)` man page is installed; and a CI job exercises
+  install → enable → search → uninstall in the Arch container.
+- **Non-manual setup (M21).** The release archive ships a download-then-run
+  bootstrap script that installs the daemon and plugin, enables the service, and
+  verifies the install.
+- **No-match keeps the last results.** When a query has no matches, the overlay
+  keeps the previous result page visible (dimmed) instead of blanking the list,
+  and tints the input's last character red — mimicking Voidtools Everything. The
+  stale page is display-only: the cursor and Enter are disabled until a query
+  matches again.
+
+### Changed
+
+- **Idle index eviction is now disabled by default.** `evict_idle_secs`
+  defaults to `0` (disabled). Eviction is an **optional, experimental**
+  memory-saving feature: it releases the in-memory index when the desktop is
+  idle, at the cost of a reload on the next query. Set `evict_idle_secs` to a
+  positive number of seconds to opt in. See
+  [`docs/memory-optimization.md`](docs/memory-optimization.md).
+- **Version bumped to `0.2.0`.** The shell plugin manifest and the AUR
+  `PKGBUILD` are updated to match.
+
+### Fixed
+
+- See the `0.2.0-rc1` … `0.2.0-rc11` sections below for the fixes rolled into
+  this release (NTFS remount re-indexing, evicted-index materialization, the
+  idle-evictor starvation, the `uninstall.sh` live-mount recursion, and more).
+
+## [0.2.0-rc11] — 2026-10-19
+
+Rollup of fixes and improvements from rc1–rc10. See those sections for
+per-candidate detail.
+
+## [0.2.0-rc10] — 2026-10-18
+
+### Added
+
+- **M19 mount correctness and hotplug.** NTFS mount and unmount commands are
+  now time-boxed, so a hung `mount`/`udisksctl` cannot wedge the daemon. Both
+  the udisks2 and private `ntfs3` paths mount `ro,nosuid,nodev,noexec`, and a
+  pre-existing writable mount is remounted read-only. A UUID-less volume now
+  uses its device basename for the private mount point instead of the shared
+  constant `volume`. The NTFS policy file is written atomically under a lock.
+  Mounting prefers the udisks2 D-Bus API through zbus 6, which returns the
+  mount point directly; `udisksctl` and the private read-only `ntfs3` mount are
+  fallbacks. A udev netlink monitor wakes the hotplug pass on block-device
+  add/remove/change, with a 30 s fallback and a 2 s mount-table poll if the
+  socket is unavailable. A remembered partition that appears is mounted and
+  indexed; a mount that disappears has its entries dropped.
+
+### Changed
+
+- **Version bumped to `0.2.0-rc10`.** The systemd unit now states
+  `PrivateMounts=no`/`PrivateTmp=no` explicitly to preserve the host mount
+  namespace, and the tmpfiles drop-in creates `/run/omavrything/ntfs` with the
+  service account's ownership. `uninstall.sh` falls back to `/proc/mounts` when
+  `findmnt` is unavailable.
+
+### Fixed
+
+- **NTFS remount re-indexing.** Unmounting a volume now removes its root from
+  the index, not just its records. Previously the stale root made the volume
+  still report `indexed` with no searchable entries, and the hotplug monitor
+  skipped re-indexing when the volume was mounted again. A remount now
+  re-indexes and the files are searchable.
+
+## [0.2.0-rc9] — 2026-10-17
+
+### Added
+
+- **NTFS forced-close and shutdown safety (M25).** The daemon now unmounts
+  every mount it created on `SIGTERM`/`SIGINT`, retrying a busy unmount a
+  bounded number of times before a lazy (`umount -l`) fallback, and reconciles
+  stale daemon-created mounts under `/run/omavrything/ntfs` on startup after a
+  `SIGKILL` or crash. Every mount is verified read-only before indexing, and a
+  writable mount is refused. The systemd unit sets `KillSignal=SIGTERM` and an
+  `ExecStopPost` sweep so `systemctl stop`, reboot, and poweroff release mounts
+  before the local filesystems are unmounted.
+- **Indexing correctness (M15).** The walker no longer crosses a nested mount
+  that shares the root's device (bind mounts, btrfs subvolumes), using the
+  `/proc/self/mountinfo` mount points, and tracks a visited `(dev, inode)` set
+  so a traversal cycle cannot loop. NTFS `entry.path` values are validated
+  before being joined onto the mount point, so a crafted MFT record cannot
+  escape it.
+- **Indexing observability and lifecycle (M16).** Traversal failures are
+  recorded (an exact count plus a bounded path sample) and surfaced in
+  `GetStatus` and the `ScanProgress` signal. A scan is cancelled promptly on
+  shutdown or when a newer rescan supersedes it. Subtrees that could not be
+  watched (`max_user_watches` exhaustion) are rescanned on a targeted cadence
+  and counted in status. Traversal of network filesystems is time-boxed so a
+  stalled mount cannot block a scan.
+
+### Changed
+
+- **`zbus` upgraded from 5 to 6.** The 5.x `zbus_names`, `zvariant`, and
+  `zvariant_derive` crates are unmaintained (RUSTSEC-2026-0370/0371/0372) and
+  were merged into `zbus` 6.0.0, so `cargo audit` failed the CI job. The
+  workspace now depends on `zbus` 6 with the `tokio`, `proxy`, and `service`
+  features, and the polkit subject uses the renamed `zbus::Variant` (formerly
+  `zbus::zvariant::Value`). The workspace MSRV rises to 1.89 (zbus 6's minimum).
+
+### Fixed
+
+- **NTFS volumes mount, index, search, and open again.** The earlier
+  host-namespace mount attempt (`nsenter -t 1 -m`) could never work: a
+  non-root daemon cannot open `/proc/1/ns/mnt` (it requires ptrace access to a
+  root process), so every mount fell back to the daemon's sandboxed mount
+  namespace, the host mount table could not see it, and each volume failed with
+  "mount ... vanished before the read-only check". The daemon now mounts in its
+  own namespace and reads `/proc/mounts` again — and the unit no longer gives
+  the service a private mount namespace at all: the filesystem-view options
+  (`ProtectSystem=`, `ProtectHome=`, `PrivateTmp=`, `ProtectKernelTunables=`,
+  `ProtectKernelLogs=`, `ProtectControlGroups=`, `ReadWritePaths=`) and the
+  bind-mount options (`ProtectKernelModules=`, `ProtectHostname=`,
+  `RuntimeDirectory=`, `StateDirectory=`) each create one, so they are dropped
+  and the read-only `ntfs3` mount lands in the host namespace where the desktop
+  can open the indexed files. `/run/omavrything` is now created by a tmpfiles.d
+  drop-in instead of `RuntimeDirectory=`. The daemon keeps its dedicated
+  unprivileged user, two-capability bounding set, `NoNewPrivileges`, syscall
+  filter, and the remaining hardening.
+- **`uninstall.sh` no longer recurses into a live NTFS mount.** The script
+  removed `/run/omavrything` with a plain `rm -rf`, which descended into any
+  daemon-created read-only mount under `/run/omavrything/ntfs/<uuid>`: on a
+  read-only mount that produced a flood of failed-removal errors, and on a
+  writable mount it would have deleted the user's files. The script now
+  unmounts every mount under the runtime directory first (with a lazy fallback)
+  and removes the directory with `rm -rf --one-file-system`, so a mount that
+  could not be unmounted is still never crossed.
+- **Removable media is now indexed only through the NTFS MFT path (ADR-018).**
+  The generic walker no longer descends into `/run/media` (it is filtered from
+  the walk roots and pruned in the walk), so a udisks2 NTFS mount is no longer
+  double-indexed by the walker while the MFT path refuses it. The MFT path now
+  remounts a writable pre-existing mount read-only and keeps it read-only, so
+  the read-only invariant (B12) is enforced instead of silently bypassed. A
+  writable NTFS partition therefore loses desktop write access while the daemon
+  runs (safety over write access).
+- **The daemon no longer logs a misleading `ERROR ntfs: failed to index` for a
+  writable mount.** The writable-mount refusal is an expected, non-fatal
+  outcome (the walker used to cover it) and is now logged at `info` with a
+  clarifying message; `error` is reserved for genuine failures.
+- **The smoke test's NTFS ownership guard named a function that never
+  existed.** `ci-smoke.sh` asserted `record_owned_mount` in `ntfs.rs`; the
+  function is `mount_index_and_remember_with_ownership`. The guard now names
+  the real symbol (the check had been failing 113/114).
+- **An evicted index is materialized on the first query instead of being
+  linear-scanned.** A query while evicted now returns `state: "loading"`
+  immediately and starts a background materialization of the owned index
+  (folding the live-update delta in); the next query is served at full speed.
+  Previously the query scanned the mmap image, which took 8–16 s at 1.38 M
+  records, so the widget's first search after the 20 s idle eviction appeared
+  to return nothing. The overlay's reload retry is spaced to 500 ms to match.
+  The smoke test's evicted-image check now retries the search until the marker
+  appears, matching the new loading-then-served contract.
+- **Background indexing no longer resets the idle-eviction timer.**
+  `IndexManager::with_index_mut` used to call `touch()`, so NTFS/volume
+  indexing, snapshot encoding, and materialization all restarted the idle
+  window and delayed eviction until the last background pass finished. Only
+  user-driven work (a query, or a mutation requested through the control
+  interface) now touches the timer; the D-Bus mount/unmount/rescan/config
+  handlers call `touch()` explicitly. This is the same principle rc8 applied
+  to filesystem events.
+- **A failed eviction is no longer reported as a successful one.**
+  `IndexManager::evict` now returns whether the index actually became evicted,
+  and `evict_if_idle` propagates that result. Previously a snapshot write
+  failure (for example an unwritable snapshot path) still logged
+  `index evicted (idle)` and retried every ~1.2 s; the evictor now logs a
+  warning and backs off for 30 s instead of spinning.
+- **The installer and package now create `/var/lib/omavrything`.** The daemon
+  runs as the unprivileged `omavrything` user and cannot create a directory
+  under root-owned `/var/lib`, so the snapshot write and every `SetConfig`
+  (which persists the state config) failed with `Permission denied`. The
+  tmpfiles drop-in now creates `/var/lib/omavrything` with the daemon's
+  ownership, and the installer and the pacman scriptlet run
+  `systemd-tmpfiles --create`. This also lets the daemon write a snapshot on
+  shutdown and warm-start from it, so the first eviction after a restart no
+  longer waits for a full cold scan.
+
+## [0.2.0-rc8] — 2026-10-17
+
+### Fixed
+
+- **The daemon failed to compile after the 0.1.9 fixes were rebased onto the
+  rc6+ codebase.** The rebase resolution kept the pre-rc6 two-argument
+  `spawn_thread` call at the D-Bus ntfs-startup site; it now passes the explicit
+  `CONTROL_STACK` stack size like every other call site.
+- **The idle evictor could be starved by filesystem events.** Event bursts kept
+  resetting the idle window so eviction never ran on busy filesystems; the
+  evictor now bounds how long event activity can defer an eviction pass.
+
+### Changed
+
+#### 0.2.0-rc6 — daemon RSS overhead
+
+The rc5 index accounting reached 81.2 B/record on the 1 M synthetic tree, but the
+end-to-end RSS/record was still dominated by the daemon's own overhead. rc6 cuts
+that overhead:
+
+- **Release profile.** A `[profile.release]` with fat LTO, one codegen unit, and
+  stripped symbols cut the daemon binary from 7.66 MB to 4.04 MB (−47 %). The
+  resident text is the largest fixed cost. `panic = "abort"` is deliberately not
+  set, because it would defeat the NTFS `catch_unwind` containment.
+- **Threads and runtimes.** The rayon global pool is bounded to `min(cores, 4)`
+  (override with `OMAVRYTHING_SCAN_THREADS`), the D-Bus tokio runtime uses 2
+  worker threads, and the daemon's threads get explicit stack sizes. Thread count
+  fell from 20 to 8.
+- **Allocator.** `M_MMAP_THRESHOLD`/`M_TRIM_THRESHOLD` are lowered to 64 KiB and
+  `trim_heap()` now runs after the live-update shrink.
+- **Capacity slack.** The record and path vectors were found at exactly 2× their
+  length on the live daemon (~75 MB of spare capacity) because the live-update
+  and rescan paths never shrank them. A new `Index::shrink_if_slack()` is called
+  from the watcher, and the full `shrink()` after a rescan.
+- **Benchmark.** `scripts/benchmark.sh` now reports the RSS breakdown
+  (`RssAnon`/`RssFile`/`RssShmem`/threads), an empty-index baseline, and the
+  index capacity-vs-length figures.
+
+Measured: the empty-index baseline is 5 MiB; the 500 k hermetic tree fell from
+115.7 to ~104 B/record; the live-update burst RSS fell from 104 MiB to ~33 MiB
+(451 → ~145 B/record). mimalloc was evaluated and rejected (315 MiB vs 49 MiB at
+500 k).
+
+### Planned
+
+- **Indexing and search performance (highest priority).** The search path is
+  currently a linear scan. v0.2.0 adds a candidate-narrowing (n-gram) index, a
+  cache-friendly hot layout, a prefix/token index, incremental index maintenance,
+  faster snapshot load/save, query-result caching, and parallelism/SIMD tuning,
+  with p50/p95 performance budgets enforced in CI. This lands first so the rest
+  of the release has timing headroom.
+- **Toggleable menu-entry (app shortcut) indexing.** Freedesktop `.desktop`
+  entries and Omarchy's own menu config become searchable, launchable results
+  behind an `index_menu_entries` config toggle, with a distinct icon/type and
+  `Enter`-to-launch.
+- **NTFS mount/unmount safety on forced close.** Clean unmount on
+  `SIGTERM`/`SIGINT`, startup reconciliation after `SIGKILL` or a crash, a
+  systemd `ExecStopPost` sweep on stop/reboot/poweroff, a tmpfs mount root, and
+  read-only mounts so a forced close cannot leak a mount or dirty the volume.
+- **Robustness and setup.** Mount-boundary correctness, scan cancellation and
+  error reporting, non-btrfs snapshot staleness, mount ownership and hotplug,
+  install/uninstall hardening, and a single copyable setup command.
+
+### Fixed
+
+- **The idle evictor could be starved by filesystem activity, so the index
+  never evicted and the daemon's resident set stayed at its peak.** Every
+  inotify event reset the idle-eviction timer, and a desktop fires events
+  (real changes, excluded paths, metadata noise) far more often than the
+  default 20 s idle period. Filesystem events no longer count as activity:
+  "idle" means no queries and no user-driven mutations (config changes,
+  rescans), which is when the memory should be released. While evicted,
+  events accumulate in the delta as before. The evictor also now sleeps
+  until the idle deadline instead of polling at fixed intervals, so eviction
+  happens within about one idle period of the last query rather than up to
+  two poll intervals late.
+- **Added `--evict-idle-secs <secs>`** to `omavrythingd` (the idle period was
+  previously configurable only through the config file), so tests and
+  hermetic setups can exercise eviction directly.
+
+
+## [0.2.0-rc7] — 2026-10-16
+
+Rollup of fixes and improvements from rc1–rc6. See those sections for
+per-candidate detail.
+
+## [0.2.0-rc6] — 2026-10-15
+
+Rollup of fixes and improvements from rc1–rc5. See those sections for
+per-candidate detail.
+
+## [0.2.0-rc5] — 2026-10-14
+
+Rollup of fixes and improvements from rc1–rc4. See those sections for
+per-candidate detail.
+
+## [0.2.0-rc4] — 2026-10-13
+
+Rollup of fixes and improvements from rc1–rc3. See those sections for
+per-candidate detail.
+
+## [0.2.0-rc3] — 2026-10-12
+
+Rollup of fixes and improvements from rc1–rc2. See those sections for
+per-candidate detail.
+
+## [0.2.0-rc2] — 2026-10-11
+
+Rollup of fixes and improvements from rc1. See those sections for
+per-candidate detail.
+
+## [0.2.0-rc1] — 2026-10-10
+
+Rollup of initial release candidate fixes. See those sections for
+per-candidate detail.
+
 ## [0.1.11] — 2026-10-17
 
 ### Fixed
@@ -111,14 +439,17 @@ the findings that blocked marketplace verification.
   distributions (p50/p95/p99/max) for selective, broad, and no-match queries,
   the cold-scan indexing throughput, and search latency *while the index is
   being rebuilt* (a rescan) and *while it is being updated live* (an inotify
-  burst). It also benchmarks the live installed daemon when one is reachable,
-  and can optionally run the Criterion micro-benchmark and the standalone
-  profiler example. The script ships in the release archive under `scripts/`
-  and in the AUR package under `/usr/share/omavrything/scripts/`; the archive
-  checks in `scripts/ci-smoke.sh` and `scripts/test-install-uninstall.sh` guard
-  its presence. The default run is a fast (~10 s) profile; `--full`/`--all` run
-  the larger, more comprehensive sizes. The 0.1.6 baseline numbers are recorded
-  in [`docs/benchmarks.md`](docs/benchmarks.md).
+  burst). It also samples the daemon's resident set size (RSS) and its peak
+  (`VmHWM`), and reports the per-record memory cost — including the index's own
+  bytes per record for the live daemon — for both the live and hermetic modes.
+  It benchmarks the live installed daemon when one is reachable, and can
+  optionally run the Criterion micro-benchmark and the standalone profiler
+  example. The script ships in the release archive under `scripts/` and in the
+  AUR package under `/usr/share/omavrything/scripts/`; the archive checks in
+  `scripts/ci-smoke.sh` and `scripts/test-install-uninstall.sh` guard its
+  presence. The default run is a fast (~10 s) profile; `--full`/`--all` run the
+  larger, more comprehensive sizes. The 0.1.7 baseline numbers are recorded in
+  [`docs/benchmarks.md`](docs/benchmarks.md).
 
 ## [0.1.6] — 2026-10-12
 

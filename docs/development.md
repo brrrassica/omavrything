@@ -11,16 +11,24 @@ glibc, and package availability catches problems that an Ubuntu build would miss
 The release archive is built the same way, so the shipped binaries match the
 target platform.
 
-The workflow ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) has four
+The workflow ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) has seven
 jobs:
 
 - **build** — `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`
   (debug and release), and `cargo build`.
+- **qml** — `scripts/lint-qml.sh` runs `qmllint` over the shell plugin's QML
+  (`qt6-declarative`). The omarchy shell modules are absent in the container, so
+  the `qs.*` imports are reported as warnings; the job still catches QML syntax
+  and semantic errors.
 - **fuzz** — a short `cargo-fuzz` smoke session of the snapshot and protocol
   targets (nightly toolchain).
-- **audit** — `cargo audit` for dependency advisories. This job stays on the
-  default runner because advisories are platform-independent (they only read
-  `Cargo.lock`).
+- **audit** — `cargo audit` for dependency advisories. This job runs on the
+  runner host rather than in a container, because advisories are
+  platform-independent (they only read `Cargo.lock`).
+- **smoke** — `scripts/ci-smoke.sh` exercises install → enable → search →
+  uninstall inside the Arch container.
+- **bench** — `scripts/benchmark.sh --quick --hermetic --budgets` checks the
+  hermetic p50/p95 and cold-scan throughput against the performance budgets.
 - **package** — builds the release archive with `scripts/package-release.sh` and
   uploads it as a build artifact, so a broken release is caught before a tag.
 
@@ -82,9 +90,10 @@ there.
 
 | Crate | Artifact | Role |
 | --- | --- | --- |
-| `omavrything-core` | library | Index, search, scanner, IPC protocol. |
+| `omavrything-core` | library | Index, search, scanner, IPC protocol, snapshot. |
 | `omavrything-ntfs` | library | Pure-Rust NTFS MFT reader and partition detection. |
-| `omavrythingd` | binary | Root system daemon. |
+| `omavrything-client` | library | Shared Unix-socket and D-Bus clients. |
+| `omavrythingd` | binary | System daemon (dedicated `omavrything` user). |
 | `omavrything-cli` | binary (`omavry`) | CLI client. |
 | `omavrything` shell plugin | QML | Search bar + results overlay. |
 
@@ -98,15 +107,16 @@ scripts/run-daemon.sh                              # indexes $HOME
 scripts/run-daemon.sh --root /home/sam/Documents   # indexes a subtree
 scripts/restart-all.sh                             # restart the daemon + reload the shell plugin
 scripts/restart-all.sh --rebuild                   # rebuild the release daemon first (-r)
-scripts/restart-all.sh --sudo                      # run the daemon as root (to index NTFS)
+scripts/restart-all.sh --sudo                      # run the daemon as root for raw-device access in a dev checkout
 ```
 
 See [`daemon.md`](daemon.md) for the full flag list.
 
 ## Profiling query performance
 
-Search is a linear scan over every record, so its cost is proportional to the
-index size. Three tools measure it:
+Search scans the index, narrowed by the candidate index when the query allows
+it; a broad query that cannot be narrowed still scales with the index size.
+Three tools measure it:
 
 - **End-to-end benchmark** — [`scripts/benchmark.sh`](../scripts/benchmark.sh)
   drives a real daemon over the Unix socket and reports wall-clock latency
@@ -136,8 +146,8 @@ index size. Three tools measure it:
   ```
 
   Always pass `--release`: a debug build is 10-50x slower and the example warns
-  when it detects one. On a 1M-record index a query is ~6-18 ms; the cost scales
-  linearly (1M ≈ 6 ms, 2M ≈ 12 ms, 3M ≈ 18 ms).
+  when it detects one. On a 1M-record index a broad query is ~6-18 ms; selective
+  queries are narrowed by the candidate index and are much faster.
 
 - **Daemon query profiler** — set `OMAVRYTHING_PROFILE=1` when starting the
   daemon and every search logs a breakdown to stderr:

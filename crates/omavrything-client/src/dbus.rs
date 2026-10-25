@@ -21,15 +21,21 @@ pub trait Manager {
     fn set_config(&self, key: &str, value: &str) -> zbus::Result<()>;
     /// The indexed roots.
     fn list_roots(&self) -> zbus::Result<Vec<String>>;
+    /// Every detected block volume with its indexing status.
+    fn list_volumes(&self) -> zbus::Result<Vec<HashMap<String, String>>>;
     /// Mount an NTFS partition by UUID and index it; returns the mount point.
     fn mount_ntfs(&self, uuid: &str) -> zbus::Result<String>;
+    /// Mount a volume by device path and index it; returns the mount point.
+    fn mount_volume(&self, device: &str) -> zbus::Result<String>;
+    /// Unmount a volume by device path and drop its index entries.
+    fn unmount_volume(&self, device: &str) -> zbus::Result<()>;
 
     /// Emitted when the index changes.
     #[zbus(signal)]
     fn index_changed(&self, entries: u64) -> zbus::Result<()>;
     /// Emitted during a scan.
     #[zbus(signal)]
-    fn scan_progress(&self, phase: &str, entries: u64) -> zbus::Result<()>;
+    fn scan_progress(&self, phase: &str, entries: u64, errors: u64) -> zbus::Result<()>;
 }
 
 /// A client for the D-Bus control interface.
@@ -70,8 +76,23 @@ impl DbusClient {
         self.proxy.list_roots().await
     }
 
+    /// Every detected block volume with its indexing status.
+    pub async fn volumes(&self) -> zbus::Result<Vec<HashMap<String, String>>> {
+        self.proxy.list_volumes().await
+    }
+
     /// Mount an NTFS partition by UUID and index it; returns the mount point.
     pub async fn mount_ntfs(&self, uuid: &str) -> zbus::Result<String> {
         self.proxy.mount_ntfs(uuid).await
+    }
+
+    /// Mount a volume by device path and index it; returns the mount point.
+    pub async fn mount_volume(&self, device: &str) -> zbus::Result<String> {
+        self.proxy.mount_volume(device).await
+    }
+
+    /// Unmount a volume by device path and drop its index entries.
+    pub async fn unmount_volume(&self, device: &str) -> zbus::Result<()> {
+        self.proxy.unmount_volume(device).await
     }
 }

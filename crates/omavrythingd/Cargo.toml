@@ -23,7 +23,11 @@ tracing-subscriber = { workspace = true }
 libc = { workspace = true }
 zbus = { workspace = true }
 tokio = { workspace = true }
+memmap2 = { workspace = true }
 
 [dev-dependencies]
 omavrything-ntfs = { workspace = true, features = ["test-image"] }
 omavrything-client = { workspace = true }
+
+[lints]
+workspace = true

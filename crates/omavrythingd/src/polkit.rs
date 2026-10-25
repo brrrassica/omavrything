@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use tracing::{debug, warn};
 use zbus::Connection;
-use zbus::zvariant::Value;
+use zbus::Variant;
 
 /// The polkit action that gates the privileged control methods.
 pub const ACTION: &str = "tech.alatcerdas.omavrything.control";
@@ -44,9 +44,9 @@ pub async fn is_authorized(connection: &Connection, uid: u32, sender: &str, acti
 
 /// Build the polkit subject for a D-Bus caller. The `system-bus-name` subject
 /// lets polkit resolve the caller's session and prompt for authentication.
-fn subject(sender: &str) -> (&'static str, HashMap<String, Value<'_>>) {
-    let mut details: HashMap<String, Value<'_>> = HashMap::new();
-    details.insert("name".to_string(), Value::Str(sender.into()));
+fn subject(sender: &str) -> (&'static str, HashMap<String, Variant<'_>>) {
+    let mut details: HashMap<String, Variant<'_>> = HashMap::new();
+    details.insert("name".to_string(), Variant::Str(sender.into()));
     ("system-bus-name", details)
 }
 
@@ -118,7 +118,7 @@ mod tests {
         let (kind, details) = subject(":1.42");
         assert_eq!(kind, "system-bus-name");
         match details.get("name") {
-            Some(Value::Str(name)) => assert_eq!(name.as_ref(), ":1.42"),
+            Some(Variant::Str(name)) => assert_eq!(name.as_ref(), ":1.42"),
             _ => panic!("subject detail 'name' is missing or not a string"),
         }
     }

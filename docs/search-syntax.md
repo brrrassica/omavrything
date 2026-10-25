@@ -108,4 +108,4 @@ omavry search "invoice 2024" | head -n 5
 - **Quoted phrases** — quotes are matched literally, not as grouping.
 
 These may arrive in a later release; the query parser is intentionally minimal
-for v0.1.
+in the current release.

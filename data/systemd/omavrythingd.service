@@ -14,46 +14,66 @@ Type=simple
 ExecStart=/usr/bin/omavrythingd --socket /run/omavrything/omavrything.sock --snapshot /var/lib/omavrything/index.snapshot --state-config /var/lib/omavrything/config.toml
 Restart=on-failure
 RestartSec=5s
-# Allow the clean snapshot write on SIGTERM before the process is killed.
+# Allow the clean snapshot write and the private-mount unmounts on SIGTERM
+# before the process is killed.
 TimeoutStopSec=30s
+# B11: the daemon unmounts its private NTFS mounts on SIGTERM (B9). These
+# settings make `systemctl stop`, reboot, and poweroff send SIGTERM (never
+# SIGKILL first) and sweep any mount the daemon could not release before the
+# local filesystems are unmounted, so a forced close cannot leave the NTFS
+# volume dirty.
+KillSignal=SIGTERM
+ExecStopPost=+/bin/sh -c 'umount -l /run/omavrything/ntfs/* 2>/dev/null; true'
 
 # Run as a dedicated unprivileged user. The daemon reads raw block devices (the
 # NTFS MFT) and, as a fallback, mounts them read-only, so it keeps only those
 # two capabilities rather than full root.
 User=omavrything
 Group=omavrything
-RuntimeDirectory=omavrything
-RuntimeDirectoryMode=0750
-StateDirectory=omavrything
-StateDirectoryMode=0750
+# The runtime and state directories are created by the tmpfiles.d drop-in and
+# the installer rather than RuntimeDirectory=/StateDirectory=: systemd sets
+# those up through bind mounts, which would give the service its own mount
+# namespace and hide its read-only NTFS mounts from the desktop.
 CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_SYS_ADMIN
 AmbientCapabilities=CAP_DAC_READ_SEARCH CAP_SYS_ADMIN
 
 # Resource limits.
-# Set from measurement, not guesswork: the daemon settles below 300 MB RSS at
-# idle with the index loaded, and a cold initial index of ~3M files never
-# exceeded 900 MB (the NTFS MFT read is the largest transient at ~836 MB).
-# MemoryHigh sits above that measured peak so ordinary indexing is never
-# throttled; MemoryMax is the hard ceiling that OOM-kills the cgroup if the
-# index grows well beyond the tested size.
-MemoryHigh=1200M
-MemoryMax=1536M
+# The ceiling is generous on purpose: a cold initial scan that includes several
+# large NTFS mounts peaks well above 1 GB, and the idle evictor brings the RSS
+# back down to the snapshot mapping plus a small delta afterwards, so a high
+# transient peak is not a high steady state. MemoryHigh sits above the measured
+# peak so ordinary indexing is never throttled; MemoryMax is the hard ceiling
+# that OOM-kills the cgroup if the index grows well beyond the tested size.
+MemoryHigh=3G
+MemoryMax=4G
 CPUQuota=50%
 TasksMax=64
 LimitNOFILE=65536
 IOWeight=50
 
 # Hardening.
+#
+# The filesystem-view options (ProtectSystem=, ProtectHome=, PrivateTmp=,
+# ProtectKernelTunables=, ProtectKernelLogs=, ProtectControlGroups=,
+# ReadWritePaths=) are deliberately NOT set: every one of them gives the
+# service its own mount namespace, and a mount the daemon creates would then be
+# invisible to the desktop, making indexed NTFS files impossible to open. A
+# non-root daemon also cannot `setns` into PID 1's namespace to mount there
+# (opening /proc/1/ns/mnt requires ptrace access to a root process), so the
+# daemon must share the host's mount namespace for its read-only NTFS mounts to
+# be usable. The daemon still runs as a dedicated unprivileged user with a
+# two-capability bounding set, NoNewPrivileges, a syscall filter, and the
+# options below.
+#
+# M19: make the host-namespace decision explicit. Do not add
+# PrivateMounts=yes or any option that implies it.
+PrivateMounts=no
+PrivateTmp=no
 NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=read-only
-PrivateTmp=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectKernelLogs=yes
-ProtectControlGroups=yes
-ProtectClock=yes
-ProtectHostname=yes
+# ProtectKernelModules= and ProtectHostname= are also deliberately not set:
+# they mask /usr/lib/modules and make /proc/sys/kernel/hostname read-only
+# through bind mounts, which — like the filesystem-view options — would give
+# the service its own mount namespace.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 RestrictNamespaces=yes
 RestrictRealtime=yes
@@ -62,10 +82,9 @@ LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 # @system-service covers the daemon and its helper processes (blkid, udisksctl);
-# @mount is needed for the read-only ntfs3 fallback mount.
+# @mount is needed for the read-only ntfs3 mount.
 SystemCallFilter=@system-service @mount
 SystemCallErrorNumber=EPERM
-ReadWritePaths=/run/omavrything /var/lib/omavrything
 UMask=0027
 
 [Install]

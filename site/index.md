@@ -3,7 +3,7 @@
 <p class="tagline">Instant, index-backed file search: "Everything" built for Omarchy.</p>
 <p class="lede">A search bar in your <code>omarchy-shell</code>. Start typing and a scratchpad pane of results drops over whatever you are doing, backed by a daemon that keeps every mounted filesystem indexed in memory.</p>
 <div class="badges">
-<span class="badge ok">v0.1.11</span>
+<span class="badge ok">v0.2.0</span>
 <span class="badge">Omarchy Quattro 4.x</span>
 <span class="badge">Quickshell / Qt</span>
 <span class="badge">MIT</span>
@@ -20,21 +20,21 @@
 
 <figure>
 <img src="assets/file-managers.jpg" alt="Meme: File managers? Where we're going we don't need file managers.">
-<figcaption>Where we're going, we don't need file managers.</figcaption>
+<figcaption>Because file management is so 1985</figcaption>
 </figure>
 
 ## What it is
 
-Are you a Windows refugee or simply trying out Omarchy with dual-booting? Are Voidtool's Everything a must-have on your tool belt?
+Are you a Windows refugee or simply trying out Omarchy with dual-booting? Are Voidtools' Everything a must-have on your tool belt?
 Do you hate doing file management and consider instant file searching indispensable; the thing you miss most since moving to Omarchy?
 
 Omavrything brings it back. The UI lives in the `omarchy-shell` as a persistent
-search bar; typing opens a centered, high-transparency scratchpad with a results
+search bar; typing opens a centered, adjustable-transparency scratchpad with a results
 table. A root system daemon (`omavrythingd`) keeps an in-memory index of all
 mounted filesystems — using directory traversal plus `inotify` for Linux
 filesystems (btrfs/ext4/xfs/f2fs) and the MFT for NTFS partitions.
 
-The UX is openly inspired by [Voidtools Everything](https://www.voidtools.com/).
+The UX is openly inspired by [Voidtools' Everything](https://www.voidtools.com/).
 
 ## Highlights
 
@@ -74,14 +74,6 @@ o.bind("SUPER + ALT + SPACE", "Search files", "omarchy-shell tech.alatcerdas.oma
 
 Full setup, including the optional D-Bus control interface, is in
 [Install](docs/install.html).
-
-<div class="note">
-<strong>Upgrading from v0.1.0?</strong> That release shipped the plugin under the id
-<code>omavrything</code> and the daemon under the <code>org.omarchy.*</code> D-Bus
-namespace. Both moved to <code>tech.alatcerdas.omavrything</code> in v0.1.1, so a
-0.1.0 install needs the short upgrade note at the top of
-<a href="https://github.com/brrrassica/omavrything/blob/main/CHANGELOG.md">CHANGELOG.md</a>.
-</div>
 
 ## Requirements
 

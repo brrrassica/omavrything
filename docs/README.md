@@ -11,7 +11,7 @@ Public documentation for `omavrything`.
 - [`architecture.md`](architecture.md) — system design.
 - [`decisions.md`](decisions.md) — decision log (ADRs).
 - [`development.md`](development.md) — build, test, and query profiling.
-- [`benchmarks.md`](benchmarks.md) — baseline search-latency and indexing-throughput numbers.
+- [`benchmarks.md`](benchmarks.md) — baseline search-latency, indexing-throughput, and memory numbers.
 - [`profiling.md`](profiling.md) — CPU wakeups, idle cost, rescan tuning, and the memory cap.
 - [`memory-optimization.md`](memory-optimization.md) — memory model and optimization analysis.
 - [`ffi-audit.md`](ffi-audit.md) — FFI and raw-device access audit.

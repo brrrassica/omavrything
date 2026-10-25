@@ -8,8 +8,10 @@ of `docs/` reference them by number.
 
 ## ADR-001 — Privilege model and indexing scope
 
-**Decision:** A single **root system daemon** (`omavrythingd`, a `systemd` system
-service) indexes all mounted filesystems and handles NTFS directly.
+**Decision:** A single **system daemon** (`omavrythingd`, a `systemd` system
+service) indexes all mounted filesystems and handles NTFS directly. It runs as
+the dedicated `omavrything` user with only the capabilities it needs, not as
+full root.
 
 **Rationale:** Closest to Everything's "index everything" model and the simplest
 process model — one owner of the index, one place that touches raw devices and
@@ -27,12 +29,12 @@ user daemon only with udisks2 mounts and no raw MFT access.
 
 ## ADR-002 — Daemon language
 
-**Decision:** **Rust** for the daemon, core library, NTFS bindings, and CLI.
+**Decision:** **Rust** for the daemon, core library, NTFS reader, and CLI.
 
-**Rationale:** Memory safety and predictable performance for a long-running root
-daemon; a strong ecosystem for filesystem traversal, inotify, D-Bus (`zbus`),
-and FFI to C libraries; matches the conventions of the author's prior Omarchy
-projects.
+**Rationale:** Memory safety and predictable performance for a long-running
+system daemon; a strong ecosystem for filesystem traversal, inotify, D-Bus
+(`zbus`), and the small libc/syscall surface the daemon needs; matches the
+conventions of the author's prior Omarchy projects.
 
 **Alternatives considered:** C++ (Qt-native), Go, Zig.
 
@@ -46,8 +48,10 @@ projects.
 queries instant. A snapshot avoids a full cold scan on every boot while keeping
 the query path purely in-memory.
 
-**Consequences:** Memory scales with file count (~100–200 bytes/file). A very
-large index may need a memory cap or a future memory-mapped/trigram design.
+**Consequences:** Memory scales with file count (roughly a few hundred bytes per
+file including the path arenas, path map, and derived candidate index). The
+current design adds a trigram candidate index and an mmap-backed idle image; a
+very large index may still need a memory cap.
 
 **Alternatives considered:** In-RAM only, rebuilt on boot; memory-mapped LMDB;
 SQLite FTS.
@@ -87,34 +91,37 @@ rescan is the safety net. Idle detection reads `/proc/loadavg`, `/proc/stat`,
 `/proc/diskstats`, and the login1 idle hint.
 
 **Alternatives considered:** fanotify (whole-FS, needs root — viable since the
-daemon is root, but more complex); polling only.
+daemon has the needed capabilities, but more complex); polling only.
 
 ---
 
 ## ADR-006 — NTFS access
 
-**Decision:** **FFI to libntfs-ng (ntfs-3g)** for MFT enumeration and USN journal
+**Decision:** A **pure-Rust NTFS reader** for MFT enumeration and USN journal
 parsing; the daemon mounts read-only via the **kernel `ntfs3`** driver for
 indexing and triggers a **udisks2** user mount so the desktop sees the partition.
 
-**Rationale:** libntfs-ng is the mature, battle-tested NTFS implementation and
-reads the MFT directly from the raw device — the fastest path and the Everything
-approach. udisks2 keeps the user-visible mount consistent with the rest of the
-desktop.
+**Rationale:** Reading the MFT directly from the raw device is the fastest path
+and the Everything approach. A pure-Rust reader avoids a C dependency and an
+unsafe FFI surface while remaining fast enough for the MFT walk. udisks2 keeps
+the user-visible mount consistent with the rest of the desktop.
 
-**Consequences:** A C dependency and unsafe FFI surface; the daemon needs raw
-block-device access (it is root). USN **live** updates are deferred to v0.2; v0.1
-uses MFT read-only plus periodic rescan. The shipped implementation instead uses
-the **pure-Rust** reader documented here as the alternative (see
-[`architecture.md`](architecture.md) and [`daemon.md`](daemon.md)), which removes
-the C dependency and the FFI surface.
+**Consequences:** The daemon needs raw block-device access
+(`CAP_DAC_READ_SEARCH`). USN parsing is implemented but **live** USN updates are
+not yet wired into the index; the daemon uses an MFT read plus the periodic
+rescan. The libntfs-ng (ntfs-3g) binding was considered and rejected in favor of
+the pure-Rust reader (see [`architecture.md`](architecture.md) and
+[`daemon.md`](daemon.md)).
 
-**Alternatives considered:** Pure-Rust NTFS crate (no C dependency, less mature);
-shelling out to `ntfsprogs` (simplest, slowest, fragile).
+**Alternatives considered:** FFI to libntfs-ng (mature, but a C dependency and
+unsafe FFI surface); shelling out to `ntfsprogs` (simplest, slowest, fragile).
 
 ---
 
 ## ADR-007 — UI model
+
+> **Superseded by ADR-008** for the focus mechanism; the persistent bar and
+> summoned results window remain.
 
 **Decision:** A **persistent search bar** in the `omarchy-shell` bar
 (right-center aligned) with a **summoned floating results window** below it.
@@ -156,7 +163,7 @@ the spike); a standalone always-visible panel.
 
 ---
 
-## ADR-009 — Search semantics (v0.1)
+## ADR-009 — Search semantics
 
 **Decision:** Case-insensitive **substring** matching over the **name and full
 path**, with **space-separated AND terms**, ranked by match position, name vs
@@ -171,22 +178,22 @@ majority of real queries without the complexity of regex/glob or a query parser.
 
 ---
 
-## ADR-010 — v0.1 scope
+## ADR-010 — Initial release scope
 
-**Decision:** v0.1 ships btrfs/ext4/xfs/f2fs traversal + inotify; NTFS MFT
-read-only; substring search with AND terms; actions = open file, open containing
-folder, copy path; configurable result window size. **Deferred:** NTFS USN live
-updates, regex/glob, content search.
+**Decision:** The initial release ships btrfs/ext4/xfs/f2fs traversal + inotify;
+NTFS MFT read-only; substring search with AND terms; the action is open file;
+configurable result window size. **Deferred:** NTFS USN live updates,
+regex/glob, content search.
 
 **Rationale:** Delivers the core "instant search" experience end-to-end on the
 target machine (btrfs root, optional NTFS) before adding advanced matching and
 live NTFS journaling.
 
-**Consequences:** USN parsing is implemented in `omavrything-ntfs` but not wired
-into live updates until v0.2.
+**Consequences:** USN parsing is implemented in `omavrything-ntfs` but is not
+yet wired into live updates.
 
-**Alternatives considered:** Broader v0.1 including USN and regex/glob; minimal
-v0.1 without NTFS.
+**Alternatives considered:** A broader initial release including USN and
+regex/glob; a minimal release without NTFS.
 
 ---
 
@@ -275,8 +282,9 @@ scratchpad (per-monitor query state); a daemon pub/sub channel.
 ## ADR-015 — Settings menu
 
 **Decision:** The scratchpad exposes a **settings menu** opened from a **gear
-button** in its top-right corner. Settings include the tile opacity, the size
-fractions, and the result cap.
+button** in its top-right corner. Settings include the tile opacity, snapshot
+interval, idle-eviction period, log level, NTFS toggle, and the detected-volume
+list with mount/unmount actions.
 
 **Rationale:** The tile's appearance (opacity, size) is user-tunable, and a
 gear button is the conventional affordance.
@@ -315,3 +323,79 @@ changes; the docs site still publishes only from `main`.
 gate on the marketplace-tracked branch); a `release/*` branch per version
 (rejected: unnecessary for a single-package project); tagging on `develop`
 (rejected: the marketplace and docs site track `main`).
+
+---
+
+## ADR-017 — Evictable, image-backed index
+
+**Decision:** The snapshot format is a **directly-mappable image** (v6): a
+header, a section table, and four 8-byte aligned sections (`ROOTS`, `RECORDS`,
+`PATHS`, `ROOT_STRINGS`). The `RECORDS` section is a contiguous `#[repr(C)]`
+`FileRecord` array cast directly from the mapping, so loading is an `mmap` plus
+header validation — no decode, no rebuild. The daemon's `IndexManager` **evicts**
+the owned index to this image when idle; while evicted, only the mapping (file
+backed, reclaimable) and a resident path -> index map remain. A query while
+evicted reports `loading` and starts a **background materialization** of the
+owned index (folding the `DeltaIndex` of live updates in), so the next query is
+served at full speed; the image is never linear-scanned on the query path (that
+took 8–16 s at 1.38 M records). v6 adds a per-root `mtime` watermark to the
+`ROOTS` section (M17/A4), so a warm start on a non-btrfs filesystem can detect a
+root that changed while the daemon was down.
+
+**Rationale:** The v4 warm-start decode rebuilt `by_path` and the candidate index
+(~580 ms). A byte-identical image removes that cost and lets the daemon drop the
+owned record/path arenas and the candidate index when idle, cutting RSS. The
+candidate index is not persisted (it is the largest component), so an evicted
+query cannot narrow; it materializes the owned index in the background instead
+of scanning the image, which measured 8–16 s at 1.38 M records.
+
+**Consequences:** The snapshot format is versioned and older versions are
+rejected (a one-time cold scan after upgrade). Live updates while evicted
+accumulate in a bounded delta that is folded into a new snapshot past a
+threshold. The daemon keeps a resident path -> index map while evicted so the
+watcher can resolve a removed path to its base-image record index. Idle eviction
+is **optional and experimental** and is **disabled by default**
+(`evict_idle_secs = 0`); it is a memory-saving feature for very large indexes on
+memory-constrained machines, and the default keeps the index resident so every
+query is served at full speed.
+
+**Alternatives considered:** Keeping the owned index resident (rejected: no RSS
+reduction); persisting the candidate index in the image (rejected: it is the
+largest component and the linear scan is fast enough); storing delta removals by
+path (rejected: the base scan would pay a per-match path check).
+
+## ADR-018 — Removable media is indexed only through the NTFS MFT path
+
+**Decision:** The generic filesystem walker **never** descends into
+`/run/media` (the udisks2 removable-media root): it is filtered out of the walk
+roots in `resolve_roots` and pruned in the walker's descend check. Removable
+media is indexed only by the daemon's NTFS MFT path. When that path finds a
+pre-existing mount that is writable (a udisks2 auto-mount at login), it
+**remounts it read-only and keeps it read-only** for the daemon's lifetime,
+rather than refusing to index it.
+
+**Rationale:** Before this, the walker indexed `/run/media` (it was deliberately
+a scan root) while the MFT path refused the same writable mount, so the volume
+was indexed by the walker and the daemon logged a contradictory "refusing to
+index writable mount" error. The MFT path is both faster (it reads the MFT
+directly) and the only path that can honour the read-only invariant (B12): the
+walker cannot make a mount read-only, so letting it index removable media
+silently bypassed the dirty-bit safety rule. Making the MFT path the sole owner
+of removable media removes the double-index and the contradiction.
+
+**Consequences:** A writable NTFS mount is remounted read-only, so the desktop
+loses write access to that partition while the daemon runs (the user accepted
+this trade-off: safety over write access). The daemon needs `CAP_SYS_ADMIN` to
+remount, which the systemd unit already grants. A remount failure is logged and
+the partition is skipped (never indexed writable). Non-NTFS removable media
+(e.g. a vfat USB stick) is not auto-indexed, since the MFT path only handles
+NTFS; a targeted rescan of a volume the user explicitly mounted can still index
+it (`allow_removable`).
+
+**Alternatives considered:** Keeping the walker indexing `/run/media` and only
+fixing the log (rejected: the read-only invariant stays bypassed and the volume
+is double-indexed); a transient remount (read-only for the MFT read, then
+read-write again — rejected: a race window where the desktop can write during
+the read, and the daemon's model is read-only mounts); a private second
+read-only mount of the same device (rejected: mounting one NTFS device twice is
+not reliably supported by the kernel driver).

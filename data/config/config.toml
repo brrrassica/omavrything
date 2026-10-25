@@ -11,6 +11,10 @@ auto = true
 # Explicit roots, used when `auto` is false.
 # roots = ["/home", "/mnt/data"]
 
+# Block devices mounted through the settings UI. The daemon records them in its
+# state config and mounts/indexes them again on the next start.
+# volumes = ["/dev/sda1"]
+
 # Exclude globs applied during traversal.
 excludes = ["**/.git/**", "**/node_modules/**", "**/.cache/**"]
 
@@ -19,6 +23,14 @@ scan_interval = 900
 
 # Snapshot write interval, in seconds (0 disables).
 snapshot_interval = 300
+
+# Idle period, in seconds, after which the index is evicted to its snapshot image
+# (0 disables). Eviction is an OPTIONAL, EXPERIMENTAL memory-saving feature: it
+# releases the in-memory index when the desktop is idle, at the cost of a reload
+# on the next query. It is disabled by default (0). Set a positive number of
+# seconds to opt in; the settings menu offers 0 s (disabled) or 10-60 s in 10 s
+# steps.
+evict_idle_secs = 0
 
 # Watch roots with inotify for live updates.
 watch = true
@@ -31,6 +43,10 @@ ntfs = true
 
 # Collect per-file size and mtime (needed for the results table).
 metadata = true
+
+# Build and consult the n-gram candidate index (F10). Disabling it bounds memory
+# on very large indexes at the cost of a linear scan per query.
+candidate_index = true
 
 # Log level: error, warn, info, debug, or trace. The default is "error" so a
 # production daemon is quiet unless something is wrong; raise it to "info" or

@@ -11,9 +11,11 @@ confined to thin wrappers around libc.
   documented as the ADR-006 alternative. There is no `libntfs-ng` binding, no
   `bindgen`, and no `build.rs` that links a C library. The only foreign function
   interface is to **libc** (the C standard library and the syscalls it wraps).
-- **All `unsafe` is libc.** Every `unsafe` block in the workspace calls a libc
-  function or constructs a libc struct. There is no `unsafe` in the index,
-  search, scanner, snapshot, protocol, or live-update code.
+- **All `unsafe` is libc or a validated pointer cast.** Every `unsafe` block in
+  the workspace calls a libc function, constructs a libc struct, or casts a
+  validated, aligned byte slice to `[FileRecord]`. There is no `unsafe` in the
+  index, search, scanner, protocol, or live-update code; the snapshot and watch
+  modules contain thin, documented blocks.
 - **Raw-device access is read-only.** The daemon opens a block device only to
   read the NTFS boot sector and MFT. It never writes to a device.
 - **Every `unsafe` block carries a `SAFETY:` comment** stating the invariant that
@@ -34,6 +36,8 @@ confined to thin wrappers around libc.
 | [`peer.rs`](../crates/omavrythingd/src/peer.rs) | `geteuid`, `getegid` | self identity | no preconditions |
 | [`watch.rs`](../crates/omavrything-core/src/watch.rs) | `poll` | bounded inotify wait | single valid `pollfd` |
 | [`snapshot.rs`](../crates/omavrything-core/src/snapshot.rs) | `ioctl(BTRFS_IOC_GET_SUBVOL_INFO)` | btrfs subvolume generation | over-sized buffer; ioctl writes within it |
+| [`snapshot.rs`](../crates/omavrything-core/src/snapshot.rs) | `records_from_bytes` pointer cast | cast the mapped `RECORDS` section to `[FileRecord]` | slice is 8-byte aligned and its length is an exact multiple of `size_of::<FileRecord>()` |
+| [`udev.rs`](../crates/omavrythingd/src/udev.rs) | `socket`, `bind`, `recv` | netlink block-device monitor | fresh owned fd; valid `sockaddr_nl`; buffer sized |
 
 ### Notes on the riskier calls
 
@@ -68,14 +72,16 @@ no raw write path anywhere in the workspace.
 Mounting is delegated to external tools, never done by writing to the kernel
 directly:
 
-- **udisks2** — `udisksctl mount -o ro` (preferred, so the desktop sees the
-  partition).
+- **udisks2** — the D-Bus API is preferred (so the desktop sees the partition),
+  with `udisksctl mount -o ro` as a fallback.
 - **`ntfs3` fallback** — a private read-only mount at
   `/run/omavrything/ntfs/<uuid>`.
 
 Both are spawned as subprocesses. The daemon's systemd unit grants only the
-minimal capability set it needs (raw-device read and the fallback mount), and
-`ProtectSystem=strict` makes the rest of the filesystem read-only.
+minimal capability set it needs (`CAP_DAC_READ_SEARCH` and `CAP_SYS_ADMIN`) and
+shares the host mount namespace so its read-only mounts are visible to the
+desktop; it deliberately does not set `ProtectSystem=` or other
+filesystem-view options.
 
 ## 4. Privilege and input boundaries
 
@@ -90,7 +96,8 @@ minimal capability set it needs (raw-device read and the fallback mount), and
   of the `snapshot_decode` fuzzer.
 - **Peer identity** is enforced with `SO_PEERCRED`; only root, the daemon's own
   uid, and members of the `omavrything` group may connect.
-- **Control methods** (`Rescan`, `SetConfig`, `MountNtfs`) are gated by the
+- **Control methods** (`Rescan`, `SetConfig` for privileged keys, `MountNtfs`,
+  `MountVolume`, `UnmountVolume`) are gated by the
   `tech.alatcerdas.omavrything.control` polkit action.
 
 ## 5. Findings and follow-ups

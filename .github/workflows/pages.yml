@@ -33,11 +33,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Build in a virtualenv: the self-hosted runner's system Python is
+      # externally managed (PEP 668), so a bare `pip install` is refused.
       - name: Install build dependencies
-        run: pip install -r site/requirements.txt
+        run: |
+          python3 -m venv .venv-site
+          .venv-site/bin/pip install -r site/requirements.txt
 
       - name: Build the site
-        run: python site/build.py --out _site
+        run: .venv-site/bin/python site/build.py --out _site
 
       - uses: actions/configure-pages@v6
 

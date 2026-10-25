@@ -1,6 +1,6 @@
 # Installation and setup
 
-`omavrything` is at **v0.1.11**:, but released and used day to day. Install it
+`omavrything` is at **v0.2.0**, released and used day to day. Install it
 from a release archive or from source (§1–2). It targets
 **Omarchy Quattro (4.x)** only — Hyprland, `omarchy-shell` (Quickshell), Arch
 Linux. There is no backwards compatibility with earlier Omarchy releases that
@@ -29,7 +29,8 @@ The daemon serves newline-delimited JSON over
 `$XDG_RUNTIME_DIR/omavrything.sock`. See [`daemon.md`](daemon.md) for the full
 flag list and the protocol.
 
-To index NTFS partitions the daemon must run as root:
+For a user-run daemon, indexing NTFS requires root (raw-device access); the
+system service has the needed capability. In a dev checkout:
 
 ```sh
 scripts/restart-all.sh --sudo
@@ -105,10 +106,11 @@ sudo usermod -aG omavrything "$USER"   # so the shell plugin can reach the socke
 ```
 
 The service runs as the unprivileged `omavrything` user with only the minimal
-capability set it needs, and a hardened profile
-(`ProtectSystem=strict`, `NoNewPrivileges`, a syscall filter, and resource
-limits). Edit `/etc/omavrything/config.toml` to choose roots, excludes, and
-intervals, then `sudo systemctl restart omavrythingd`. See
+capability set it needs (`CAP_DAC_READ_SEARCH` and `CAP_SYS_ADMIN`), and a
+hardened profile (`NoNewPrivileges`, a syscall filter, and resource limits). It
+deliberately shares the host mount namespace so its read-only NTFS mounts are
+visible to the desktop. Edit `/etc/omavrything/config.toml` to choose roots,
+excludes, and intervals, then `sudo systemctl restart omavrythingd`. See
 [`daemon.md`](daemon.md) for the configuration keys and the hardening details.
 
 ## 7. Uninstall

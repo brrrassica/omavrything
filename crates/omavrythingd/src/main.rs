@@ -10,9 +10,13 @@ mod config;
 mod config_file;
 mod dbus;
 mod logging;
+mod manager;
 mod ntfs;
 mod peer;
 mod polkit;
+mod udev;
+mod udisks;
+mod volumes;
 
 use std::ffi::CString;
 use std::fs::File;
@@ -23,16 +27,19 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use omavrything_core::VERSION;
+use omavrything_core::glob::GlobSet;
 use omavrything_core::idle::{IdleMonitor, IdleThresholds, RescanScheduler};
 use omavrything_core::index::Index;
-use omavrything_core::live::{self, FsEvent};
-use omavrything_core::protocol::{Method, Response, ResultItem, parse_request};
-use omavrything_core::scan::{ScanConfig, apply_rescan, plan_rescan, scan};
-use omavrything_core::snapshot::{self, RootIdentity, WarmStart};
+use omavrything_core::live::FsEvent;
+use omavrything_core::protocol::{IndexState, Method, Response, ResultItem, parse_request};
+use omavrything_core::scan::{
+    ScanCancel, ScanConfig, ScanReport, apply_rescan, plan_rescan_cancellable, scan, scan_subtree,
+};
+use omavrything_core::snapshot::{self, WarmStart};
 use omavrything_core::watch::Watcher;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, error, info, warn};
@@ -41,6 +48,7 @@ use config::{ConfigInit, SharedConfig};
 use config_file::{DEFAULT_CONFIG_PATH, FileConfig};
 use dbus::IndexEvent;
 use logging::LogLevel;
+use manager::IndexManager;
 
 /// Maximum number of concurrent client-connection threads.
 ///
@@ -61,6 +69,11 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const WATCH_POLL: Duration = Duration::from_millis(500);
 /// Default interval between periodic snapshot writes.
 const DEFAULT_SNAPSHOT_INTERVAL: u64 = 300;
+/// Idle period (seconds) after which the index is evicted to its snapshot image.
+/// Eviction is an optional, experimental memory-saving feature and is disabled
+/// by default (0); the settings menu offers 0 s (disabled) or 10-60 s in 10 s
+/// steps.
+const EVICT_IDLE_SECS: u64 = 0;
 /// The group that may use the system socket.
 const SOCKET_GROUP: &str = "omavrything";
 
@@ -68,17 +81,22 @@ const SOCKET_GROUP: &str = "omavrything";
 /// handler, which share a fixed temp path.
 static SNAPSHOT_LOCK: Mutex<()> = Mutex::new(());
 
-/// Spawn a named daemon thread, logging instead of panicking on failure.
+/// Spawn a named daemon thread with a bounded stack, logging instead of
+/// panicking on failure.
 ///
 /// `std::thread::spawn` aborts the whole daemon if the OS refuses the spawn
 /// (e.g. under a tight `TasksMax` cgroup budget); background tasks like the
 /// watcher or D-Bus loop should degrade gracefully rather than take the
-/// service down.
-pub(crate) fn spawn_thread<F>(name: &str, f: F)
+/// service down. The explicit stack size keeps per-thread RSS bounded (rc6).
+pub(crate) fn spawn_thread<F>(name: &str, stack: usize, f: F)
 where
     F: FnOnce() + Send + 'static,
 {
-    match std::thread::Builder::new().name(name.to_owned()).spawn(f) {
+    match std::thread::Builder::new()
+        .name(name.to_owned())
+        .stack_size(stack)
+        .spawn(f)
+    {
         Ok(_join) => {}
         Err(err) => error!(thread = name, error = %err, "failed to spawn thread"),
     }
@@ -88,6 +106,9 @@ fn main() {
     // Constrain the allocator before any thread spawns so the scan's transient
     // buffers are returned to the OS rather than retained in per-thread arenas.
     tune_allocator();
+    // Bound the rayon pool before the scan builds it, so the daemon does not
+    // spawn one worker per core for an I/O-bound walk (rc6 RSS spike).
+    tune_scan_pool();
     let args = match Args::parse() {
         Ok(args) => args,
         Err(err) => {
@@ -101,75 +122,43 @@ fn main() {
     let scan_config = args.scan_config();
     let started = Instant::now();
 
-    let (mut index, report, identities, outcome) = match &args.snapshot {
-        Some(path) => {
-            let warm = snapshot::warm_start(&scan_config, path);
-            (warm.index, warm.report, warm.identities, Some(warm.outcome))
+    // Diagnostics: log the roots the scan will walk, so a slow startup can be
+    // attributed to a specific (e.g. large NTFS) mount.
+    {
+        let roots = omavrything_core::scan::resolve_roots(&scan_config);
+        info!(count = roots.len(), "scan: resolved roots");
+        for (root, kind) in &roots {
+            info!(path = %root.display(), fs_kind = ?kind, "scan: root");
         }
-        None => {
-            let (index, report) = scan(&scan_config);
-            let identities = index
-                .roots()
-                .iter()
-                .filter_map(|r| snapshot::root_identity(Path::new(&r.path)))
-                .collect();
-            (index, report, identities, None)
-        }
-    };
-
-    let elapsed_ms = started.elapsed().as_millis() as u64;
-    match outcome {
-        Some(WarmStart::Snapshot) => info!(
-            entries = %index.len(),
-            elapsed_ms,
-            "warm-started from snapshot"
-        ),
-        Some(WarmStart::Partial { rescanned }) => info!(
-            entries = %index.len(),
-            rescanned,
-            elapsed_ms,
-            "warm-started from snapshot"
-        ),
-        Some(WarmStart::ColdScan) => info!(
-            entries = %report.entries,
-            roots = %report.roots,
-            skipped = %report.skipped,
-            unreadable = %report.errors,
-            elapsed_ms,
-            "no usable snapshot; cold scan"
-        ),
-        None => info!(
-            entries = %report.entries,
-            roots = %report.roots,
-            skipped = %report.skipped,
-            unreadable = %report.errors,
-            elapsed_ms,
-            "indexed"
-        ),
-    }
-    for root in index.roots() {
-        info!(path = %root.path, fs_kind = ?root.fs_kind, "root");
     }
 
-    // Reclaim the doubling slack left by the scan or snapshot load, then return
-    // the scan's freed transient pages to the OS before the daemon idles.
-    index.shrink();
-    trim_heap();
-
-    let index = Arc::new(RwLock::new(index));
+    // Non-blocking startup: the manager starts with an empty index and a
+    // `loading` flag, the socket and D-Bus are served immediately, and the scan
+    // (or snapshot warm start) runs in a background thread that swaps the real
+    // index in when it lands. A cold scan of large NTFS mounts can take minutes;
+    // building it synchronously here used to delay the socket bind and the D-Bus
+    // name registration past the install script's 30 s wait, which reported the
+    // daemon as dead while it was merely still scanning.
+    let index = Arc::new(IndexManager::new(
+        Index::new(),
+        Vec::new(),
+        args.snapshot.clone(),
+    ));
+    index.set_loading(true);
     let config = Arc::new(SharedConfig::new(ConfigInit {
         scan: scan_config,
         scan_interval: args.scan_interval,
         snapshot_interval: args.snapshot_interval,
+        evict_idle_secs: args.evict_idle_secs,
         snapshot: args.snapshot.clone(),
         watch: args.watch,
         ntfs: args.ntfs,
         log_level: args.log_level,
         background_opacity: args.background_opacity,
+        candidate_index: args.candidate_index,
         state: args.state.clone(),
         state_path: args.state_path.clone(),
     }));
-    let identities = Arc::new(RwLock::new(identities));
     let policy = Arc::new(Mutex::new(ntfs::NtfsPolicy::load(
         ntfs::default_policy_path(),
     )));
@@ -182,50 +171,37 @@ fn main() {
     // a dedicated thread can perform a clean snapshot write on shutdown.
     install_shutdown_handler(
         Arc::clone(&index),
-        Arc::clone(&identities),
+        Arc::clone(&config),
         args.snapshot.clone(),
+        args.socket.clone(),
     );
-
-    if args.watch {
-        let index = Arc::clone(&index);
-        let config = Arc::clone(&config);
-        let events = event_tx.clone();
-        spawn_thread("watcher", move || run_watcher(index, config, events));
-    }
-
-    if args.scan_interval > 0 {
-        let index = Arc::clone(&index);
-        let config = Arc::clone(&config);
-        let events = event_tx.clone();
-        spawn_thread("scheduler", move || run_scheduler(index, config, events));
-    }
-
-    if let Some(path) = &args.snapshot {
-        if args.snapshot_interval > 0 {
-            let index = Arc::clone(&index);
-            let identities = Arc::clone(&identities);
-            let config = Arc::clone(&config);
-            let path = path.clone();
-            spawn_thread("snapshot", move || {
-                run_snapshot(index, identities, config, path)
-            });
-        }
-    }
 
     if args.dbus {
         let index = Arc::clone(&index);
         let config = Arc::clone(&config);
         let events = event_tx.clone();
         let policy = Arc::clone(&policy);
-        spawn_thread("dbus", move || {
+        spawn_thread("omavry-dbus", CONTROL_STACK, move || {
             dbus::run(index, config, started, event_rx, events, policy)
         });
     }
 
-    if args.ntfs {
+    // Build the index in the background; `run_startup` swaps it in and then
+    // starts the watch/schedule/snapshot/evict/NTFS threads.
+    {
         let index = Arc::clone(&index);
+        let config = Arc::clone(&config);
         let policy = Arc::clone(&policy);
-        spawn_thread("ntfs-startup", move || run_ntfs_startup(index, policy));
+        let events = event_tx.clone();
+        let opts = StartupOpts {
+            snapshot: args.snapshot.clone(),
+            watch: args.watch,
+            query_cache: args.query_cache,
+            started,
+        };
+        spawn_thread("omavry-startup", CONTROL_STACK, move || {
+            run_startup(index, config, policy, events, opts)
+        });
     }
 
     // A stale socket from a previous run would make bind() fail.
@@ -309,7 +285,8 @@ fn main() {
                 // A failed spawn must not panic the accept loop: decrement the
                 // counter and drop the stream so the daemon keeps serving.
                 match std::thread::Builder::new()
-                    .name("client".to_owned())
+                    .name("omavry-conn".to_owned())
+                    .stack_size(CONNECTION_STACK)
                     .spawn(move || {
                         serve(stream, index, profile);
                         active.fetch_sub(1, Ordering::Relaxed);
@@ -324,6 +301,240 @@ fn main() {
             Err(err) => warn!(error = %err, "accept error"),
         }
     }
+}
+
+/// Build the index in the background and swap it into the manager, then start
+/// the watch/schedule/snapshot/evict/NTFS threads.
+///
+/// The socket and D-Bus are already serving while this runs: searches return an
+/// empty page with the `loading` flag set until the index lands. The background
+/// services start only after the swap: the watcher would otherwise apply events
+/// to an index the swap replaces, and the snapshot writer would persist the
+/// empty warming index over a good snapshot.
+///
+/// Everything the startup needs that is not shared state, bundled so the
+/// function signature stays readable.
+struct StartupOpts {
+    snapshot: Option<PathBuf>,
+    watch: bool,
+    query_cache: bool,
+    started: Instant,
+}
+
+fn run_startup(
+    index: Arc<IndexManager>,
+    config: Arc<SharedConfig>,
+    policy: Arc<Mutex<ntfs::NtfsPolicy>>,
+    events: UnboundedSender<IndexEvent>,
+    opts: StartupOpts,
+) {
+    let StartupOpts {
+        snapshot,
+        watch,
+        query_cache,
+        started,
+    } = opts;
+    let scan_config = config.scan();
+    let (mut built, report, identities, outcome) = match &snapshot {
+        Some(path) => {
+            // Load the snapshot through an mmap (F6): it avoids the intermediate
+            // read buffer, and falls back to a plain read if mapping fails.
+            let warm = snapshot::warm_start_with(&scan_config, path, snapshot::SnapshotLoad::Mmap);
+            (warm.index, warm.report, warm.identities, Some(warm.outcome))
+        }
+        None => {
+            let (index, report) = scan(&scan_config);
+            let identities = index
+                .roots()
+                .iter()
+                .filter_map(|r| snapshot::root_identity(Path::new(&r.path)))
+                .collect();
+            (index, report, identities, None)
+        }
+    };
+
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    match outcome {
+        Some(WarmStart::Snapshot) => info!(
+            entries = %built.len(),
+            elapsed_ms,
+            "warm-started from snapshot"
+        ),
+        Some(WarmStart::Partial { rescanned }) => info!(
+            entries = %built.len(),
+            rescanned,
+            elapsed_ms,
+            "warm-started from snapshot"
+        ),
+        Some(WarmStart::ColdScan) => info!(
+            entries = %report.entries,
+            roots = %report.roots,
+            skipped = %report.skipped,
+            unreadable = %report.errors,
+            elapsed_ms,
+            "no usable snapshot; cold scan"
+        ),
+        None => info!(
+            entries = %report.entries,
+            roots = %report.roots,
+            skipped = %report.skipped,
+            unreadable = %report.errors,
+            elapsed_ms,
+            "indexed"
+        ),
+    }
+    for root in built.roots() {
+        info!(path = %root.path, fs_kind = ?root.fs_kind, "root");
+    }
+
+    // F10: honour the candidate-index preference before the index settles, so a
+    // disabled index is not consulted (and its memory is reclaimed).
+    if !config.candidate_index() {
+        built.set_candidate_enabled(false);
+    }
+    // F7: the benchmark disables the query cache to measure the cold path.
+    if !query_cache {
+        built.set_query_cache(false);
+    }
+
+    // Reclaim the doubling slack left by the scan or snapshot load, then return
+    // the scan's freed transient pages to the OS before the daemon idles.
+    built.shrink();
+    trim_heap();
+    log_memory(&built, "startup");
+
+    // Hand the built index to the manager; every subsequent query sees it.
+    let entries = built.len() as u64;
+    index.replace_index(built, identities);
+    info!(entries, elapsed_ms, "index ready; daemon serving");
+    let _ = events.send(IndexEvent::Changed { entries });
+
+    if watch {
+        let index = Arc::clone(&index);
+        let config = Arc::clone(&config);
+        let events = events.clone();
+        spawn_thread("omavry-watch", CONTROL_STACK, move || {
+            run_watcher(index, config, events)
+        });
+    }
+
+    if config.scan_interval() > 0 {
+        let index = Arc::clone(&index);
+        let config = Arc::clone(&config);
+        let events = events.clone();
+        spawn_thread("omavry-sched", CONTROL_STACK, move || {
+            run_scheduler(index, config, events)
+        });
+    }
+
+    if let Some(path) = &snapshot {
+        if config.snapshot_interval() > 0 {
+            let index = Arc::clone(&index);
+            let config = Arc::clone(&config);
+            let path = path.clone();
+            spawn_thread("omavry-snap", CONTROL_STACK, move || {
+                run_snapshot(index, config, path)
+            });
+        }
+        // Eviction needs a snapshot to map, so only run the evictor when one is
+        // configured.
+        let index = Arc::clone(&index);
+        let config = Arc::clone(&config);
+        spawn_thread("omavry-evict", CONTROL_STACK, move || {
+            run_evictor(index, config)
+        });
+    }
+
+    if config.ntfs() {
+        let ownership = Arc::new(Mutex::new(ntfs::MountOwnership::load(
+            ntfs::default_ownership_path(),
+        )));
+        let startup_index = Arc::clone(&index);
+        let startup_policy = Arc::clone(&policy);
+        spawn_thread("omavry-ntfs", CONTROL_STACK, move || {
+            run_ntfs_startup(startup_index, startup_policy, ownership)
+        });
+    }
+
+    // Mount and index volumes the user mounted through the settings UI. NTFS
+    // volumes are skipped here: the NTFS startup pass above already remembers
+    // them by UUID in its own policy file.
+    {
+        let index = Arc::clone(&index);
+        let config = Arc::clone(&config);
+        let events = events.clone();
+        spawn_thread("omavry-volumes", CONTROL_STACK, move || {
+            run_remembered_volumes(index, config, events)
+        });
+    }
+}
+
+/// Mount and index the non-NTFS volumes remembered in the state config.
+fn run_remembered_volumes(
+    index: Arc<IndexManager>,
+    config: Arc<SharedConfig>,
+    events: UnboundedSender<IndexEvent>,
+) {
+    let devices = config.remembered_volumes();
+    if devices.is_empty() {
+        return;
+    }
+    info!(
+        count = devices.len(),
+        "volumes: mounting remembered volumes"
+    );
+    for device in devices {
+        let device = PathBuf::from(device);
+        let Some(fstype) = volumes::probe_fstype(&device) else {
+            warn!(
+                device = %device.display(),
+                "volumes: remembered device has no filesystem; skipping"
+            );
+            continue;
+        };
+        // NTFS is handled by the NTFS startup pass (its policy remembers UUIDs).
+        if matches!(fstype.as_str(), "ntfs" | "ntfs3") {
+            continue;
+        }
+        let mount_point = match volumes::mount_generic(&device) {
+            Ok(mount_point) => mount_point,
+            Err(err) => {
+                warn!(
+                    device = %device.display(),
+                    error = %err,
+                    "volumes: could not mount remembered volume"
+                );
+                continue;
+            }
+        };
+        if index
+            .roots()
+            .iter()
+            .any(|r| Path::new(&r.path) == mount_point.as_path())
+        {
+            continue;
+        }
+        let kind = omavrything_core::mounts::fs_kind(&fstype);
+        index.with_index_mut(|idx| idx.add_root(&mount_point, kind));
+        let scan = config.scan();
+        let sub = ScanConfig {
+            roots: vec![mount_point.clone()],
+            excludes: scan.excludes.clone(),
+            skip_pseudo: scan.skip_pseudo,
+            metadata: scan.metadata,
+            allow_removable: true,
+        };
+        let plan = plan_rescan_cancellable(&sub, None);
+        let report = index.with_index_mut(|idx| apply_rescan(idx, plan));
+        info!(
+            device = %device.display(),
+            mount_point = %mount_point.display(),
+            entries = report.entries,
+            "volumes: remembered volume indexed"
+        );
+    }
+    let entries = index.len() as u64;
+    let _ = events.send(IndexEvent::Changed { entries });
 }
 
 /// Set the socket to mode `0660` and, when running as root, group
@@ -400,7 +611,7 @@ fn login1_idle_hint(rt: &tokio::runtime::Runtime) -> Option<bool> {
 
 /// Watch the indexed roots with inotify and apply events to the index.
 fn run_watcher(
-    index: Arc<RwLock<Index>>,
+    index: Arc<IndexManager>,
     config: Arc<SharedConfig>,
     events: UnboundedSender<IndexEvent>,
 ) {
@@ -412,7 +623,12 @@ fn run_watcher(
         }
     };
 
-    let roots: Vec<PathBuf> = read_index(&index)
+    // Do not watch excluded subtrees. The scanner prunes them, so watching them
+    // only delivers events `apply_event` discards; a churning excluded directory
+    // (e.g. `~/.cache`) then floods the watcher under the index write lock.
+    watcher.set_excludes(GlobSet::new(&config.scan().excludes));
+
+    let roots: Vec<PathBuf> = index
         .roots()
         .iter()
         .map(|r| PathBuf::from(&r.path))
@@ -429,6 +645,9 @@ fn run_watcher(
             "directories could not be watched (max_user_watches exhausted?)"
         );
     }
+    // A5: publish the unwatched subtrees so the scheduler can rescan them on a
+    // targeted cadence and GetStatus can surface the count.
+    config.set_unwatched(watcher.failed().to_vec());
     info!(directories = watcher.watch_count(), "watching");
 
     let mut buffer = [0u8; 8192];
@@ -439,11 +658,20 @@ fn run_watcher(
                     continue;
                 }
                 let scan = config.scan();
-                {
-                    let mut idx = write_index(&index);
-                    for event in &batch {
-                        live::apply(&mut idx, event, &scan);
-                    }
+                let mut changed = false;
+                for event in &batch {
+                    changed |= index.apply_event(event, &scan);
+                }
+                // Reclaim the doubling slack the inserts left, so a long-running
+                // daemon does not hold 2x capacity forever (rc6 RSS spike). Only
+                // run it when the batch actually changed the index: a batch of
+                // no-op events (excluded paths, metadata noise) leaves no slack,
+                // so shrinking on every batch is pure write-lock churn. A no-op
+                // when the index is evicted or the slack is small.
+                if changed && index.shrink_if_owned() {
+                    // The shrink freed pages; return them to the OS rather than
+                    // leaving them in the glibc arena (rc6 RSS spike).
+                    trim_heap();
                 }
                 // Watch newly created directories.
                 for event in &batch {
@@ -460,8 +688,9 @@ fn run_watcher(
                         "more directories could not be watched (max_user_watches exhausted?)"
                     );
                     reported_failed = failed;
+                    config.set_unwatched(watcher.failed().to_vec());
                 }
-                let entries = read_index(&index).len() as u64;
+                let entries = index.len() as u64;
                 let _ = events.send(IndexEvent::Changed { entries });
             }
             Err(err) => {
@@ -474,12 +703,16 @@ fn run_watcher(
 
 /// Periodically rescan the roots when the system is idle.
 fn run_scheduler(
-    index: Arc<RwLock<Index>>,
+    index: Arc<IndexManager>,
     config: Arc<SharedConfig>,
     events: UnboundedSender<IndexEvent>,
 ) {
     let mut monitor = IdleMonitor::new(IdleThresholds::default());
     let mut scheduler = RescanScheduler::new(Duration::from_secs(config.scan_interval().max(1)));
+    // A5: the targeted-rescan cadence for unwatched subtrees: one pass every
+    // 60 polls (5 minutes at the 5 s poll interval).
+    const TARGETED_RESCAN_POLLS: u32 = 60;
+    let mut polls = 0u32;
     // A current-thread runtime for the login1 idle-hint query. If it cannot be
     // built, the hint is simply unavailable.
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -502,20 +735,39 @@ fn run_scheduler(
             let _ = events.send(IndexEvent::ScanProgress {
                 phase: "start".into(),
                 entries: 0,
+                errors: 0,
             });
             config.set_scanning(true);
             let scan = config.scan();
+            // A3: the walk stops promptly on shutdown or when a newer rescan
+            // supersedes this one.
+            let cancel = ScanCancel::new(config.generation_cell(), config.shutdown_cell());
             // Walk the filesystem outside the lock, then reconcile under it.
             // This keeps searches unblocked during the traversal without cloning
             // the whole index (which doubled peak memory).
-            let plan = plan_rescan(&scan);
-            let (report, entries) = {
-                let mut idx = write_index(&index);
-                let report = apply_rescan(&mut idx, plan);
-                (report, idx.len() as u64)
+            let plan = plan_rescan_cancellable(&scan, Some(&cancel));
+            let cancelled = cancel.cancelled();
+            let (report, entries) = if cancelled {
+                warn!("rescan superseded or shutting down; discarding the partial plan");
+                (ScanReport::default(), index.len() as u64)
+            } else {
+                index.with_index_mut(|idx| {
+                    let report = apply_rescan(idx, plan);
+                    // A rescan appends the new entries and leaves the vectors at
+                    // their doubled capacity; reclaim it (rc6 RSS spike).
+                    idx.shrink();
+                    (report, idx.len() as u64)
+                })
             };
             config.set_scanning(false);
+            config.set_last_scan_errors(report.errors, report.error_paths.clone());
             trim_heap();
+            if !report.error_paths.is_empty() {
+                warn!(
+                    paths = ?report.error_paths,
+                    "rescan: directories could not be read"
+                );
+            }
             info!(
                 added = %report.entries,
                 stale = %report.skipped,
@@ -525,8 +777,31 @@ fn run_scheduler(
             let _ = events.send(IndexEvent::ScanProgress {
                 phase: "done".into(),
                 entries,
+                errors: report.errors as u64,
             });
             let _ = events.send(IndexEvent::Changed { entries });
+        }
+        // A5: targeted rescan of the subtrees that could not be watched, on
+        // their own cadence, so watch-limit exhaustion does not leave those
+        // subtrees permanently stale.
+        polls += 1;
+        if polls >= TARGETED_RESCAN_POLLS {
+            polls = 0;
+            let unwatched = config.unwatched();
+            if !unwatched.is_empty() && !config.shutting_down() {
+                let scan = config.scan();
+                let entries = index.with_index_mut(|idx| {
+                    for path in &unwatched {
+                        scan_subtree(idx, path, &scan);
+                    }
+                    idx.len() as u64
+                });
+                info!(
+                    subtrees = unwatched.len(),
+                    "targeted rescan of unwatched subtrees"
+                );
+                let _ = events.send(IndexEvent::Changed { entries });
+            }
         }
     }
 }
@@ -539,7 +814,39 @@ fn contain_panic<T>(job: impl FnOnce() -> T) -> Result<T, ()> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).map_err(|_| ())
 }
 
-pub(crate) fn run_ntfs_startup(index: Arc<RwLock<Index>>, policy: Arc<Mutex<ntfs::NtfsPolicy>>) {
+pub(crate) fn run_ntfs_startup(
+    index: Arc<IndexManager>,
+    policy: Arc<Mutex<ntfs::NtfsPolicy>>,
+    ownership: Arc<Mutex<ntfs::MountOwnership>>,
+) {
+    // B10: reconcile the ownership state left by a SIGKILL or crash — unmount
+    // stale daemon-created private mounts before indexing. This runs on the
+    // NTFS startup thread, so it does not block the rest of startup, and a
+    // failed unmount is non-fatal (B14): a stuck mount cannot put the daemon
+    // into a restart loop.
+    ntfs::reconcile_stale_mounts();
+    // M18 (B2): the persisted mount-ownership state is loaded by the caller and
+    // shared with the hotplug monitor. Reconcile it here — entries for mounts
+    // that are no longer live are pruned, and a tracked mount that vanished
+    // while the daemon was down has its index entries dropped (B8). A mount
+    // that is live again is re-indexed below by the normal partition pass.
+    {
+        let mut o = ownership.lock().unwrap_or_else(|e| e.into_inner());
+        if !o.is_empty() {
+            info!(mounts = o.len(), "ntfs: tracked mount ownership");
+        }
+        // B8: a recorded mount that is no longer live had its entries indexed
+        // before the daemon stopped; drop them so the index matches the volume.
+        // `drop_mount_entries` is a no-op for a mount that is live again, which
+        // the partition pass below then re-indexes.
+        for mp in o.mount_points() {
+            ntfs::drop_mount_entries(&index, &mp);
+        }
+        // Prune the state of mounts that are no longer live.
+        if let Err(e) = o.reconcile() {
+            warn!(error = %e, "ntfs: could not persist the reconciled ownership state");
+        }
+    }
     {
         let p = policy.lock().unwrap_or_else(|e| e.into_inner());
         if !p.is_empty() {
@@ -569,11 +876,27 @@ pub(crate) fn run_ntfs_startup(index: Arc<RwLock<Index>>, policy: Arc<Mutex<ntfs
         // whole startup thread and no later partition is indexed at all. The index
         // and policy locks are reached through `unwrap_or_else(|e| e.into_inner())`
         // everywhere, so a lock poisoned by a contained panic stays usable.
-        match contain_panic(|| ntfs::mount_index_and_remember(&index, &policy, part)) {
+        match contain_panic(|| {
+            ntfs::mount_index_and_remember_with_ownership(
+                index.as_ref(),
+                policy.as_ref(),
+                ownership.as_ref(),
+                part,
+            )
+        }) {
             Ok(Ok(mount_point)) => info!(
                 device = %part.device.display(),
                 mount_point = %mount_point.display(),
                 "ntfs: indexed"
+            ),
+            // A writable mount is refused by design (B12): MFT parsing reads the
+            // raw device, which risks the volume's dirty bit. This is not a
+            // failure — the generic filesystem walker still indexes the mount —
+            // so it is logged at `info`, not `error`.
+            Ok(Err(err)) if err.starts_with(ntfs::WRITABLE_MOUNT_ERR) => info!(
+                device = %part.device.display(),
+                error = %err,
+                "ntfs: skipping MFT indexing of a writable mount (the filesystem walker still indexes it)"
             ),
             Ok(Err(err)) => error!(
                 device = %part.device.display(),
@@ -589,8 +912,7 @@ pub(crate) fn run_ntfs_startup(index: Arc<RwLock<Index>>, policy: Arc<Mutex<ntfs
     // MFT parsing allocates large transient buffers and the re-index appends to
     // the arenas; compact, reclaim the doubling slack, and return the freed pages
     // before the daemon idles.
-    {
-        let mut idx = write_index(&index);
+    index.with_index_mut(|idx| {
         idx.compact();
         idx.shrink();
         let b = idx.memory_breakdown();
@@ -601,17 +923,53 @@ pub(crate) fn run_ntfs_startup(index: Arc<RwLock<Index>>, policy: Arc<Mutex<ntfs
             paths_cap = b.paths_cap,
             "index shrunk after NTFS indexing"
         );
-    }
+    });
     trim_heap();
+
+    // B4: start the hotplug monitor only after the startup pass has finished,
+    // so it cannot race the initial mount/index of a large volume. The monitor
+    // is idempotent (a static guard prevents a second instance when NTFS is
+    // toggled on again at runtime).
+    let hotplug_index = Arc::clone(&index);
+    let hotplug_policy = Arc::clone(&policy);
+    let hotplug_ownership = Arc::clone(&ownership);
+    spawn_thread("omavry-ntfs-hotplug", CONTROL_STACK, move || {
+        ntfs::run_hotplug_monitor(hotplug_index, hotplug_policy, hotplug_ownership)
+    });
 }
 
 /// Periodically write a snapshot of the index.
-fn run_snapshot(
-    index: Arc<RwLock<Index>>,
-    identities: Arc<RwLock<Vec<RootIdentity>>>,
-    config: Arc<SharedConfig>,
-    path: PathBuf,
-) {
+/// Evict the index to its snapshot image after a period with no queries or
+/// mutations, so the daemon's resident set falls to the mapping plus the delta.
+fn run_evictor(index: Arc<IndexManager>, config: Arc<SharedConfig>) {
+    loop {
+        let idle = config.evict_idle_secs();
+        if idle == 0 {
+            // Eviction is disabled; just idle without spinning.
+            std::thread::sleep(Duration::from_secs(30));
+            continue;
+        }
+        // Sleep until the idle deadline would actually be reached (capped at
+        // 30 s so a runtime `evict_idle_secs` change is picked up promptly),
+        // so eviction happens within ~one poll of the configured period rather
+        // than up to two poll intervals late.
+        let elapsed = index.idle_secs(idle);
+        let remaining = idle.saturating_sub(elapsed).max(1);
+        std::thread::sleep(Duration::from_secs(remaining.min(30)));
+        if index.evict_if_idle(idle) {
+            info!(idle_secs = idle, "index evicted (idle)");
+            trim_heap();
+        } else if !index.is_evicted() && index.idle_secs(idle) >= idle {
+            // The idle deadline passed but the eviction failed (for example the
+            // snapshot path is not writable). Back off instead of retrying every
+            // second, which would spin the evictor and spam the log.
+            warn!(idle_secs = idle, "index eviction failed; retrying in 30 s");
+            std::thread::sleep(Duration::from_secs(30));
+        }
+    }
+}
+
+fn run_snapshot(index: Arc<IndexManager>, config: Arc<SharedConfig>, path: PathBuf) {
     loop {
         let interval = config.snapshot_interval();
         if interval == 0 {
@@ -619,14 +977,18 @@ fn run_snapshot(
             continue;
         }
         std::thread::sleep(Duration::from_secs(interval));
+        // When evicted with no pending delta, the on-disk snapshot is already
+        // current (eviction wrote it), so there is nothing to persist.
+        if index.is_evicted() && !index.has_pending_delta() {
+            continue;
+        }
         // Compact and encode under the lock, then write outside it so the
         // inotify writer is not blocked on disk I/O.
-        let bytes = {
-            let mut idx = write_index(&index);
+        let ids = index.identities();
+        let bytes = index.with_index_mut(|idx| {
             idx.compact();
-            let ids = read_identities(&identities);
-            snapshot::encode(&idx, &ids)
-        };
+            snapshot::encode(idx, &ids)
+        });
         let _guard = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         if let Err(e) = snapshot::write_atomic(&bytes, &path) {
             error!(error = %e, "snapshot save failed");
@@ -659,9 +1021,10 @@ extern "C" fn handle_shutdown_signal(_sig: libc::c_int) {
 /// only writes a byte, and a dedicated thread performs the snapshot write. The
 /// handler is installed process-wide; it does not block the signals.
 fn install_shutdown_handler(
-    index: Arc<RwLock<Index>>,
-    identities: Arc<RwLock<Vec<RootIdentity>>>,
+    index: Arc<IndexManager>,
+    config: Arc<SharedConfig>,
     snapshot: Option<PathBuf>,
+    socket: PathBuf,
 ) {
     let mut fds = [0i32; 2];
     // SAFETY: `fds` is a valid 2-element array for `pipe`.
@@ -681,7 +1044,7 @@ fn install_shutdown_handler(
     }
 
     let read_fd = fds[0];
-    spawn_thread("shutdown", move || {
+    spawn_thread("omavry-shutdown", CONTROL_STACK, move || {
         let mut byte = [0u8; 1];
         loop {
             // SAFETY: `read_fd` is a valid pipe read end and `byte` is 1 byte.
@@ -698,28 +1061,38 @@ fn install_shutdown_handler(
             }
         }
         info!("shutdown signal received");
+        // A3: running scans stop promptly so the shutdown snapshot is written
+        // without waiting for a long traversal to finish.
+        config.set_shutting_down(true);
         if let Some(path) = &snapshot {
-            let bytes = {
-                let idx = read_index(&index);
-                let ids = read_identities(&identities);
-                snapshot::encode(&idx, &ids)
-            };
-            let _guard = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            match snapshot::write_atomic(&bytes, path) {
-                Ok(()) => info!(path = %path.display(), "snapshot written"),
-                Err(e) => error!(error = %e, "snapshot save failed"),
+            // A shutdown while the background startup is still building the
+            // index would persist the empty warming index over a possibly good
+            // snapshot; skip the write.
+            if index.is_loading() {
+                warn!("shutdown during startup; snapshot not written");
+            } else {
+                let bytes = index.encode();
+                let _guard = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                match snapshot::write_atomic(&bytes, path) {
+                    Ok(()) => info!(path = %path.display(), "snapshot written"),
+                    Err(e) => error!(error = %e, "snapshot save failed"),
+                }
             }
         }
-        // Diagnostics: the daemon does not unmount the private NTFS mounts it
-        // created (a known defect, see plans/risks.md R13). Log what leaks so
-        // the mount-lifecycle question can be answered from logs.
-        let leaked = ntfs::private_mounts();
-        if !leaked.is_empty() {
-            warn!(
-                mounts = ?leaked,
-                "ntfs: daemon-created mounts are NOT unmounted on shutdown (known defect; plans/risks.md R13)"
-            );
-        }
+        // B9: unmount every daemon-created private mount before exiting. Each
+        // unmount is bounded by per-mount retries and a lazy (`umount -l`)
+        // fallback (B13); a mount that cannot be released is logged and left
+        // in place rather than blocking shutdown (B14). The signal handler
+        // itself stays async-signal-safe: all work happens on this thread.
+        ntfs::unmount_all_private();
+        // Remove the socket so a stopped daemon leaves no stale socket behind.
+        // The unit no longer uses RuntimeDirectory= (systemd sets that up
+        // through a bind mount, which would give the service its own mount
+        // namespace and hide its NTFS mounts from the desktop), so systemd does
+        // not clean the runtime directory on stop; the daemon must remove its
+        // own socket. A stale socket would make clients hang or fail
+        // confusingly.
+        let _ = std::fs::remove_file(&socket);
         std::process::exit(0);
     });
 }
@@ -728,7 +1101,7 @@ fn install_shutdown_handler(
 ///
 /// When `profile` is set, each search logs a stage-by-stage timing breakdown to
 /// stderr (see `OMAVRYTHING_PROFILE`).
-fn serve(stream: UnixStream, index: Arc<RwLock<Index>>, profile: bool) {
+fn serve(stream: UnixStream, index: Arc<IndexManager>, profile: bool) {
     let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
     // The write timeout applies to the socket itself, so it also covers the
     // `try_clone`d read half; a stalled reader cannot wedge the reply write.
@@ -771,16 +1144,18 @@ fn serve(stream: UnixStream, index: Arc<RwLock<Index>>, profile: bool) {
         let response = match request.method {
             Method::Search => {
                 let started = Instant::now();
-                let guard = read_index(&index);
                 let limit = request.effective_limit();
                 let offset = request.effective_offset();
-                let outcome = if profile {
-                    let (outcome, timing) = guard.search_profiled(&request.q, limit, offset);
-                    debug!(query = %request.q, timing = %timing.summary(), "search");
-                    outcome
-                } else {
-                    guard.search(&request.q, limit, offset)
-                };
+                let (outcome, loading) = index.search(&request.q, limit, offset);
+                // An evicted index reports `loading` and is materialized in the
+                // background, so the client shows a reloading state and the next
+                // query is served from the owned index at full speed.
+                if loading {
+                    index.ensure_resident();
+                }
+                if profile {
+                    debug!(query = %request.q, hits = outcome.hits.len(), "search");
+                }
                 let results: Vec<ResultItem> = outcome
                     .hits
                     .iter()
@@ -797,6 +1172,11 @@ fn serve(stream: UnixStream, index: Arc<RwLock<Index>>, profile: bool) {
                     total: outcome.total,
                     took_ms: started.elapsed().as_millis() as u64,
                     error: None,
+                    state: if loading {
+                        Some(IndexState::Loading)
+                    } else {
+                        None
+                    },
                 }
             }
         };
@@ -855,19 +1235,25 @@ fn read_line_bounded<R: BufRead>(
     Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
 }
 
-/// Acquire a read lock, recovering from a poisoned lock rather than panicking.
-fn read_index(index: &RwLock<Index>) -> RwLockReadGuard<'_, Index> {
-    index.read().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Acquire a write lock, recovering from a poisoned lock rather than panicking.
-fn write_index(index: &RwLock<Index>) -> RwLockWriteGuard<'_, Index> {
-    index.write().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Clone the current root identities.
-fn read_identities(identities: &RwLock<Vec<RootIdentity>>) -> Vec<RootIdentity> {
-    identities.read().unwrap_or_else(|e| e.into_inner()).clone()
+/// Log the index's used and resident (capacity) memory, so the benchmark can
+/// attribute the gap between the accounting and RSS (rc7).
+fn log_memory(index: &Index, phase: &str) {
+    let b = index.memory_breakdown();
+    info!(
+        phase,
+        entries = index.len(),
+        memory_bytes = index.memory_bytes(),
+        capacity_bytes = index.capacity_bytes(),
+        records_len = b.records_len,
+        records_cap = b.records_cap,
+        paths_len = b.paths_len,
+        paths_cap = b.paths_cap,
+        map_len = b.map_len,
+        map_cap_bytes = b.map_cap_bytes,
+        candidate_bytes = b.candidate_bytes,
+        candidate_capacity_bytes = b.candidate_capacity_bytes,
+        "index memory"
+    );
 }
 
 /// Ask the allocator to return freed heap pages to the OS.
@@ -892,9 +1278,43 @@ fn trim_heap() {
 /// [`trim_heap`] effective. A no-op on non-glibc targets.
 fn tune_allocator() {
     #[cfg(target_env = "gnu")]
-    // SAFETY: `mallopt` has no preconditions; `M_ARENA_MAX` is a valid option.
+    // SAFETY: `mallopt` has no preconditions; the options are valid.
     unsafe {
         libc::mallopt(libc::M_ARENA_MAX, 1);
+        // Make large transient buffers (the scan's walk buffer, the candidate
+        // build's staging maps, the encoded snapshot) use mmap, so they are
+        // returned to the OS on free without waiting for a trim (rc6 RSS spike).
+        libc::mallopt(libc::M_MMAP_THRESHOLD, 64 * 1024);
+        // Trim the heap top more eagerly when a large block is freed.
+        libc::mallopt(libc::M_TRIM_THRESHOLD, 64 * 1024);
+    }
+}
+
+/// Stack size for the daemon's long-lived control threads. The default 8 MiB is
+/// virtual and mostly untouched, but an explicit smaller size keeps the resident
+/// stack pages bounded (rc6 RSS spike).
+pub(crate) const CONTROL_STACK: usize = 1 << 20;
+/// Stack size for a per-connection thread.
+const CONNECTION_STACK: usize = 512 << 10;
+
+/// Bound the rayon global pool used by the scan and the parallel search.
+///
+/// The scan is I/O-bound and scales only ~1.4x from one to sixteen cores (F8),
+/// so a small pool keeps the throughput while cutting the resident thread
+/// stacks. Override with `OMAVRYTHING_SCAN_THREADS`; the default is
+/// `min(cores, 4)`.
+fn tune_scan_pool() {
+    let threads = std::env::var("OMAVRYTHING_SCAN_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get().min(4))
+                .unwrap_or(4)
+        });
+    if !omavrything_core::tune_scan_pool(threads) {
+        debug!("scan pool already built; OMAVRYTHING_SCAN_THREADS ignored");
     }
 }
 
@@ -910,11 +1330,16 @@ struct Args {
     scan_interval: u64,
     snapshot: Option<PathBuf>,
     snapshot_interval: u64,
+    evict_idle_secs: u64,
     dbus: bool,
     ntfs: bool,
     metadata: bool,
     log_level: LogLevel,
     background_opacity: f64,
+    /// Whether the n-gram candidate index is built (F10).
+    candidate_index: bool,
+    /// Whether repeated queries are served from the memoization cache (F7).
+    query_cache: bool,
     /// The persisted runtime overrides, carried for `SetConfig` persistence.
     state: FileConfig,
     /// Where to persist `state`; `None` disables persistence.
@@ -934,6 +1359,7 @@ struct RawArgs {
     snapshot: Option<PathBuf>,
     no_snapshot: bool,
     snapshot_interval: Option<u64>,
+    evict_idle_secs: Option<u64>,
     dbus: Option<bool>,
     ntfs: Option<bool>,
     no_metadata: bool,
@@ -941,6 +1367,8 @@ struct RawArgs {
     state_config: Option<PathBuf>,
     no_config: bool,
     log_level: Option<String>,
+    candidate_index: Option<bool>,
+    no_query_cache: bool,
 }
 
 impl Args {
@@ -1008,6 +1436,11 @@ impl Args {
             .or(state.snapshot_interval)
             .or(base.snapshot_interval)
             .unwrap_or(DEFAULT_SNAPSHOT_INTERVAL);
+        let evict_idle_secs = raw
+            .evict_idle_secs
+            .or(state.evict_idle_secs)
+            .or(base.evict_idle_secs)
+            .unwrap_or(EVICT_IDLE_SECS);
         let watch = raw.watch.or(state.watch).or(base.watch).unwrap_or(true);
         let dbus = raw.dbus.or(state.dbus).or(base.dbus).unwrap_or(true);
         let ntfs = raw.ntfs.or(state.ntfs).or(base.ntfs).unwrap_or(true);
@@ -1020,6 +1453,12 @@ impl Args {
             .background_opacity
             .or(base.background_opacity)
             .unwrap_or(0.75);
+        let candidate_index = raw
+            .candidate_index
+            .or(state.candidate_index)
+            .or(base.candidate_index)
+            .unwrap_or(true);
+        let query_cache = !raw.no_query_cache;
 
         Ok(Self {
             roots,
@@ -1030,11 +1469,14 @@ impl Args {
             scan_interval,
             snapshot,
             snapshot_interval,
+            evict_idle_secs,
             dbus,
             ntfs,
             metadata,
             log_level,
             background_opacity,
+            candidate_index,
+            query_cache,
             state,
             state_path,
         })
@@ -1060,6 +1502,7 @@ impl Args {
             excludes: self.excludes.clone(),
             skip_pseudo: true,
             metadata: self.metadata,
+            allow_removable: false,
         }
     }
 }
@@ -1111,6 +1554,15 @@ impl RawArgs {
                         );
                     }
                 }
+                "--evict-idle-secs" => {
+                    if let Some(value) = args.next() {
+                        raw.evict_idle_secs = Some(
+                            value
+                                .parse()
+                                .map_err(|_| format!("invalid --evict-idle-secs: {value}"))?,
+                        );
+                    }
+                }
                 "--no-dbus" => raw.dbus = Some(false),
                 "--no-ntfs" => raw.ntfs = Some(false),
                 "--no-metadata" => raw.no_metadata = true,
@@ -1125,6 +1577,8 @@ impl RawArgs {
                     }
                 }
                 "--no-config" => raw.no_config = true,
+                "--no-candidate-index" => raw.candidate_index = Some(false),
+                "--no-query-cache" => raw.no_query_cache = true,
                 "--log-level" => {
                     if let Some(value) = args.next() {
                         raw.log_level = Some(value);
@@ -1240,7 +1694,9 @@ fn print_help() {
          Usage: omavrythingd [--config <path>] [--root <dir>]... [--auto] [--exclude <glob>]...\n\
          \x20                  [--no-watch] [--scan-interval <secs>] [--socket <path>]\n\
          \x20                  [--snapshot <path>] [--no-snapshot] [--snapshot-interval <secs>]\n\
+         \x20                  [--evict-idle-secs <secs>]\n\
          \x20                  [--no-dbus] [--no-ntfs] [--no-metadata] [--log-level <level>]\n\
+         \x20                  [--no-candidate-index] [--no-query-cache]\n\
          \n\
          Options:\n\
            --config <path>       Configuration file (default: {DEFAULT_CONFIG_PATH})\n\
@@ -1256,9 +1712,13 @@ fn print_help() {
          \x20                       else $XDG_STATE_HOME/omavrything/index.snapshot)\n\
            --no-snapshot         Disable snapshot persistence\n\
            --snapshot-interval <s>  Snapshot write interval in seconds (0 disables; default 300)\n\
+           --evict-idle-secs <s> Idle period before the index is evicted to its\n\
+          \x20                       snapshot image in seconds (0 disables; default 0)\n\
            --no-dbus             Disable the D-Bus control interface\n\
            --no-ntfs             Disable NTFS partition detection and indexing\n\
            --no-metadata         Skip per-file size/mtime stats (names-only; faster scan)\n\
+           --no-candidate-index  Disable the n-gram candidate index (linear scan; bounds memory)\n\
+           --no-query-cache      Disable the query-result memoization cache (cold-path measurement)\n\
            --log-level <level>   Log level: error, warn, info, debug, trace (default: error)\n\
            -V, --version         Show the version\n\
            -h, --help            Show this help"

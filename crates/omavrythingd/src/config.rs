@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -19,11 +20,15 @@ pub struct ConfigInit {
     pub scan: ScanConfig,
     pub scan_interval: u64,
     pub snapshot_interval: u64,
+    /// Idle period (seconds) after which the index is evicted (0 disables).
+    pub evict_idle_secs: u64,
     pub snapshot: Option<PathBuf>,
     pub watch: bool,
     pub ntfs: bool,
     pub log_level: LogLevel,
     pub background_opacity: f64,
+    /// Whether the n-gram candidate index is built (F10).
+    pub candidate_index: bool,
     /// The persisted runtime overrides, updated on every `set`.
     pub state: FileConfig,
     /// Where to persist `state`; `None` disables persistence.
@@ -35,14 +40,26 @@ pub struct SharedConfig {
     scan: RwLock<ScanConfig>,
     scan_interval: AtomicU64,
     snapshot_interval: AtomicU64,
+    /// Idle period (seconds) after which the index is evicted (0 disables).
+    evict_idle_secs: AtomicU64,
     snapshot: Option<PathBuf>,
     watch: bool,
     /// Whether a scan/rescan is currently in progress.
     scanning: AtomicBool,
+    /// Scan generation (A3): bumped when a new rescan supersedes a running one.
+    scan_generation: AtomicU64,
+    /// Set on shutdown (A3): running scans stop promptly.
+    shutting_down: AtomicBool,
+    /// Subtrees that could not be watched (A5), bounded.
+    unwatched: Mutex<Vec<PathBuf>>,
+    /// The last scan's traversal failures (A2): count and bounded path sample.
+    last_scan_errors: Mutex<(usize, Vec<String>)>,
     ntfs: AtomicBool,
     log_level: RwLock<LogLevel>,
     /// `f64` bits, so the value can live in an atomic.
     background_opacity: AtomicU64,
+    /// Whether the n-gram candidate index is built (F10).
+    candidate_index: AtomicBool,
     state: RwLock<FileConfig>,
     state_path: Option<PathBuf>,
 }
@@ -53,12 +70,18 @@ impl SharedConfig {
             scan: RwLock::new(init.scan),
             scan_interval: AtomicU64::new(init.scan_interval),
             snapshot_interval: AtomicU64::new(init.snapshot_interval),
+            evict_idle_secs: AtomicU64::new(init.evict_idle_secs),
             snapshot: init.snapshot,
             watch: init.watch,
             scanning: AtomicBool::new(false),
+            scan_generation: AtomicU64::new(0),
+            shutting_down: AtomicBool::new(false),
+            unwatched: Mutex::new(Vec::new()),
+            last_scan_errors: Mutex::new((0, Vec::new())),
             ntfs: AtomicBool::new(init.ntfs),
             log_level: RwLock::new(init.log_level),
             background_opacity: AtomicU64::new(init.background_opacity.to_bits()),
+            candidate_index: AtomicBool::new(init.candidate_index),
             state: RwLock::new(init.state),
             state_path: init.state_path,
         }
@@ -74,6 +97,63 @@ impl SharedConfig {
         self.scanning.store(value, Ordering::Relaxed);
     }
 
+    /// The scan-generation cell (A3), for building a [`ScanCancel`].
+    pub fn generation_cell(&self) -> &AtomicU64 {
+        &self.scan_generation
+    }
+
+    /// The shutdown-flag cell (A3), for building a [`ScanCancel`].
+    pub fn shutdown_cell(&self) -> &AtomicBool {
+        &self.shutting_down
+    }
+
+    /// Supersede any running scan (A3): a new rescan bumps the generation, so
+    /// the previous scan's cancel token goes stale and its walk stops.
+    pub fn bump_scan_generation(&self) -> u64 {
+        self.scan_generation.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Mark the daemon as shutting down (A3): running scans stop promptly.
+    pub fn set_shutting_down(&self, value: bool) {
+        self.shutting_down.store(value, Ordering::Relaxed);
+    }
+
+    pub fn shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::Relaxed)
+    }
+
+    /// Record the subtrees that could not be watched (A5), bounded to 256.
+    pub fn set_unwatched(&self, paths: Vec<PathBuf>) {
+        let mut unwatched = self.unwatched.lock().unwrap_or_else(|e| e.into_inner());
+        unwatched.clear();
+        unwatched.extend(paths.into_iter().take(256));
+    }
+
+    /// The subtrees that could not be watched (A5).
+    pub fn unwatched(&self) -> Vec<PathBuf> {
+        self.unwatched
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Record the last scan's traversal failures (A2).
+    pub fn set_last_scan_errors(&self, count: usize, paths: Vec<String>) {
+        let mut last = self
+            .last_scan_errors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *last = (count, paths);
+    }
+
+    /// The last scan's traversal failures (A2): count and bounded path sample.
+    pub fn last_scan_errors(&self) -> (usize, Vec<String>) {
+        self.last_scan_errors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     /// A snapshot of the current scan configuration.
     pub fn scan(&self) -> ScanConfig {
         self.scan.read().unwrap_or_else(|e| e.into_inner()).clone()
@@ -85,6 +165,11 @@ impl SharedConfig {
 
     pub fn snapshot_interval(&self) -> u64 {
         self.snapshot_interval.load(Ordering::Relaxed)
+    }
+
+    /// The idle period (seconds) after which the index is evicted (0 disables).
+    pub fn evict_idle_secs(&self) -> u64 {
+        self.evict_idle_secs.load(Ordering::Relaxed)
     }
 
     pub fn snapshot_path(&self) -> Option<PathBuf> {
@@ -104,6 +189,47 @@ impl SharedConfig {
     /// The scratchpad tile opacity (0.0–1.0).
     pub fn background_opacity(&self) -> f64 {
         f64::from_bits(self.background_opacity.load(Ordering::Relaxed))
+    }
+
+    /// Whether the n-gram candidate index is built (F10).
+    pub fn candidate_index(&self) -> bool {
+        self.candidate_index.load(Ordering::Relaxed)
+    }
+
+    /// The block devices mounted through the settings UI, persisted in the
+    /// state config so they are mounted again on the next start.
+    pub fn remembered_volumes(&self) -> Vec<String> {
+        self.state
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .volumes
+            .clone()
+            .unwrap_or_default()
+    }
+
+    /// Remember a mounted device in the state config.
+    pub fn remember_volume(&self, device: &str) -> Result<(), String> {
+        let Some(path) = &self.state_path else {
+            return Ok(());
+        };
+        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+        let volumes = state.volumes.get_or_insert_with(Vec::new);
+        if !volumes.iter().any(|v| v == device) {
+            volumes.push(device.to_string());
+        }
+        state.save(path)
+    }
+
+    /// Forget an unmounted device in the state config.
+    pub fn forget_volume(&self, device: &str) -> Result<(), String> {
+        let Some(path) = &self.state_path else {
+            return Ok(());
+        };
+        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(volumes) = &mut state.volumes {
+            volumes.retain(|v| v != device);
+        }
+        state.save(path)
     }
 
     /// Apply a configuration change and persist it. Returns an error for
@@ -130,6 +256,12 @@ impl SharedConfig {
                     .map_err(|_| format!("invalid snapshot_interval: {value}"))?;
                 self.snapshot_interval.store(v, Ordering::Relaxed);
             }
+            "evict_idle_secs" => {
+                let v: u64 = value
+                    .parse()
+                    .map_err(|_| format!("invalid evict_idle_secs: {value}"))?;
+                self.evict_idle_secs.store(v, Ordering::Relaxed);
+            }
             "ntfs" => {
                 let v = parse_bool(value)?;
                 self.ntfs.store(v, Ordering::Relaxed);
@@ -148,6 +280,10 @@ impl SharedConfig {
                 }
                 self.background_opacity
                     .store(v.to_bits(), Ordering::Relaxed);
+            }
+            "candidate_index" => {
+                let v = parse_bool(value)?;
+                self.candidate_index.store(v, Ordering::Relaxed);
             }
             other => return Err(format!("unknown config key: {other}")),
         }
@@ -182,6 +318,7 @@ impl SharedConfig {
             "snapshot_interval".into(),
             self.snapshot_interval().to_string(),
         );
+        map.insert("evict_idle_secs".into(), self.evict_idle_secs().to_string());
         map.insert(
             "snapshot".into(),
             self.snapshot_path()
@@ -196,6 +333,8 @@ impl SharedConfig {
             "background_opacity".into(),
             self.background_opacity().to_string(),
         );
+        map.insert("candidate_index".into(), self.candidate_index().to_string());
+        map.insert("volumes".into(), self.remembered_volumes().join(","));
         map
     }
 }
@@ -210,11 +349,13 @@ mod tests {
             scan: ScanConfig::default(),
             scan_interval: 900,
             snapshot_interval: 300,
+            evict_idle_secs: 120,
             snapshot: None,
             watch: true,
             ntfs: true,
             log_level: LogLevel::Info,
             background_opacity: 0.75,
+            candidate_index: true,
             state: FileConfig::default(),
             state_path: None,
         })
@@ -262,11 +403,13 @@ mod tests {
             scan: ScanConfig::default(),
             scan_interval: 900,
             snapshot_interval: 300,
+            evict_idle_secs: 120,
             snapshot: None,
             watch: true,
             ntfs: true,
             log_level: LogLevel::Info,
             background_opacity: 0.75,
+            candidate_index: true,
             state: FileConfig::default(),
             state_path: Some(path.clone()),
         });
@@ -295,6 +438,7 @@ mod tests {
             "ntfs",
             "log_level",
             "background_opacity",
+            "candidate_index",
         ] {
             assert!(map.contains_key(key), "missing {key}");
         }
@@ -309,5 +453,31 @@ mod tests {
         assert_eq!(c.as_map().get("scanning").map(String::as_str), Some("true"));
         c.set_scanning(false);
         assert!(!c.scanning());
+    }
+
+    #[test]
+    fn unwatched_and_scan_error_reporting_are_bounded() {
+        let c = cfg();
+        // A5: the unwatched list is bounded.
+        let many: Vec<PathBuf> = (0..1000).map(|i| PathBuf::from(format!("/d{i}"))).collect();
+        c.set_unwatched(many);
+        assert_eq!(c.unwatched().len(), 256);
+        c.set_unwatched(vec![PathBuf::from("/one")]);
+        assert_eq!(c.unwatched(), vec![PathBuf::from("/one")]);
+
+        // A2: the last scan's failures are recorded and reported.
+        c.set_last_scan_errors(7, vec!["/a".into(), "/b".into()]);
+        let (count, paths) = c.last_scan_errors();
+        assert_eq!(count, 7);
+        assert_eq!(paths, vec!["/a".to_string(), "/b".to_string()]);
+
+        // A3: the generation bumps monotonically.
+        let g0 = c.bump_scan_generation();
+        let g1 = c.bump_scan_generation();
+        assert!(g1 > g0);
+        assert!(!c.shutting_down());
+        c.set_shutting_down(true);
+        assert!(c.shutting_down());
+        c.set_shutting_down(false);
     }
 }

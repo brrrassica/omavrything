@@ -33,6 +33,15 @@ Item {
   property bool cursorActive: false
   property var results: []
   property bool daemonAvailable: false
+  // True while the daemon is mapping an evicted index; the empty state shows a
+  // "reloading" message and the query is retried.
+  property bool indexLoading: false
+  // True when the current query has no matches. The last result page is kept
+  // visible (dimmed) instead of blanking the list, and the input's last
+  // character is tinted red — mimicking Voidtools Everything's "keep the last
+  // results" feel. The stale page is display-only: the cursor and Enter are
+  // disabled until a query matches again.
+  property bool noMatch: false
 
   // Column sorting: "" keeps the daemon's ranking; otherwise the results are
   // re-sorted client-side by the selected column.
@@ -55,10 +64,28 @@ Item {
   property var settings: ({})
   property string configCommand: "omavry"
 
+  // Detected block volumes and their indexing status, shown at the bottom of
+  // the settings panel. Refreshed while the panel is open so a mount/index
+  // transition is visible without reopening it.
+  property var volumes: []
+  property bool volumesBusy: false
+  property string volumesError: ""
+
   // Snapshot-interval choices: 30 s to 300 s in 30 s steps.
   readonly property var snapshotOptions: {
     var opts = []
     for (var s = 30; s <= 300; s += 30) opts.push({ value: String(s), label: s + " s" })
+    return opts
+  }
+
+  // Eviction-cadence choices: 0 s (disables eviction) then 10 s to 60 s in 10 s
+  // steps. Eviction is an optional, experimental memory-saving feature: the
+  // daemon evicts the index to its snapshot image after this idle period,
+  // dropping RSS to the mapping plus a small delta; a query reloads it. It is
+  // disabled by default.
+  readonly property var evictionOptions: {
+    var opts = [{ value: "0", label: "0 s (disables eviction)" }]
+    for (var s = 10; s <= 60; s += 10) opts.push({ value: String(s), label: s + " s" })
     return opts
   }
 
@@ -112,12 +139,20 @@ Item {
   readonly property real modifiedWidth: Math.round(contentWidth * colModifiedFrac)
   readonly property real pathWidth: Math.max(0, contentWidth - nameWidth - sizeWidth - modifiedWidth - columnGap * 3)
 
+  // Volume table columns: mount point, filesystem type, label, status, then
+  // the mount and unmount buttons.
+  readonly property real volMountWidth: Math.round(contentWidth * 0.30)
+  readonly property real volFsWidth: Math.round(contentWidth * 0.10)
+  readonly property real volLabelWidth: Math.round(contentWidth * 0.18)
+  readonly property int volButtonSize: Style.space(24)
+
   // Plugin lifecycle hooks, called by the shell host.
   function open(payloadJson) {
     root.settingsOpen = false
     root.filterText = ""
     root.selectedIndex = 0
     root.cursorActive = false
+    root.noMatch = false
     root.results = []
     displayModel.clear()
     root.writeQuery("")
@@ -160,11 +195,44 @@ Item {
   function openSettings() {
     root.settingsOpen = true
     root.settingsError = ""
+    root.volumesError = ""
     configGetProc.running = true
+    root.refreshVolumes()
   }
 
   function closeSettings() {
     root.settingsOpen = false
+  }
+
+  // Load the detected volumes and their statuses from the daemon.
+  function refreshVolumes() {
+    if (!root.settingsOpen) return
+    volumesGetProc.running = true
+  }
+
+  function applyVolumes(text) {
+    var parsed
+    try { parsed = JSON.parse(text) } catch (e) { root.volumesError = "Could not read volumes"; return }
+    if (!Array.isArray(parsed)) return
+    root.volumes = parsed
+  }
+
+  // Mount and index one volume through the daemon (polkit-gated).
+  function mountVolume(device) {
+    if (root.volumesBusy) return
+    root.volumesBusy = true
+    root.volumesError = ""
+    volumeMountProc.command = [root.configCommand, "mount-volume", device]
+    volumeMountProc.running = true
+  }
+
+  // Unmount one volume and drop its index entries (polkit-gated).
+  function unmountVolume(device) {
+    if (root.volumesBusy) return
+    root.volumesBusy = true
+    root.volumesError = ""
+    volumeUnmountProc.command = [root.configCommand, "unmount-volume", device]
+    volumeUnmountProc.running = true
   }
 
   // Parse `omavry config get --json` output and apply the UI-side setting.
@@ -214,6 +282,7 @@ Item {
   // in handleResponse().
   function sendQuery() {
     if (!sock.connected) {
+      root.noMatch = false
       root.results = []
       displayModel.clear()
       return
@@ -227,11 +296,33 @@ Item {
     try { response = JSON.parse(line) } catch (e) { return }
     if (!response || !Array.isArray(response.results)) return
 
-    // Bound the page. The daemon is trusted, but a spoofed socket (the /tmp
-    // fallback) or a compromised daemon must not be able to make the shared
-    // shell allocate an unbounded result set.
+    // The daemon evicts the index when idle; a query while evicted returns
+    // `state: "loading"` and starts the load. Retry shortly so the next
+    // response carries results.
+    root.indexLoading = response.state === "loading"
+    if (root.indexLoading) {
+      root.results = []
+      displayModel.clear()
+      reloadRetry.restart()
+      return
+    }
+
+    // Bound the page. The daemon is trusted, but a spoofed socket or a
+    // compromised daemon must not be able to make the shared shell allocate an
+    // unbounded result set (0.1.8 security hardening).
     var results = response.results
     if (results.length > root.maxResults) results = results.slice(0, root.maxResults)
+
+    // No matches for a non-empty query: keep the last result page visible
+    // (dimmed) instead of blanking the list, and flag the no-match state for
+    // the red cue. The stale page is display-only. A cleared query (empty
+    // filterText) does clear the list.
+    if (results.length === 0 && root.filterText !== "") {
+      root.noMatch = true
+      root.cursorActive = false
+      return
+    }
+    root.noMatch = false
 
     root.results = results
     if (root.selectedIndex >= results.length)
@@ -290,14 +381,16 @@ Item {
   }
 
   function select(delta) {
-    if (root.results.length === 0) return
+    if (root.noMatch || root.results.length === 0) return
     root.cursorActive = true
     root.selectedIndex = (root.selectedIndex + delta + root.results.length) % root.results.length
     resultList.positionViewAtIndex(root.selectedIndex, ListView.Contain)
   }
 
   function activate() {
-    if (root.results.length === 0) return
+    // The no-match page is the last result set, not a match for the current
+    // query; do not open a file that does not match what the user typed.
+    if (root.noMatch || root.results.length === 0) return
     // With no explicit cursor, Enter opens the top result (Everything behavior).
     var index = root.cursorActive ? root.selectedIndex : 0
     if (index < 0 || index >= root.results.length) return
@@ -356,6 +449,16 @@ Item {
   Timer {
     id: searchDebounce
     interval: 40
+    repeat: false
+    onTriggered: root.sendQuery()
+  }
+
+  // Retries a query while the daemon is reloading an evicted index. The daemon
+  // materializes the owned index in the background (~1-2 s at 1.38 M records),
+  // so the retry is spaced to avoid a burst of requests while it runs.
+  Timer {
+    id: reloadRetry
+    interval: 500
     repeat: false
     onTriggered: root.sendQuery()
   }
@@ -431,6 +534,51 @@ Item {
       root.settingsBusy = false
       if (exitCode !== 0) root.settingsError = "Could not apply setting"
     }
+  }
+
+  // Read the detected volumes and their statuses for the settings panel.
+  Process {
+    id: volumesGetProc
+    command: [root.configCommand, "volumes", "--json"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.applyVolumes(text)
+    }
+    onExited: function(exitCode) {
+      if (exitCode !== 0) root.volumesError = "Could not read volumes"
+    }
+  }
+
+  // Mount and index one volume.
+  Process {
+    id: volumeMountProc
+    stdout: StdioCollector { waitForEnd: true }
+    onExited: function(exitCode) {
+      root.volumesBusy = false
+      if (exitCode !== 0) root.volumesError = "Could not mount volume"
+      else root.refreshVolumes()
+    }
+  }
+
+  // Unmount one volume and drop its index entries.
+  Process {
+    id: volumeUnmountProc
+    stdout: StdioCollector { waitForEnd: true }
+    onExited: function(exitCode) {
+      root.volumesBusy = false
+      if (exitCode !== 0) root.volumesError = "Could not unmount volume"
+      else root.refreshVolumes()
+    }
+  }
+
+  // Poll while the settings panel is open so "indexing" transitions to
+  // "indexed" without the user reopening the panel.
+  Timer {
+    id: volumesTimer
+    interval: 2000
+    repeat: true
+    running: root.settingsOpen
+    onTriggered: root.refreshVolumes()
   }
 
   PanelWindow {
@@ -581,6 +729,23 @@ Item {
                 clip: true
               }
 
+              // Reddish cue on the last character when the query has no match
+              // (Everything-style). Only shown when the text is not elided, so
+              // the last character is actually visible.
+              Text {
+                id: lastChar
+                anchors.verticalCenter: parent.verticalCenter
+                x: inputText.contentWidth - lastChar.contentWidth
+                visible: root.noMatch && root.filterText.length > 0
+                  && inputText.contentWidth <= inputText.width
+                text: root.filterText.length > 0
+                  ? root.filterText.charAt(root.filterText.length - 1) : ""
+                textFormat: Text.PlainText
+                color: "#e06c75"
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.heading
+              }
+
               // Caret at the end of the query. The custom field has no in-text
               // cursor movement; the query is edited at its end.
               Rectangle {
@@ -723,6 +888,9 @@ Item {
             id: resultList
             anchors.fill: parent
             visible: root.results.length > 0 && !root.settingsOpen
+            // Dim the stale page while the current query has no match, so it
+            // reads as "last results", not "current results".
+            opacity: root.noMatch ? 0.45 : 1
             model: displayModel
             clip: true
             spacing: 0
@@ -820,7 +988,9 @@ Item {
             visible: root.results.length === 0 && !root.settingsOpen
             text: !root.daemonAvailable
               ? "Search daemon unavailable"
-              : (root.filterText ? "No matches for “" + root.filterText + "”" : "Type to search files")
+              : (root.indexLoading
+                 ? "Reloading index…"
+                 : (root.filterText ? "No matches for “" + root.filterText + "”" : "Type to search files"))
             // Echoes the user's query; render as plain text so a query that
             // looks like rich text is never parsed by the rich-text engine.
             textFormat: Text.PlainText
@@ -831,11 +1001,19 @@ Item {
           }
 
           // ---------------------------------------------------- settings menu
-          Column {
+          Flickable {
             id: settingsPanel
             anchors.fill: parent
             visible: root.settingsOpen
-            spacing: root.contentSpacing
+            contentWidth: width
+            contentHeight: settingsColumn.implicitHeight
+            clip: true
+            boundsBehavior: Flickable.StopAtBounds
+
+            Column {
+              id: settingsColumn
+              width: parent.width
+              spacing: root.contentSpacing
 
             // Header: title + close button.
             Item {
@@ -912,32 +1090,6 @@ Item {
               }
             }
 
-            // NTFS support.
-            Item {
-              width: parent.width
-              height: root.rowHeight
-
-              Text {
-                width: root.nameWidth
-                anchors.left: parent.left
-                anchors.verticalCenter: parent.verticalCenter
-                text: "NTFS support"
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.body
-              }
-
-              ToggleSwitch {
-                anchors.left: parent.left
-                anchors.leftMargin: root.nameWidth + root.columnGap
-                anchors.verticalCenter: parent.verticalCenter
-                checked: root.settingValue("ntfs", "true") === "true"
-                foreground: root.foreground
-                accent: Color.accent
-                onToggled: root.setSetting("ntfs", !checked)
-              }
-            }
-
             // Snapshot interval.
             Item {
               width: parent.width
@@ -967,6 +1119,40 @@ Item {
                 accent: Color.accent
                 fontFamily: root.fontFamily
                 onChanged: function(v) { root.setSetting("snapshot_interval", v) }
+              }
+            }
+
+            // Eviction cadence: the idle period after which the index is evicted
+            // to its snapshot image (0 s disables; 10-60 s in 10 s steps; default
+            // 0 s, disabled). Optional, experimental memory-saving feature.
+            Item {
+              width: parent.width
+              height: root.rowHeight
+
+              Text {
+                width: root.nameWidth
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Index eviction timer"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+              }
+
+              Dropdown {
+                anchors.left: parent.left
+                anchors.leftMargin: root.nameWidth + root.columnGap
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                showLabel: false
+                value: root.settingValue("evict_idle_secs", "0")
+                options: root.evictionOptions
+                foreground: root.foreground
+                background: root.background
+                popupBorder: root.border
+                accent: Color.accent
+                fontFamily: root.fontFamily
+                onChanged: function(v) { root.setSetting("evict_idle_secs", v) }
               }
             }
 
@@ -1002,6 +1188,250 @@ Item {
               }
             }
 
+            // NTFS support. Sits directly above the Volumes section because it
+            // gates whether NTFS volumes are detected and listed.
+            Item {
+              width: parent.width
+              height: root.rowHeight
+
+              Text {
+                width: root.nameWidth
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                text: "NTFS support"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+              }
+
+              ToggleSwitch {
+                anchors.left: parent.left
+                anchors.leftMargin: root.nameWidth + root.columnGap
+                anchors.verticalCenter: parent.verticalCenter
+                checked: root.settingValue("ntfs", "true") === "true"
+                foreground: root.foreground
+                accent: Color.accent
+                onToggled: root.setSetting("ntfs", !checked)
+              }
+            }
+
+            // Breathing room between the NTFS toggle and the volume table.
+            Item {
+              width: parent.width
+              height: root.contentSpacing * 2
+            }
+
+            // Volumes: every detected block filesystem, its indexing status,
+            // and mount/unmount actions. NTFS rows disappear when the toggle
+            // above is off (the daemon filters them out).
+            Text {
+              width: parent.width
+              text: "Volumes"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              font.bold: true
+            }
+
+            // Column headers.
+            Item {
+              width: parent.width
+              height: root.headerHeight
+
+              Text {
+                width: root.volMountWidth
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Mount point"
+                color: root.foreground
+                opacity: 0.6
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+              }
+
+              Text {
+                anchors.left: parent.left
+                anchors.leftMargin: root.volMountWidth + root.columnGap
+                width: root.volFsWidth
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Type"
+                color: root.foreground
+                opacity: 0.6
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+              }
+
+              Text {
+                anchors.left: parent.left
+                anchors.leftMargin: root.volMountWidth + root.volFsWidth + root.columnGap * 2
+                width: root.volLabelWidth
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Label"
+                color: root.foreground
+                opacity: 0.6
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+              }
+
+              Text {
+                anchors.left: parent.left
+                anchors.leftMargin: root.volMountWidth + root.volFsWidth + root.volLabelWidth + root.columnGap * 3
+                anchors.right: parent.right
+                anchors.rightMargin: root.volButtonSize * 2 + root.columnGap * 2
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Status"
+                color: root.foreground
+                opacity: 0.6
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+              }
+            }
+
+            Text {
+              width: parent.width
+              visible: root.volumes.length === 0
+              text: "No volumes detected"
+              color: root.foreground
+              opacity: 0.6
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+
+            Repeater {
+              model: root.volumes
+
+              delegate: Item {
+                width: parent.width
+                height: root.rowHeight
+
+                // Mount point (the device path when the volume is unmounted).
+                Text {
+                  width: root.volMountWidth
+                  anchors.left: parent.left
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: modelData.mount_point && modelData.mount_point !== ""
+                    ? modelData.mount_point
+                    : modelData.device
+                  elide: Text.ElideRight
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                }
+
+                // Filesystem type.
+                Text {
+                  anchors.left: parent.left
+                  anchors.leftMargin: root.volMountWidth + root.columnGap
+                  width: root.volFsWidth
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: modelData.fstype
+                  elide: Text.ElideRight
+                  color: root.foreground
+                  opacity: 0.8
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                }
+
+                // Label (empty when the volume has none).
+                Text {
+                  anchors.left: parent.left
+                  anchors.leftMargin: root.volMountWidth + root.volFsWidth + root.columnGap * 2
+                  width: root.volLabelWidth
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: modelData.label || ""
+                  elide: Text.ElideRight
+                  color: root.foreground
+                  opacity: 0.8
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                }
+
+                // Status.
+                Text {
+                  anchors.left: parent.left
+                  anchors.leftMargin: root.volMountWidth + root.volFsWidth + root.volLabelWidth + root.columnGap * 3
+                  anchors.right: mountButton.left
+                  anchors.rightMargin: root.columnGap
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: modelData.status
+                  elide: Text.ElideRight
+                  color: modelData.status === "indexing" ? Color.accent : root.foreground
+                  opacity: modelData.status === "unmounted" ? 0.6 : 0.9
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                }
+
+                // Mount button.
+                Item {
+                  id: mountButton
+                  anchors.right: unmountButton.left
+                  anchors.rightMargin: root.columnGap
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: root.volButtonSize
+                  height: root.volButtonSize
+
+                  Text {
+                    anchors.centerIn: parent
+                    text: "󰋊"
+                    color: root.foreground
+                    opacity: mountMouse.enabled
+                      ? (mountMouse.containsMouse ? 0.95 : 0.7)
+                      : 0.3
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                  }
+
+                  MouseArea {
+                    id: mountMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    enabled: modelData.status === "unmounted" && !root.volumesBusy
+                    cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                    onClicked: root.mountVolume(modelData.device)
+                  }
+                }
+
+                // Unmount button.
+                Item {
+                  id: unmountButton
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: root.volButtonSize
+                  height: root.volButtonSize
+
+                  Text {
+                    anchors.centerIn: parent
+                    text: "󰅖"
+                    color: root.foreground
+                    opacity: unmountMouse.enabled
+                      ? (unmountMouse.containsMouse ? 0.95 : 0.7)
+                      : 0.3
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                  }
+
+                  MouseArea {
+                    id: unmountMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    enabled: modelData.mount_point && modelData.mount_point !== "" && !root.volumesBusy
+                    cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                    onClicked: root.unmountVolume(modelData.device)
+                  }
+                }
+              }
+            }
+
+            Text {
+              width: parent.width
+              visible: root.volumesError !== ""
+              text: root.volumesError
+              color: Color.accent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.WordWrap
+            }
+
             Text {
               width: parent.width
               visible: root.settingsError !== ""
@@ -1010,6 +1440,7 @@ Item {
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
               wrapMode: Text.WordWrap
+            }
             }
           }
         }

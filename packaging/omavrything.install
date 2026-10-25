@@ -7,6 +7,10 @@
 
 post_install() {
   systemd-sysusers
+  # Create /run/omavrything and /var/lib/omavrything with the daemon's
+  # ownership. The state directory holds the index snapshot and the state
+  # config; without it the daemon cannot persist either.
+  systemd-tmpfiles --create /usr/lib/tmpfiles.d/omavrything.conf
   systemctl daemon-reload
   # Reload the system bus so it picks up the new policy; a bus that was already
   # running before the install does not see it otherwise, and the daemon cannot
@@ -39,6 +43,9 @@ EOF
 
 post_upgrade() {
   systemd-sysusers
+  # Recreate the runtime and state directories in case the previous package
+  # version did not ship the /var/lib/omavrything tmpfiles entry.
+  systemd-tmpfiles --create /usr/lib/tmpfiles.d/omavrything.conf
   systemctl daemon-reload
   # Reload the system bus so it picks up any policy change in the new version.
   dbus-send --system --type=method_call --dest=org.freedesktop.DBus \
