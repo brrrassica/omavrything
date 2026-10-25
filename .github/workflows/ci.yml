@@ -22,6 +22,27 @@ env:
 # The first run after this change downloads everything once; every run after it
 # is served entirely from the runner's own disk, with no internet fetches for
 # packages, crates or toolchains.
+#
+# Toolchains are PINNED: both the `RUSTUP_TOOLCHAIN` env and the `toolchain:`
+# input below name an exact release (stable 1.99.1, nightly-2026-10-22) instead
+# of the floating `stable`/`nightly` channels. A floating channel makes rustup
+# re-resolve the channel over the network on every run, and a nightly newer than
+# the cached one forces a full re-download into the shared RUSTUP_HOME (which is
+# what broke the fuzz job). Bump both values together to move to a newer
+# compiler, then let the first run repopulate the cache.
+#
+# Two further details make that reuse actually happen:
+#
+#   * Each job puts $CARGO_HOME/bin on PATH before the toolchain step. rustup is
+#     not on PATH inside a bare archlinux container even though the cached shims
+#     live there, so without this dtolnay/rust-toolchain re-downloads the rustup
+#     installer on every run (~1-2 min) and trips over
+#     "HOME differs from euid-obtained home directory".
+#
+#   * The toolchain is installed under flock /ci/cache/locks/rustup.lock. The
+#     push and pull_request runs of the same commit can otherwise install a
+#     not-yet-cached toolchain into the shared downloads dir at the same time,
+#     and one of them dies with "could not rename '...partial' ...".
 # ---------------------------------------------------------------------------
 
 jobs:
@@ -42,7 +63,7 @@ jobs:
     env:
       CARGO_HOME: /ci/cache/cargo
       RUSTUP_HOME: /ci/cache/rustup
-      RUSTUP_TOOLCHAIN: stable
+      RUSTUP_TOOLCHAIN: 1.99.1
       CARGO_TARGET_DIR: /ci/cache/targets/${{ github.repository }}/${{ github.job }}
     steps:
       - name: Install dependencies (from the local pacman cache)
@@ -61,9 +82,21 @@ jobs:
           mkdir -p "$CARGO_TARGET_DIR"
           rm -rf target
           ln -s "$CARGO_TARGET_DIR" target
+      - name: Put the cached cargo/rustup shims on PATH
+        run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+
+      # Install under the cache lock so the action below only has to confirm
+      # the toolchain is already present.
+      - name: Pre-install the pinned toolchain under the cache lock
+        run: |
+          flock /ci/cache/locks/rustup.lock \
+            rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update \
+              --component rustfmt --component clippy
+
       - name: Install Rust toolchain (reused from RUSTUP_HOME)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.99.1
           components: rustfmt, clippy
 
       - name: Check formatting
@@ -109,7 +142,7 @@ jobs:
     env:
       CARGO_HOME: /ci/cache/cargo
       RUSTUP_HOME: /ci/cache/rustup
-      RUSTUP_TOOLCHAIN: nightly
+      RUSTUP_TOOLCHAIN: nightly-2026-10-22
       CARGO_TARGET_DIR: /ci/cache/targets/${{ github.repository }}/${{ github.job }}
     steps:
       - name: Install dependencies (from the local pacman cache)
@@ -135,8 +168,20 @@ jobs:
           rm -rf fuzz/target
           ln -s "$CARGO_TARGET_DIR" fuzz/target
 
+      - name: Put the cached cargo/rustup shims on PATH
+        run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+
+      # Install under the cache lock so the action below only has to confirm
+      # the toolchain is already present.
+      - name: Pre-install the pinned toolchain under the cache lock
+        run: |
+          flock /ci/cache/locks/rustup.lock \
+            rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update
+
       - name: Install nightly toolchain (reused from RUSTUP_HOME)
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-22
 
       - name: Install cargo-fuzz (reused from CARGO_HOME)
         run: cargo install cargo-fuzz --locked
@@ -164,8 +209,15 @@ jobs:
       checks: write
     steps:
       - uses: actions/checkout@v4
+      # This job runs on the host, not in a container, so it uses the runner's
+      # own ~/.cargo and ~/.rustup: there is no shared cache to lock against.
+      - name: Put the cached cargo/rustup shims on PATH
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
 
       - uses: rustsec/audit-check@v2
         with:
@@ -185,7 +237,7 @@ jobs:
     env:
       CARGO_HOME: /ci/cache/cargo
       RUSTUP_HOME: /ci/cache/rustup
-      RUSTUP_TOOLCHAIN: stable
+      RUSTUP_TOOLCHAIN: 1.99.1
       CARGO_TARGET_DIR: /ci/cache/targets/${{ github.repository }}/${{ github.job }}
     needs: build
     steps:
@@ -205,8 +257,20 @@ jobs:
           mkdir -p "$CARGO_TARGET_DIR"
           rm -rf target
           ln -s "$CARGO_TARGET_DIR" target
+      - name: Put the cached cargo/rustup shims on PATH
+        run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+
+      # Install under the cache lock so the action below only has to confirm
+      # the toolchain is already present.
+      - name: Pre-install the pinned toolchain under the cache lock
+        run: |
+          flock /ci/cache/locks/rustup.lock \
+            rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update
+
       - name: Install Rust toolchain (reused from RUSTUP_HOME)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
 
       - name: Run the install/uninstall smoke test
         run: scripts/ci-smoke.sh
@@ -268,7 +332,7 @@ jobs:
     env:
       CARGO_HOME: /ci/cache/cargo
       RUSTUP_HOME: /ci/cache/rustup
-      RUSTUP_TOOLCHAIN: stable
+      RUSTUP_TOOLCHAIN: 1.99.1
       CARGO_TARGET_DIR: /ci/cache/targets/${{ github.repository }}/${{ github.job }}
     needs: build
     steps:
@@ -288,8 +352,20 @@ jobs:
           mkdir -p "$CARGO_TARGET_DIR"
           rm -rf target
           ln -s "$CARGO_TARGET_DIR" target
+      - name: Put the cached cargo/rustup shims on PATH
+        run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+
+      # Install under the cache lock so the action below only has to confirm
+      # the toolchain is already present.
+      - name: Pre-install the pinned toolchain under the cache lock
+        run: |
+          flock /ci/cache/locks/rustup.lock \
+            rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update
+
       - name: Install Rust toolchain (reused from RUSTUP_HOME)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
 
       - name: Build the release archive
         run: scripts/package-release.sh
