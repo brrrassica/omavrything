@@ -74,9 +74,13 @@ install -Dm644 shell/omavrything/SearchBar.qml "$stage/shell/omavrything/SearchB
 install -Dm644 shell/omavrything/SearchOverlay.qml "$stage/shell/omavrything/SearchOverlay.qml"
 install -Dm644 shell/omavrything/Service.qml "$stage/shell/omavrything/Service.qml"
 
-# Install and helper scripts.
+# Install and helper scripts. bootstrap.sh and fetch-daemon.sh are the
+# plugin-driven escalation path: the shell plugin runs bootstrap.sh, which
+# fetches the release binaries and escalates with pkexec to install.sh.
 install -m755 scripts/install.sh "$stage/scripts/install.sh"
 install -m755 scripts/uninstall.sh "$stage/scripts/uninstall.sh"
+install -m755 scripts/bootstrap.sh "$stage/scripts/bootstrap.sh"
+install -m755 scripts/fetch-daemon.sh "$stage/scripts/fetch-daemon.sh"
 install -m755 scripts/run-daemon.sh "$stage/scripts/run-daemon.sh"
 install -m755 scripts/restart-all.sh "$stage/scripts/restart-all.sh"
 install -m755 scripts/doctor.sh "$stage/scripts/doctor.sh"
@@ -126,4 +130,10 @@ else
   exit 1
 fi
 
+# The checksum asset the plugin bootstrap verifies before installing the
+# binaries as root (scripts/fetch-daemon.sh). The format is what `sha256sum -c`
+# expects: "<hash>  <filename>".
+( cd "$dist" && sha256sum "$name.zip" > "$name.zip.sha256" )
+
 echo "Wrote $archive"
+echo "Wrote $dist/$name.zip.sha256"

@@ -224,6 +224,11 @@ PY
       "/run/user/$user_uid/omavrything-query"
   fi
   rm -rf "$user_home/.local/state/omavrything"
+
+  # The bootstrap dismissal marker (scripts/bootstrap.sh) lives under the cache
+  # dir. Remove it so a reinstall prompts again instead of silently skipping the
+  # system install because a previous prompt was dismissed.
+  rm -rf "$user_home/.cache/omavrything"
 fi
 
 # 6. Remove the runtime and state directories owned by the service. The index

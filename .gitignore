@@ -5,6 +5,11 @@
 # Release binaries staged by scripts/build.sh (the release archive layout)
 /bin
 
+# Release binaries staged into the plugin tree by scripts/build.sh. A bare clone
+# has none, so the plugin fetches the release asset on first run
+# (scripts/fetch-daemon.sh); a local build is preferred when present.
+/shell/omavrything/bin
+
 # Release archives
 /dist
 

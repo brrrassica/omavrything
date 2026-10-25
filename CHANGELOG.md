@@ -7,6 +7,51 @@ Notable changes to `omavrything`. The format follows
 ## [Unreleased]
 
 
+## [0.2.1] — 2026-10-25
+
+The standard-installation release. `omarchy plugin add <url> --enable` now yields
+a working plugin with the full system daemon: the plugin **self-provisions** the
+privileged install through a one-time polkit-authenticated escalation, so the
+user authenticates once in a GUI prompt and never runs a command.
+
+### Added
+
+- **Plugin self-provisioning.** The `service` plugin runs `scripts/bootstrap.sh`
+  on first start. It ensures the daemon binary is available, then escalates with
+  `pkexec` to run `scripts/install.sh --from-plugin` as root; the Omarchy polkit
+  agent (`omarchy.polkit`) shows the authentication dialog. A dismissal writes a
+  marker so the prompt does not recur on every shell restart, and
+  `omarchy-shell tech.alatcerdas.omavrything setup` retries.
+- **Fetch-on-first-run binary distribution.** `scripts/fetch-daemon.sh`
+  downloads the release asset `omavrything-<version>-<arch>.zip` and verifies it
+  against its `.sha256` before extracting. `scripts/bootstrap.sh` prefers a local
+  build (the plugin tree `shell/omavrything/bin/`, then `bin/`), then fetches.
+  The release workflow now publishes the `.sha256` asset alongside the archive.
+- **`install.sh --from-plugin` and `--bindir`.** `--from-plugin` skips the
+  plugin-copy step (the plugin is already installed by `omarchy plugin add`) and
+  the shell restart; `--bindir` locates the binaries from the plugin tree. The
+  installer resolves the invoking user from `PKEXEC_UID` (then `SUDO_USER`).
+
+### Changed
+
+- **Version bumped to `0.2.1`.** The shell plugin manifest, the workspace, and
+  the AUR `PKGBUILD` are updated to match.
+- **`scripts/build.sh` stages the binaries into the plugin tree**
+  (`shell/omavrything/bin/`) in addition to `bin/`, so a plugin installed from a
+  source checkout finds them without a network fetch.
+- **`scripts/uninstall.sh` removes the bootstrap dismissal marker**, so a
+  reinstall prompts again instead of silently skipping the system install.
+
+### Documentation
+
+- The README and `docs/install.md` lead with the one-liner
+  `omarchy plugin add … --enable` and the "authenticate once" step; the manual
+  `sudo scripts/install.sh` path is documented for headless/offline installs.
+- `docs/omarchy-shell-integration.md` describes the `Service.qml` bootstrap and
+  the `pkexec` escalation; `docs/troubleshooting.md` documents the polkit-agent
+  dependency and the `sudo` fallback.
+- ADR-019 records the self-provisioning and fetch-on-first-run decisions.
+
 ## [0.2.0] — 2026-10-23
 
 The v0.2.0 release. It rolls up the release candidates

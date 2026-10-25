@@ -16,10 +16,34 @@ system daemon (`omavrythingd`) keeps an in-memory index of all mounted
 filesystems — using directory traversal + inotify for Linux filesystems
 (btrfs/ext4/xfs/f2fs) and the MFT for NTFS partitions.
 
-> **Status:** v0.2.0. See [`docs/`](docs/) and the
+> **Status:** v0.2.1. See [`docs/`](docs/) and the
 > [changelog](CHANGELOG.md).
 
 ## Install
+
+Add the plugin from the Omarchy marketplace (or by URL) and enable it:
+
+```sh
+omarchy plugin add https://github.com/brrrassica/omavrything.git --enable
+```
+
+On first start the plugin **self-provisions** the system daemon. It fetches the
+release binaries (verified against their `.sha256`), then asks for administrator
+authentication once in the Omarchy polkit dialog. **Authenticate once when
+prompted**; the daemon, the `omavrything` user/group, the systemd service, and
+the D-Bus/polkit policy are installed and started for you. No terminal and no
+manual command is required.
+
+Then bind a hotkey in `~/.config/hypr/bindings.lua`:
+
+```lua
+hl.unbind("SUPER + ALT + SPACE")
+o.bind("SUPER + ALT + SPACE", "Search files", "omarchy-shell tech.alatcerdas.omavrything focus")
+```
+
+`SUPER + ALT + SPACE` is reassigned from the Omarchy "Apps menu" binding.
+
+### From a release archive or source
 
 Download the latest `omavrything-<version>-<arch>.zip` from the
 [releases page](https://github.com/brrrassica/omavrything/releases), extract it,
@@ -31,10 +55,18 @@ cd omavrything-*
 sudo ./scripts/install.sh
 ```
 
-One command installs the daemon, CLI, systemd unit, D-Bus policy, polkit action,
-man page, default config, and shell plugin; creates the `omavrything` user; adds
-you to its group; reloads D-Bus; starts the daemon; and enables the plugin. The
-group change applies on your next login.
+Or from a source checkout:
+
+```sh
+scripts/build.sh
+sudo scripts/install.sh
+```
+
+The manual `sudo scripts/install.sh` path is for **headless or offline** installs
+(no polkit agent, or no network). It installs the daemon, CLI, systemd unit,
+D-Bus policy, polkit action, man page, default config, and shell plugin; creates
+the `omavrything` user; adds you to its group; reloads D-Bus; starts the daemon;
+and enables the plugin. The group change applies on your next login.
 
 The archive holds the `omavrythingd` daemon and `omavry` CLI under `bin/`, system
 files under `data/`, the plugin under `shell/`, scripts under `scripts/`, and
@@ -43,20 +75,6 @@ docs under `docs/`.
 An AUR package is prepared under [`packaging/`](packaging/) but is **not
 published yet**; build it locally with `makepkg -si`, or use the release archive
 or a source build.
-
-## Quick start (from source)
-
-```sh
-scripts/build.sh
-sudo scripts/install.sh
-```
-
-Then bind a hotkey in `~/.config/hypr/bindings.lua`:
-
-```lua
-hl.unbind("SUPER + ALT + SPACE")
-o.bind("SUPER + ALT + SPACE", "Search files", "omarchy-shell tech.alatcerdas.omavrything focus")
-```
 
 See [`docs/install.md`](docs/install.md) for the full setup, including the D-Bus control interface.
 
@@ -121,16 +139,25 @@ Rendered at **<https://omavrything.alatcerdas.tech>** (mirror:
 
 ## Removal
 
-`scripts/uninstall.sh` removes everything the installer added (system-only,
-matching the installer):
+Remove the plugin from the shell:
+
+```sh
+omarchy plugin remove tech.alatcerdas.omavrything --yes
+```
+
+This removes the plugin (the bar widget, overlay, and service) and its
+registration in `~/.config/omarchy/shell.json`. It does **not** remove the system
+daemon the plugin self-provisioned; remove that with the uninstaller from a
+checkout or the release archive:
 
 ```sh
 sudo scripts/uninstall.sh       # the daemon, system integration, and plugin
 ```
 
-`--keep-config` keeps `/etc/omavrything/config.toml`, `--keep-user` keeps the
-`omavrything` user and group, and `--keep-state` keeps the index snapshot under
-`/var/lib/omavrything`. Remove the hotkey binding from
+`scripts/uninstall.sh` also removes the plugin, so it is the single command for a
+full removal. `--keep-config` keeps `/etc/omavrything/config.toml`, `--keep-user`
+keeps the `omavrything` user and group, and `--keep-state` keeps the index
+snapshot under `/var/lib/omavrything`. Remove the hotkey binding from
 `~/.config/hypr/bindings.lua` if you added one.
 
 With the AUR package (once published): `sudo pacman -Rns omavrything`.

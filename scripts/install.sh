@@ -19,14 +19,40 @@ set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-if [[ $# -gt 0 ]]; then
-  echo "error: install.sh takes no options (got: $*)" >&2
-  echo "usage: sudo scripts/install.sh" >&2
-  exit 2
-fi
+# Options. The default (no options) is the manual `sudo scripts/install.sh`
+# path. --from-plugin is used by scripts/bootstrap.sh, which escalates with
+# pkexec from the shell plugin; it skips the plugin-copy step because
+# `omarchy plugin add` already installed and enabled the plugin.
+from_plugin=0
+bindir_override=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --from-plugin)
+      from_plugin=1
+      shift
+      ;;
+    --bindir)
+      [[ $# -ge 2 ]] || {
+        echo "error: --bindir requires a directory" >&2
+        exit 2
+      }
+      bindir_override="$2"
+      shift 2
+      ;;
+    -h | --help)
+      echo "usage: sudo scripts/install.sh [--from-plugin] [--bindir <dir>]"
+      exit 0
+      ;;
+    *)
+      echo "error: unknown option: $1" >&2
+      echo "usage: sudo scripts/install.sh [--from-plugin] [--bindir <dir>]" >&2
+      exit 2
+      ;;
+  esac
+done
 
 if [[ "$(id -u)" -ne 0 ]]; then
-  echo "error: install.sh must be run as root (use sudo)" >&2
+  echo "error: install.sh must be run as root (use sudo or pkexec)" >&2
   exit 1
 fi
 
@@ -39,10 +65,11 @@ die() {
 
 # Locate the release binaries. They live in bin/ at the top level, the same
 # layout the release archive ships; a source checkout populates it with
-# scripts/build.sh.
-bindir="$here/bin"
+# scripts/build.sh. --bindir overrides the location (the bootstrap passes a
+# fetched or local build directory).
+bindir="${bindir_override:-$here/bin}"
 if [[ ! -x "$bindir/omavrythingd" || ! -x "$bindir/omavry" ]]; then
-  die "omavrythingd/omavry not found in bin/; run scripts/build.sh first"
+  die "omavrythingd/omavry not found in $bindir; run scripts/build.sh first"
 fi
 
 # Remove any previous installation first so an upgrade leaves nothing stale
@@ -65,11 +92,15 @@ version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
   "$here/manifest.json" 2>/dev/null | head -n1)"
 
 # The user the shell plugin is installed for. Under sudo this is the real
-# invoker; running as root directly leaves it empty and the per-user steps are
-# skipped with a warning.
+# invoker; under pkexec (the plugin bootstrap) it is $PKEXEC_UID. Running as
+# root directly leaves it empty and the per-user steps are skipped with a
+# warning.
 target_user="${SUDO_USER:-}"
+if [[ -z "$target_user" || "$target_user" == "root" ]] && [[ -n "${PKEXEC_UID:-}" ]]; then
+  target_user="$(getent passwd "$PKEXEC_UID" | cut -d: -f1 || true)"
+fi
 if [[ -z "$target_user" || "$target_user" == "root" ]]; then
-  warn "could not determine a non-root invoking user; run with sudo so the shell plugin can be installed"
+  warn "could not determine a non-root invoking user; run with sudo or pkexec so the shell plugin can be installed"
   target_user=""
 fi
 
@@ -266,53 +297,59 @@ fi
 
 # 7. Install, enable, and load the shell plugin for the invoking user.
 if [[ -n "$target_user" ]]; then
-  log "installing the shell plugin for $target_user"
-  plugin_dest="$user_home/.config/omarchy/plugins/tech.alatcerdas.omavrything"
-  # Replace the plugin tree wholesale so a newer version's dropped files do not
-  # linger next to the freshly installed ones.
-  as_user rm -rf "$plugin_dest"
-  as_user mkdir -p "$plugin_dest/shell/omavrything"
-  as_user install -m644 "$here/manifest.json" "$plugin_dest/manifest.json"
-  as_user install -m644 "$here"/shell/omavrything/*.qml "$plugin_dest/shell/omavrything/"
-
-  # Validate the plugin with omarchy when available. The plugin folder is a
-  # required argument: bare `omarchy plugin validate` prints usage and exits 0.
-  if as_user sh -c 'command -v omarchy >/dev/null 2>&1'; then
-    if as_user omarchy plugin validate "$plugin_dest" >/dev/null 2>&1; then
-      log "validated the plugin with 'omarchy plugin validate'"
-    else
-      warn "'omarchy plugin validate' rejected the installed plugin"
-    fi
-  fi
-
   # The settings menu reads and writes the daemon config through the `omavry`
-  # CLI, so it must be on PATH.
+  # CLI, so it must be on PATH. Needed in both modes.
   as_user mkdir -p "$user_home/.local/bin"
   as_user ln -sf /usr/bin/omavry "$user_home/.local/bin/omavry"
 
-  # Restart the shell FIRST so the freshly copied plugin is discovered and
-  # registered. `omarchy plugin enable` talks to the running shell
-  # (`omarchy-shell shell enablePlugin`) and fails with "plugin ... is not
-  # known" until the shell has rescanned; a plugin rescan alone keeps the
-  # previously compiled component, so the shell process must restart for the
-  # new QML to take effect.
-  if as_user sh -c 'command -v omarchy >/dev/null 2>&1'; then
-    if as_user omarchy restart shell >/dev/null 2>&1; then
-      log "restarted the shell"
-    else
-      warn "could not restart the shell; run 'omarchy restart shell'"
-    fi
-  elif as_user sh -c 'command -v omarchy-shell >/dev/null 2>&1'; then
-    as_user omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
-    warn "'omarchy' not found; rescanned plugins only (changed QML may not apply)"
-  fi
+  if [[ "$from_plugin" == 1 ]]; then
+    # The plugin was installed and enabled by `omarchy plugin add`; do not
+    # overwrite it or restart the shell from inside the install.
+    log "plugin already installed by 'omarchy plugin add'; skipping the plugin copy"
+  else
+    log "installing the shell plugin for $target_user"
+    plugin_dest="$user_home/.config/omarchy/plugins/tech.alatcerdas.omavrything"
+    # Replace the plugin tree wholesale so a newer version's dropped files do not
+    # linger next to the freshly installed ones.
+    as_user rm -rf "$plugin_dest"
+    as_user mkdir -p "$plugin_dest/shell/omavrything"
+    as_user install -m644 "$here/manifest.json" "$plugin_dest/manifest.json"
+    as_user install -m644 "$here"/shell/omavrything/*.qml "$plugin_dest/shell/omavrything/"
 
-  # Enable the plugin in the bar, now that the shell knows about it.
-  if as_user sh -c 'command -v omarchy >/dev/null 2>&1'; then
-    if as_user omarchy plugin enable tech.alatcerdas.omavrything --section center >/dev/null 2>&1; then
-      log "enabled the plugin in the center section"
-    else
-      warn "could not enable the plugin; run 'omarchy plugin enable tech.alatcerdas.omavrything --section center'"
+    # Validate the plugin with omarchy when available. The plugin folder is a
+    # required argument: bare `omarchy plugin validate` prints usage and exits 0.
+    if as_user sh -c 'command -v omarchy >/dev/null 2>&1'; then
+      if as_user omarchy plugin validate "$plugin_dest" >/dev/null 2>&1; then
+        log "validated the plugin with 'omarchy plugin validate'"
+      else
+        warn "'omarchy plugin validate' rejected the installed plugin"
+      fi
+    fi
+
+    # Restart the shell FIRST so the freshly copied plugin is discovered and
+    # registered. `omarchy plugin enable` talks to the running shell
+    # (`omarchy-shell shell enablePlugin`) and fails with "plugin ... is not
+    # known" until the shell has rescanned; a plugin rescan alone keeps the
+    # previously compiled component, so the shell process must restart for the
+    # new QML to take effect.
+    if as_user sh -c 'command -v omarchy >/dev/null 2>&1'; then
+      if as_user omarchy restart shell >/dev/null 2>&1; then
+        log "restarted the shell"
+      else
+        warn "could not restart the shell; run 'omarchy restart shell'"
+      fi
+    elif as_user sh -c 'command -v omarchy-shell >/dev/null 2>&1'; then
+      as_user omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+      warn "'omarchy' not found; rescanned plugins only (changed QML may not apply)"
+    fi
+
+    # Enable the plugin in the bar, now that the shell knows about it.
+    if as_user sh -c 'command -v omarchy >/dev/null 2>&1'; then
+      if as_user omarchy plugin enable tech.alatcerdas.omavrything --section center >/dev/null 2>&1; then
+        log "enabled the plugin in the center section"
+      else
+        warn "could not enable the plugin; run 'omarchy plugin enable tech.alatcerdas.omavrything --section center'"
+      fi
     fi
   fi
 fi

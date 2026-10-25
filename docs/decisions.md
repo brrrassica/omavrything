@@ -399,3 +399,47 @@ read-write again — rejected: a race window where the desktop can write during
 the read, and the daemon's model is read-only mounts); a private second
 read-only mount of the same device (rejected: mounting one NTFS device twice is
 not reliably supported by the kernel driver).
+
+---
+
+## ADR-019 — The plugin self-provisions the system daemon via polkit
+
+**Decision:** The `omarchy-shell` plugin **self-provisions** the system daemon.
+On first start, `Service.qml` runs `scripts/bootstrap.sh`, which ensures the
+daemon binary is available and escalates with **`pkexec`** (polkit) to run
+`scripts/install.sh --from-plugin` as root. The user authenticates once in the
+Omarchy polkit dialog (the `omarchy.polkit` shell plugin); they never run a
+command. The system distribution (systemd unit, sysusers, tmpfiles, D-Bus and
+polkit policy, man page, config, and the installer) **stays in the plugin repo**.
+
+**Rationale:** `omarchy plugin add <url> --enable` must yield a working plugin
+with the full system daemon — the `omavrything` user/group, the systemd service,
+and the NTFS capabilities — without a manual `sudo` step. `pkexec` uses the
+default `org.freedesktop.policykit.exec` action, so no custom `.policy` file is
+needed for the first run (avoiding the chicken-and-egg of installing a policy
+that itself needs root). Omarchy ships a polkit agent in the session, and its own
+guidance sanctions `pkexec` for a graphical background process.
+
+**Binary distribution:** **fetch-on-first-run.** A bare clone has no binaries
+(`bin/` and `shell/omavrything/bin/` are gitignored). `scripts/bootstrap.sh`
+prefers a local build (the plugin tree, then `bin/`), otherwise
+`scripts/fetch-daemon.sh` downloads the release asset
+`omavrything-<version>-<arch>.zip` and verifies it against its `.sha256` before
+extracting. The release workflow publishes the `.sha256` alongside the archive.
+A committed prebuilt was rejected: it is arch-specific and goes stale in a
+monorepo unless rebuilt per release.
+
+**Consequences:** The plugin keeps the installer and the privilege escalation, so
+the automated marketplace baseline may still report `privilege` / `installer` /
+`service-management` capabilities; the standard-installation request must argue
+self-provisioning (the user authenticates, they do not run commands). A polkit
+agent must be running in the session (Omarchy ships one); if absent, the
+documented `sudo scripts/install.sh` path remains for headless/offline installs.
+A dismissal writes a marker so the prompt does not recur on every shell restart;
+`omarchy-shell tech.alatcerdas.omavrything setup` retries.
+
+**Alternatives considered:** Moving the system artefacts out of the plugin repo
+(the "Option A" direction in `plans/copyable-installer.md` — rejected: it splits
+the distribution and still needs a privileged step); a committed prebuilt binary
+(rejected: arch-specific and stale); an unprivileged user-mode daemon (the
+fallback if the marketplace rejects the escalation).

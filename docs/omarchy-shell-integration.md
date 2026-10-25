@@ -93,7 +93,14 @@ QML. See [`troubleshooting.md`](troubleshooting.md#the-search-bar-does-not-appea
 
 ## Install and enable
 
-The unified installer copies the plugin into
+The standard path is the marketplace one-liner, which installs and enables the
+plugin and lets it self-provision the system daemon:
+
+```sh
+omarchy plugin add https://github.com/brrrassica/omavrything.git --enable
+```
+
+The manual installer copies the plugin into
 `~/.config/omarchy/plugins/tech.alatcerdas.omavrything/`, validates it, restarts
 the shell, and enables it in the center section:
 
@@ -103,6 +110,37 @@ sudo scripts/install.sh
 
 The bar widget is placed in the center section, right of the `omarchy.clock`
 anchor. The overlay and service are enabled by the same command.
+
+## System-daemon bootstrap (pkexec)
+
+The `service` plugin (`Service.qml`) is loaded at shell startup, so it can
+provision the system daemon before the overlay is ever summoned. On first start,
+if the system daemon is absent, it runs `scripts/bootstrap.sh` once (guarded by
+`bootstrapAttempted`):
+
+1. `bootstrap.sh` exits immediately if the daemon binary or socket already
+   exists, and is a no-op after a previous dismissal (a marker under
+   `$XDG_CACHE_HOME/omavrything/`).
+2. It locates the daemon binary: the plugin tree (`shell/omavrything/bin/`), then
+   `bin/`, then `scripts/fetch-daemon.sh`, which downloads the release asset
+   `omavrything-<version>-<arch>.zip` and verifies it against its `.sha256`.
+3. It escalates with `pkexec <plugin>/scripts/install.sh --from-plugin --bindir
+   <dir>`. `pkexec` uses the default `org.freedesktop.policykit.exec` action, so
+   no custom `.policy` file is needed for the first run. The Omarchy polkit agent
+   (`omarchy.polkit`, a shell plugin) shows the GUI authentication dialog; the
+   installer runs as root and resolves the invoking user from `PKEXEC_UID`.
+
+Exit codes: `126` means the prompt was dismissed (a marker is written so it does
+not recur on every shell restart), `127` means the installer could not be run.
+The `setup` IPC retries with `--force`:
+
+```sh
+omarchy-shell tech.alatcerdas.omavrything setup
+```
+
+`Service.qml` resolves its own directory with `Qt.resolvedUrl(".")` (the idiom
+Omarchy's own plugins use), with a `$HOME/.config/omarchy/plugins/...` fallback.
+The `focus` and `ping` IPC targets are unchanged.
 
 ## The scratchpad
 

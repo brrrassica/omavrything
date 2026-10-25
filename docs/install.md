@@ -1,10 +1,28 @@
 # Installation and setup
 
-`omavrything` is at **v0.2.0**, released and used day to day. Install it
-from a release archive or from source (§1–2). It targets
+`omavrything` is at **v0.2.1**, released and used day to day. Install it as an
+Omarchy plugin (§0), or from a release archive or source (§1–2). It targets
 **Omarchy Quattro (4.x)** only — Hyprland, `omarchy-shell` (Quickshell), Arch
 Linux. There is no backwards compatibility with earlier Omarchy releases that
 used waybar.
+
+## 0. Install as an Omarchy plugin (recommended)
+
+```sh
+omarchy plugin add https://github.com/brrrassica/omavrything.git --enable
+```
+
+The plugin **self-provisions** the system daemon. On first start it fetches the
+release binaries (verified against their `.sha256`), then escalates with
+`pkexec` to run `scripts/install.sh --from-plugin` as root. The Omarchy polkit
+agent (`omarchy.polkit`) shows a GUI authentication dialog; **authenticate once
+when prompted**. The daemon, the `omavrything` user/group, the systemd service,
+and the D-Bus/polkit policy are installed and started for you — no terminal and
+no manual command. Then bind a hotkey (§4).
+
+The manual `sudo scripts/install.sh` path (§6) remains for **headless or offline**
+installs: a machine with no polkit agent, or one that cannot reach the release
+assets. It does the same work from a local build or a release archive.
 
 ## 1. Build the daemon and CLI
 
