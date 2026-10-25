@@ -11,7 +11,7 @@ glibc, and package availability catches problems that an Ubuntu build would miss
 The release archive is built the same way, so the shipped binaries match the
 target platform.
 
-The workflow ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) has five
+The workflow ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) has seven
 jobs:
 
 - **build** — `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`
@@ -22,9 +22,13 @@ jobs:
   and semantic errors.
 - **fuzz** — a short `cargo-fuzz` smoke session of the snapshot and protocol
   targets (nightly toolchain).
-- **audit** — `cargo audit` for dependency advisories. This job stays on the
-  default runner because advisories are platform-independent (they only read
-  `Cargo.lock`).
+- **audit** — `cargo audit` for dependency advisories. This job runs on the
+  runner host rather than in a container, because advisories are
+  platform-independent (they only read `Cargo.lock`).
+- **smoke** — `scripts/ci-smoke.sh` exercises install → enable → search →
+  uninstall inside the Arch container.
+- **bench** — `scripts/benchmark.sh --quick --hermetic --budgets` checks the
+  hermetic p50/p95 and cold-scan throughput against the performance budgets.
 - **package** — builds the release archive with `scripts/package-release.sh` and
   uploads it as a build artifact, so a broken release is caught before a tag.
 

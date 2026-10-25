@@ -1,4 +1,4 @@
-.TH OMAVRYTHINGD 8 "2026-10-11" "omavrything 0.1.3" "System Administration"
+.TH OMAVRYTHINGD 8 "2026-10-23" "omavrything 0.2.0" "System Administration"
 .SH NAME
 omavrythingd \- index-backed file search daemon
 .SH SYNOPSIS
@@ -72,7 +72,7 @@ Snapshot write interval in seconds (0 disables; default 300).
 .TP
 .B \-\-evict-idle-secs \fIsecs\fR
 Idle period in seconds after which the index is evicted to its snapshot
-image, falling back to a small resident delta (0 disables; default 20).
+image, falling back to a small resident delta (0 disables; default 0).
 Idle means no queries and no user-driven mutations; filesystem events
 never reset the timer.
 .TP
