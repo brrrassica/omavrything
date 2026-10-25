@@ -4,9 +4,6 @@ Notable changes to `omavrything`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-
 ## [0.2.1] — 2026-10-25
 
 The standard-installation release. `omarchy plugin add <url> --enable` now yields
@@ -51,7 +48,6 @@ user authenticates once in a GUI prompt and never runs a command.
   the `pkexec` escalation; `docs/troubleshooting.md` documents the polkit-agent
   dependency and the `sudo` fallback.
 - ADR-019 records the self-provisioning and fetch-on-first-run decisions.
-
 ## [0.2.0] — 2026-10-23
 
 The v0.2.0 release. It rolls up the release candidates
@@ -422,7 +418,6 @@ per-candidate detail.
   daemon (client connections, background tasks, the shutdown handler, and the
   D-Bus NTFS startup path) logs a spawn failure instead of panicking, so a
   tight task budget degrades gracefully rather than taking the service down.
-
 
 ## [0.1.8] — 2026-10-14
 
