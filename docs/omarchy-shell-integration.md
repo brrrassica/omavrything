@@ -123,7 +123,10 @@ if the system daemon is absent, it runs `scripts/bootstrap.sh` once (guarded by
    `$XDG_CACHE_HOME/omavrything/`).
 2. It locates the daemon binary: the plugin tree (`shell/omavrything/bin/`), then
    `bin/`, then `scripts/fetch-daemon.sh`, which downloads the release asset
-   `omavrything-<version>-<arch>.zip` and verifies it against its `.sha256`.
+   `omavrything-<version>-<arch>.zip` and verifies it against a SHA-256 digest
+   pinned in the reviewed source (`scripts/daemon-checksums.txt`). The installer
+   re-verifies the binaries against the per-binary digests in the same file
+   before installing them as root.
 3. It escalates with `pkexec <plugin>/scripts/install.sh --from-plugin --bindir
    <dir>`. `pkexec` uses the default `org.freedesktop.policykit.exec` action, so
    no custom `.policy` file is needed for the first run. The Omarchy polkit agent

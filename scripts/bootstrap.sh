@@ -64,9 +64,11 @@ fi
 #                           after scripts/build.sh, or the release archive).
 # A bare clone has neither, so the release asset is fetched and verified.
 bindir=""
+local_build=0
 for candidate in "$here/shell/omavrything/bin" "$here/bin"; do
   if [[ -x "$candidate/omavrythingd" && -x "$candidate/omavry" ]]; then
     bindir="$candidate"
+    local_build=1
     break
   fi
 done
@@ -83,9 +85,17 @@ fi
 # so the installer can resolve the invoking user. pkexec runs the program in
 # root's home, so the installer must not rely on the current directory (it
 # derives its own path from $BASH_SOURCE).
+#
+# A local build is not the pinned release binary, so the installer must skip the
+# pinned-digest check for it (--no-verify). A fetched build is verified by the
+# installer against the digests pinned in the reviewed source.
+install_args=(--from-plugin --bindir "$bindir")
+if [[ "$local_build" == 1 ]]; then
+  install_args+=(--no-verify)
+fi
 log "requesting administrator authentication to install the system daemon"
 set +e
-pkexec "$here/scripts/install.sh" --from-plugin --bindir "$bindir"
+pkexec "$here/scripts/install.sh" "${install_args[@]}"
 rc=$?
 set -e
 case "$rc" in

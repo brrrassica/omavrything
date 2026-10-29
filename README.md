@@ -28,11 +28,13 @@ omarchy plugin add https://github.com/brrrassica/omavrything.git --enable
 ```
 
 On first start the plugin **self-provisions** the system daemon. It fetches the
-release binaries (verified against their `.sha256`), then asks for administrator
-authentication once in the Omarchy polkit dialog. **Authenticate once when
-prompted**; the daemon, the `omavrything` user/group, the systemd service, and
-the D-Bus/polkit policy are installed and started for you. No terminal and no
-manual command is required.
+release binaries and verifies them against SHA-256 digests pinned in the
+reviewed source (`scripts/daemon-checksums.txt`); the installer re-verifies them
+before copying them into `/usr/bin` and running them as root. It then asks for
+administrator authentication once in the Omarchy polkit dialog. **Authenticate
+once when prompted**; the daemon, the `omavrything` user/group, the systemd
+service, and the D-Bus/polkit policy are installed and started for you. No
+terminal and no manual command is required.
 
 Then bind a hotkey in `~/.config/hypr/bindings.lua`:
 

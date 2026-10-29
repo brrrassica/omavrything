@@ -13,8 +13,11 @@ omarchy plugin add https://github.com/brrrassica/omavrything.git --enable
 ```
 
 The plugin **self-provisions** the system daemon. On first start it fetches the
-release binaries (verified against their `.sha256`), then escalates with
-`pkexec` to run `scripts/install.sh --from-plugin` as root. The Omarchy polkit
+release binaries and verifies them against SHA-256 digests pinned in the
+reviewed source (`scripts/daemon-checksums.txt`), then escalates with
+`pkexec` to run `scripts/install.sh --from-plugin` as root. The installer
+re-verifies the binaries against the same pinned digests before it copies them
+into `/usr/bin` and runs them as root. The Omarchy polkit
 agent (`omarchy.polkit`) shows a GUI authentication dialog; **authenticate once
 when prompted**. The daemon, the `omavrything` user/group, the systemd service,
 and the D-Bus/polkit policy are installed and started for you — no terminal and
@@ -31,7 +34,9 @@ scripts/build.sh
 ```
 
 This compiles the workspace and writes the `omavrythingd` daemon and the
-`omavry` CLI into `bin/`, the same layout the release archive ships. See
+`omavry` CLI into `bin/`, the same layout the release archive ships. A local
+build is not the pinned release binary, so install it with
+`sudo scripts/install.sh --no-verify` (see §6). See
 [`development.md`](development.md) for the full build, test, and lint workflow.
 
 ## 2. Run the daemon
@@ -108,6 +113,11 @@ widget works immediately:
 ```sh
 sudo scripts/install.sh
 ```
+
+The installer verifies the binaries against the digests pinned in
+`scripts/daemon-checksums.txt` before installing them as root. A local build
+(`scripts/build.sh`) is not the pinned release binary, so install it with
+`sudo scripts/install.sh --no-verify`.
 
 The group change takes effect on your next login.
 

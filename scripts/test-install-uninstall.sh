@@ -44,16 +44,16 @@ cp manifest.json "$pkg/manifest.json"
 cp shell/omavrything/*.qml "$pkg/shell/omavrything/"
 cp scripts/install.sh scripts/uninstall.sh "$pkg/scripts/"
 
-# --- C2: install.sh is the unified, option-free, root-only installer --------
+# --- C2: install.sh is the unified, root-only installer ---------------------
 # The old `--user` mode is gone: the single command installs the system
-# integration and the per-user plugin for the invoking user. It must reject any
-# option and refuse to run as a non-root user.
+# integration and the per-user plugin for the invoking user. It must reject an
+# unknown option and refuse to run as a non-root user.
 err="$tmp/install-opt.err"
 if "$pkg/scripts/install.sh" --user >/dev/null 2>"$err"; then
-  bad "install.sh --user unexpectedly succeeded (it must take no options)"
+  bad "install.sh --user unexpectedly succeeded (it must reject unknown options)"
 else
-  if grep -q 'takes no options' "$err"; then
-    ok "install.sh rejects options (unified, option-free installer)"
+  if grep -q 'unknown option' "$err"; then
+    ok "install.sh rejects an unknown option"
   else
     bad "install.sh did not reject --user: $(cat "$err")"
   fi
@@ -176,7 +176,7 @@ if [[ -x bin/omavrythingd && -x bin/omavry ]]; then
     # Capture the listing first: `unzip -l | grep -q` would SIGPIPE unzip when
     # grep exits on the first match, which `set -o pipefail` turns into a failure.
     listing="$(unzip -l "$archive" 2>/dev/null || true)"
-    for entry in scripts/install.sh scripts/uninstall.sh data/man/omavrythingd.8 scripts/doctor.sh scripts/benchmark.sh; do
+    for entry in scripts/install.sh scripts/uninstall.sh data/man/omavrythingd.8 scripts/doctor.sh scripts/benchmark.sh scripts/daemon-checksums.txt; do
       if [[ -n "$listing" ]] && grep -qF "$entry" <<<"$listing"; then
         ok "the release archive contains $entry"
       else

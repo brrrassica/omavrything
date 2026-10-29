@@ -424,10 +424,19 @@ guidance sanctions `pkexec` for a graphical background process.
 (`bin/` and `shell/omavrything/bin/` are gitignored). `scripts/bootstrap.sh`
 prefers a local build (the plugin tree, then `bin/`), otherwise
 `scripts/fetch-daemon.sh` downloads the release asset
-`omavrything-<version>-<arch>.zip` and verifies it against its `.sha256` before
-extracting. The release workflow publishes the `.sha256` alongside the archive.
-A committed prebuilt was rejected: it is arch-specific and goes stale in a
-monorepo unless rebuilt per release.
+`omavrything-<version>-<arch>.zip` and verifies it against a SHA-256 digest
+pinned in the reviewed source (`scripts/daemon-checksums.txt`) before
+extracting. `scripts/install.sh` then re-verifies the individual binaries
+against the per-binary digests in the same file before copying them into
+`/usr/bin` and running them as root, so the check holds at the point of
+installation regardless of how the binaries reached it. The digests are not
+fetched from the release: the archive and its `.sha256` asset live in the same
+mutable release, so a checksum downloaded alongside the archive proves nothing.
+A local build is not the pinned release binary and is installed with
+`--no-verify`. The release workflow publishes the `.sha256` alongside the
+archive for manual verification, and commits the pinned digests to the default
+branch. A committed prebuilt was rejected: it is arch-specific and goes stale in
+a monorepo unless rebuilt per release.
 
 **Consequences:** The plugin keeps the installer and the privilege escalation, so
 the automated marketplace baseline may still report `privilege` / `installer` /

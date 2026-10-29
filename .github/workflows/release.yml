@@ -96,9 +96,11 @@ jobs:
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: omavrything ${{ steps.tag.outputs.tag }}
-          # The .sha256 asset is required: scripts/fetch-daemon.sh refuses to
-          # install an unverified binary, so the plugin's fetch-on-first-run
-          # bootstrap needs it published alongside the archive.
+          # The .sha256 asset is published for manual verification only. The
+          # plugin's fetch-on-first-run bootstrap does NOT trust it: it verifies
+          # the archive against the digest pinned in scripts/daemon-checksums.txt
+          # (see scripts/fetch-daemon.sh), because the archive and this asset
+          # live in the same mutable release.
           files: |
             dist/*.zip
             dist/*.zip.sha256
@@ -120,3 +122,29 @@ jobs:
             immediately; the group change takes effect on your next login.
 
             See `docs/install.md` inside the archive for the full setup.
+
+      # package-release.sh wrote the pinned digests for this release to
+      # dist/daemon-checksums.txt. The plugin's fetch-on-first-run bootstrap
+      # (scripts/fetch-daemon.sh) and the installer (scripts/install.sh) verify
+      # against scripts/daemon-checksums.txt, and the plugin clones the default
+      # branch, so commit the generated file there; otherwise the bootstrap and
+      # the installer fail closed and refuse to install the release. This is the
+      # provenance binding: the shipped binaries are tied to the reviewed commit
+      # that carries the digests.
+      - name: Pin the release digests in the reviewed source
+        run: |
+          set -euo pipefail
+          version="${{ steps.tag.outputs.version }}"
+          cp dist/daemon-checksums.txt /tmp/daemon-checksums.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git checkout -f main
+          cp /tmp/daemon-checksums.txt scripts/daemon-checksums.txt
+          if git diff --quiet -- scripts/daemon-checksums.txt; then
+            echo "the pinned digests are already up to date on main"
+          else
+            git add scripts/daemon-checksums.txt
+            git commit -m "chore(release): pin omavrything-${version} digests"
+            git push origin main
+          fi

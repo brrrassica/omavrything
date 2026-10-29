@@ -1,0 +1,37 @@
+# Pinned SHA-256 digests of the release artifacts that the plugin bootstrap and
+# the installer are allowed to install as root.
+#
+# This file is the trust anchor for the fetch-on-first-run bootstrap and for the
+# installer. The digests are recorded here, in the reviewed source, NOT fetched
+# from the release: the archive and its .sha256 asset live in the same GitHub
+# release, which is mutable (GitHub reports `immutable: false`), so an attacker
+# who can replace one asset can replace the other and satisfy a checksum fetched
+# from the same place. A digest committed to this reviewed source cannot be
+# changed without a reviewed commit, which binds the shipped binaries to this
+# source.
+#
+# Two kinds of entry are pinned:
+#
+#   <sha256>  omavrything-<version>-<arch>.zip
+#       The whole release archive. scripts/fetch-daemon.sh verifies the download
+#       against this before extracting anything.
+#
+#   <sha256>  omavrything-<version>-<arch>/bin/<name>
+#       The individual binaries inside the archive. scripts/install.sh verifies
+#       the binaries it is about to install and execute as root against these,
+#       so the check is enforced at the point of installation regardless of how
+#       the binaries reached the installer (fetch, release archive, or a
+#       --bindir override). A local build (scripts/build.sh) is not the pinned
+#       release binary; install it with `--no-verify`.
+#
+# Format: "<sha256>  <name>" (the format `sha256sum -c` expects).
+# scripts/package-release.sh writes the entries for the archive it builds to
+# dist/daemon-checksums.txt; the release workflow commits that file to the
+# default branch, which is the source the plugin clones.
+#
+# A missing entry is a hard failure: the fetch and the installer refuse to
+# install an artifact they cannot verify against this file.
+
+b96b87c4299f0e8a759d33ec08e74971824dff5f1211c4e9f03e0777500c5e75  omavrything-0.2.1-x86_64.zip
+9dbf072393bef7d7a2e9996378e37eb81da67f36151e792e26f54625c5f7f899  omavrything-0.2.1-x86_64/bin/omavrythingd
+e49a8f5b260a585627ffe2d0d2806ef09120ba746ccc5a1b517221b350b4214b  omavrything-0.2.1-x86_64/bin/omavry
