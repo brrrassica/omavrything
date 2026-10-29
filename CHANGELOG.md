@@ -11,6 +11,28 @@ a working plugin with the full system daemon: the plugin **self-provisions** the
 privileged install through a one-time polkit-authenticated escalation, so the
 user authenticates once in a GUI prompt and never runs a command.
 
+### Security
+
+- **The fetch and the installer now verify the release artifacts against
+  digests pinned in the reviewed source.** `scripts/fetch-daemon.sh` previously
+  downloaded both the archive and its `.sha256` from the same GitHub release.
+  That release is mutable (GitHub reports `immutable: false`), so anyone able to
+  replace one asset could replace the other and satisfy the checksum with an
+  arbitrary binary — which `scripts/bootstrap.sh` then hands to the
+  authenticated installer, which copies it into `/usr/bin` and runs it as root.
+  The expected SHA-256 digests are now recorded in
+  `scripts/daemon-checksums.txt`, a committed file: the archive digest is
+  checked by `scripts/fetch-daemon.sh`, and the per-binary digests are checked
+  by `scripts/install.sh` at the point of installation, so the check holds no
+  matter how the binaries reached the installer (fetch, release archive, or a
+  `--bindir` override) and re-checks the exact bytes the installer reads. Both
+  fail closed when there is no pinned entry. A local build
+  (`scripts/build.sh`) is not the pinned release binary and is installed with
+  `--no-verify`. The release workflow commits the digests for each new release
+  to the default branch, so the shipped binaries are bound to the reviewed
+  commit that carries them. The `.sha256` release asset is still published, but
+  only for manual verification.
+
 ### Added
 
 - **Plugin self-provisioning.** The `service` plugin runs `scripts/bootstrap.sh`
@@ -21,9 +43,11 @@ user authenticates once in a GUI prompt and never runs a command.
   `omarchy-shell tech.alatcerdas.omavrything setup` retries.
 - **Fetch-on-first-run binary distribution.** `scripts/fetch-daemon.sh`
   downloads the release asset `omavrything-<version>-<arch>.zip` and verifies it
-  against its `.sha256` before extracting. `scripts/bootstrap.sh` prefers a local
-  build (the plugin tree `shell/omavrything/bin/`, then `bin/`), then fetches.
-  The release workflow now publishes the `.sha256` asset alongside the archive.
+  against a SHA-256 digest pinned in the reviewed source
+  (`scripts/daemon-checksums.txt`) before extracting. `scripts/bootstrap.sh`
+  prefers a local build (the plugin tree `shell/omavrything/bin/`, then `bin/`),
+  then fetches. The release workflow publishes the `.sha256` asset alongside the
+  archive for manual verification.
 - **`install.sh --from-plugin` and `--bindir`.** `--from-plugin` skips the
   plugin-copy step (the plugin is already installed by `omarchy plugin add`) and
   the shell restart; `--bindir` locates the binaries from the plugin tree. The

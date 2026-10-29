@@ -194,7 +194,7 @@ fi
 if compgen -G 'dist/omavrything-*.zip' >/dev/null; then
   archive="$(ls dist/omavrything-*.zip | head -1)"
   archive_listing="$(unzip -l "$archive" 2>/dev/null || true)"
-  for entry in bin/omavry bin/omavrythingd manifest.json INSTALL.txt scripts/benchmark.sh; do
+  for entry in bin/omavry bin/omavrythingd manifest.json INSTALL.txt scripts/benchmark.sh scripts/daemon-checksums.txt; do
     if grep -q "$entry" <<<"$archive_listing"; then
       ok "release archive contains $entry"
     else
@@ -208,8 +208,11 @@ fi
 # 1. System install (idempotent: run twice), then verify what landed. The
 # unified installer does the whole job in one command (the default, no-option
 # path; --from-plugin/--bindir are the plugin-driven path).
-expect "install.sh succeeds" 0 --grep "installed" -- scripts/install.sh
-expect "install.sh is idempotent" 0 -- scripts/install.sh
+# The smoke test builds the binaries locally (scripts/build.sh), so the
+# installer must skip the pinned-digest check (--no-verify); the release path
+# verifies against scripts/daemon-checksums.txt.
+expect "install.sh succeeds" 0 --grep "installed" -- scripts/install.sh --no-verify
+expect "install.sh is idempotent" 0 -- scripts/install.sh --no-verify
 for f in \
   /usr/bin/omavrythingd \
   /usr/bin/omavry \
@@ -247,6 +250,8 @@ expect_grep "install.sh adds the user to the group" scripts/install.sh \
 expect_grep "install.sh reloads D-Bus" scripts/install.sh "ReloadConfig"
 expect_grep "install.sh supports --from-plugin" scripts/install.sh "--from-plugin"
 expect_grep "install.sh supports --bindir" scripts/install.sh "--bindir"
+expect_grep "install.sh supports --no-verify" scripts/install.sh "--no-verify"
+expect_grep "install.sh verifies the pinned digests" scripts/install.sh "daemon-checksums.txt"
 expect_grep "install.sh applies the ACL bridge" scripts/install.sh "setfacl"
 expect_grep "install.sh installs the per-user plugin" scripts/install.sh \
   "plugins/tech.alatcerdas.omavrything"

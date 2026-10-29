@@ -22,9 +22,12 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Options. The default (no options) is the manual `sudo scripts/install.sh`
 # path. --from-plugin is used by scripts/bootstrap.sh, which escalates with
 # pkexec from the shell plugin; it skips the plugin-copy step because
-# `omarchy plugin add` already installed and enabled the plugin.
+# `omarchy plugin add` already installed and enabled the plugin. --no-verify
+# skips the pinned-digest check for a local build (scripts/build.sh), whose
+# binaries are not the pinned release binaries.
 from_plugin=0
 bindir_override=""
+no_verify=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --from-plugin)
@@ -39,13 +42,17 @@ while [[ $# -gt 0 ]]; do
       bindir_override="$2"
       shift 2
       ;;
+    --no-verify)
+      no_verify=1
+      shift
+      ;;
     -h | --help)
-      echo "usage: sudo scripts/install.sh [--from-plugin] [--bindir <dir>]"
+      echo "usage: sudo scripts/install.sh [--from-plugin] [--bindir <dir>] [--no-verify]"
       exit 0
       ;;
     *)
       echo "error: unknown option: $1" >&2
-      echo "usage: sudo scripts/install.sh [--from-plugin] [--bindir <dir>]" >&2
+      echo "usage: sudo scripts/install.sh [--from-plugin] [--bindir <dir>] [--no-verify]" >&2
       exit 2
       ;;
   esac
@@ -72,12 +79,43 @@ if [[ ! -x "$bindir/omavrythingd" || ! -x "$bindir/omavry" ]]; then
   die "omavrythingd/omavry not found in $bindir; run scripts/build.sh first"
 fi
 
+# The version reported by the manifest, used for the install summary and to
+# locate the pinned digests.
+version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+  "$here/manifest.json" 2>/dev/null | head -n1)"
+
+# Verify the binaries against the digests pinned in the reviewed source before
+# installing or executing them as root. This is the enforcement point: it holds
+# no matter how the binaries reached $bindir (the plugin's fetch, a release
+# archive, or a --bindir override), and it re-checks the exact bytes the
+# installer reads, closing the gap between the fetch-time check and the install.
+# A local build (scripts/build.sh) is not the pinned release binary, so it must
+# be installed with --no-verify.
+if [[ "$no_verify" == 0 ]]; then
+  checksums="$here/scripts/daemon-checksums.txt"
+  [[ -f "$checksums" ]] ||
+    die "missing $checksums; refusing to install unverified binaries (use --no-verify for a local build)"
+  arch="$(uname -m)"
+  for bin in omavrythingd omavry; do
+    key="omavrything-${version}-${arch}/bin/${bin}"
+    expected="$(awk -v f="$key" '$2 == f { print $1; exit }' "$checksums")"
+    [[ -n "$expected" ]] ||
+      die "no pinned digest for $key in $checksums; refusing to install unverified binaries (use --no-verify for a local build)"
+    actual="$(sha256sum "$bindir/$bin" | awk '{print $1}')"
+    [[ "$actual" == "$expected" ]] ||
+      die "checksum mismatch for $bindir/$bin (expected $expected, got $actual); refusing to install unverified binaries"
+  done
+  log "verified the binaries against the pinned digests"
+else
+  warn "skipping binary verification (--no-verify); only use this for a local build"
+fi
+
 # Remove any previous installation first so an upgrade leaves nothing stale
 # behind (e.g. the 0.1.4 `omavrything-install-plugin` helper, or QML files that
 # a newer version dropped). This mirrors the uninstaller's file list but keeps
 # the config, the dedicated user, and the cached index, which an upgrade
-# preserves. The binaries are located above, so a missing build fails before
-# anything is removed.
+# preserves. The binaries are located and verified above, so a missing or
+# unverifiable build fails before anything is removed.
 log "removing any previous installation"
 rm -f /usr/bin/omavrythingd /usr/bin/omavry /usr/bin/omavrything-install-plugin
 rm -f /usr/lib/systemd/system/omavrythingd.service
@@ -86,10 +124,6 @@ rm -f /usr/share/dbus-1/system.d/tech.alatcerdas.omavrything.conf
 rm -f /usr/share/polkit-1/actions/tech.alatcerdas.omavrything.policy
 rm -f /usr/share/man/man8/omavrythingd.8
 rm -rf /usr/share/omavrything /usr/share/licenses/omavrything /usr/share/doc/omavrything
-
-# The version reported by the manifest, used for the install summary.
-version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-  "$here/manifest.json" 2>/dev/null | head -n1)"
 
 # The user the shell plugin is installed for. Under sudo this is the real
 # invoker; under pkexec (the plugin bootstrap) it is $PKEXEC_UID. Running as
