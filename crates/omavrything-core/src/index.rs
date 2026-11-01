@@ -1587,20 +1587,37 @@ impl Index {
             self.map_insert(new_path.as_str(), i);
 
             // Directories (and parentless records) store their full path, which
-            // changes; files store only their basename, which does not.
+            // changes. Files store only their basename: an exact rename to a
+            // different basename must rewrite it too. A file moved to a
+            // different-depth directory also needs its depth updated.
+            let depth = new_path
+                .bytes()
+                .filter(|&b| b == b'/')
+                .count()
+                .min(u8::MAX as usize) as u8;
             if stores_full_path(&rec) {
                 let path_off = self.paths.len() as u32;
                 self.paths.extend_from_slice(new_path.as_bytes());
                 let path_len = new_path.len().min(u16::MAX as usize) as u16;
-                let depth = new_path
-                    .bytes()
-                    .filter(|&b| b == b'/')
-                    .count()
-                    .min(u8::MAX as usize) as u8;
                 let rec = &mut self.records[i as usize];
                 rec.path_off = path_off;
                 rec.path_len = path_len;
                 rec.depth = depth;
+            } else {
+                let new_bytes = new_path.as_bytes();
+                let start = new_bytes
+                    .iter()
+                    .rposition(|&b| b == b'/')
+                    .map_or(0, |p| p + 1);
+                let new_basename = &new_bytes[start..];
+                if is_exact && stored_bytes(&rec, &self.paths) != new_basename {
+                    let path_off = self.paths.len() as u32;
+                    self.paths.extend_from_slice(new_basename);
+                    let rec = &mut self.records[i as usize];
+                    rec.path_off = path_off;
+                    rec.path_len = new_basename.len().min(u16::MAX as usize) as u16;
+                }
+                self.records[i as usize].depth = depth;
             }
             if is_exact {
                 self.records[i as usize].parent = new_parent;
@@ -2368,6 +2385,26 @@ mod tests {
         // Search sees the new paths, not the old ones.
         assert_eq!(index.search("bob", 10, 0).hits.len(), 2);
         assert_eq!(index.search("sam", 10, 0).hits.len(), 0);
+    }
+
+    #[test]
+    fn rename_updates_a_files_stored_basename() {
+        let mut index = Index::new();
+        index.insert(Path::new("/home/sam"), true, 0, 0);
+        let old = index.insert(Path::new("/home/sam/old.txt"), false, 1, 0);
+
+        assert!(index.rename(
+            Path::new("/home/sam/old.txt"),
+            Path::new("/home/sam/new.txt")
+        ));
+
+        assert!(index.find(Path::new("/home/sam/old.txt")).is_none());
+        let new = index
+            .find(Path::new("/home/sam/new.txt"))
+            .expect("new path not indexed");
+        assert_eq!(new, old);
+        assert_eq!(index.path(new), "/home/sam/new.txt");
+        assert_eq!(index.name(new), "new.txt");
     }
 
     #[test]
