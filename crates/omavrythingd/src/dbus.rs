@@ -18,6 +18,7 @@ use zbus::object_server::SignalEmitter;
 use crate::config::SharedConfig;
 use crate::manager::IndexManager;
 use crate::ntfs::{self, NtfsPolicy};
+use crate::peer;
 use crate::polkit;
 use crate::volumes;
 
@@ -69,7 +70,11 @@ impl Manager {
 #[interface(name = "tech.alatcerdas.omavrything.Manager")]
 impl Manager {
     /// Daemon status: version, entries, roots, memory, scan state, uptime.
-    async fn get_status(&self) -> HashMap<String, String> {
+    async fn get_status(
+        &self,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] connection: &zbus::Connection,
+    ) -> HashMap<String, String> {
         let mut map = HashMap::new();
         map.insert("version".into(), omavrything_core::VERSION.into());
         map.insert("entries".into(), self.index.len().to_string());
@@ -137,7 +142,16 @@ impl Manager {
         // A2: the last scan's traversal failures, with a bounded path sample.
         let (scan_errors, scan_error_paths) = self.config.last_scan_errors();
         map.insert("scan_errors".into(), scan_errors.to_string());
-        map.insert("scan_error_paths".into(), scan_error_paths.join(";"));
+        // The sample can name directories inside indexed private subtrees, and
+        // the system-bus policy lets every local user call GetStatus. Reveal it
+        // only to callers that may use the search socket (root, the daemon's own
+        // uid, or a member of the socket group); everyone else gets the count.
+        let paths = if may_read_scan_error_paths(&header, connection).await {
+            scan_error_paths.join(";")
+        } else {
+            String::new()
+        };
+        map.insert("scan_error_paths".into(), paths);
         // A5: how many subtrees could not be watched (watch-limit exhaustion).
         map.insert(
             "unwatched_dirs".into(),
@@ -505,6 +519,35 @@ async fn run_rescan(
     Ok(added)
 }
 
+/// Whether the D-Bus caller may see the sampled failed-scan paths.
+///
+/// `GetStatus` is reachable by every local user on the system bus, but the path
+/// sample can name directories inside indexed private subtrees. Apply the same
+/// gate as the search socket: root, the daemon's own uid, or a member of the
+/// socket group. If the group does not exist, fail closed for other users.
+async fn may_read_scan_error_paths(
+    header: &zbus::message::Header<'_>,
+    connection: &zbus::Connection,
+) -> bool {
+    let sender = header.sender().map(|s| s.to_string()).unwrap_or_default();
+    let Ok(uid) = polkit::peer_uid(connection, &sender).await else {
+        return false;
+    };
+    tokio::task::spawn_blocking(move || {
+        // SAFETY: `geteuid` has no preconditions.
+        let daemon_uid = unsafe { libc::geteuid() };
+        let group = peer::group_gid(crate::SOCKET_GROUP);
+        may_read_scan_error_paths_for(uid, daemon_uid, group)
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// The redaction decision, split out so the security boundary can be tested.
+fn may_read_scan_error_paths_for(uid: u32, daemon_uid: u32, group: Option<libc::gid_t>) -> bool {
+    uid == 0 || uid == daemon_uid || group.is_some_and(|gid| peer::uid_in_group(uid, gid))
+}
+
 /// Authorize a control call via polkit for `action`.
 async fn authorize(
     header: &zbus::message::Header<'_>,
@@ -607,6 +650,21 @@ mod tests {
     use omavrything_core::index::{FsKind, Index};
     use std::path::Path;
     use tokio::sync::mpsc::unbounded_channel;
+
+    #[test]
+    fn scan_error_paths_are_redacted_for_unprivileged_callers() {
+        // SAFETY: `geteuid` has no preconditions.
+        let daemon_uid = unsafe { libc::geteuid() };
+        assert!(may_read_scan_error_paths_for(0, daemon_uid, None));
+        assert!(may_read_scan_error_paths_for(daemon_uid, daemon_uid, None));
+        // No group (or no membership) means an unrelated uid sees nothing.
+        let outsider = if daemon_uid == 424_242 {
+            424_243
+        } else {
+            424_242
+        };
+        assert!(!may_read_scan_error_paths_for(outsider, daemon_uid, None));
+    }
 
     #[tokio::test]
     async fn rescan_rejects_an_unknown_root() {

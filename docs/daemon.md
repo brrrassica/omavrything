@@ -187,7 +187,7 @@ Control and status are exposed on the system bus as
 
 | Method | Description |
 | --- | --- |
-| `GetStatus` | version, entries, roots, memory breakdown, scan state, errors, uptime |
+| `GetStatus` | version, entries, roots, memory breakdown, scan state, errors, uptime; the failed-scan path sample is redacted outside the search group |
 | `Rescan(root)` | rescan all roots (empty `root`) or one configured root; returns entries added |
 | `GetConfig` | the current configuration |
 | `SetConfig(key, value)` | set `excludes`, `scan_interval`, `snapshot_interval`, `evict_idle_secs`, `ntfs`, `log_level`, `background_opacity`, or `candidate_index`; changing `excludes` triggers a rescan |

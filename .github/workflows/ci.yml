@@ -23,6 +23,11 @@ env:
 # is served entirely from the runner's own disk, with no internet fetches for
 # packages, crates or toolchains.
 #
+# Target directories are scoped by event and ref. The push and pull_request runs
+# for the same commit otherwise share one CARGO_TARGET_DIR, and two concurrent
+# cargo invocations can delete an rlib the other's doctest is still linking
+# (observed as "extern location for omavrything_core does not exist").
+#
 # Toolchains are PINNED: both the `RUSTUP_TOOLCHAIN` env and the `toolchain:`
 # input below name an exact release (stable 1.99.1, nightly-2026-10-22) instead
 # of the floating `stable`/`nightly` channels. A floating channel makes rustup
@@ -64,7 +69,7 @@ jobs:
       CARGO_HOME: /ci/cache/cargo
       RUSTUP_HOME: /ci/cache/rustup
       RUSTUP_TOOLCHAIN: 1.99.1
-      CARGO_TARGET_DIR: /ci/cache/targets/${{ github.repository }}/${{ github.job }}
+      CARGO_TARGET_DIR: /ci/cache/targets/${{ github.repository }}/${{ github.job }}/${{ github.event_name }}-${{ github.ref_name }}
     steps:
       - name: Install dependencies (from the local pacman cache)
         run: |
@@ -149,7 +154,7 @@ jobs:
       CARGO_HOME: /ci/cache/cargo
       RUSTUP_HOME: /ci/cache/rustup
       RUSTUP_TOOLCHAIN: nightly-2026-10-22
-      CARGO_TARGET_DIR: /ci/cache/targets/${{ github.repository }}/${{ github.job }}
+      CARGO_TARGET_DIR: /ci/cache/targets/${{ github.repository }}/${{ github.job }}/${{ github.event_name }}-${{ github.ref_name }}
     steps:
       - name: Install dependencies (from the local pacman cache)
         run: |
@@ -244,7 +249,7 @@ jobs:
       CARGO_HOME: /ci/cache/cargo
       RUSTUP_HOME: /ci/cache/rustup
       RUSTUP_TOOLCHAIN: 1.99.1
-      CARGO_TARGET_DIR: /ci/cache/targets/${{ github.repository }}/${{ github.job }}
+      CARGO_TARGET_DIR: /ci/cache/targets/${{ github.repository }}/${{ github.job }}/${{ github.event_name }}-${{ github.ref_name }}
     needs: build
     steps:
       - name: Install dependencies (from the local pacman cache)
@@ -296,7 +301,7 @@ jobs:
       CARGO_HOME: /ci/cache/cargo
       RUSTUP_HOME: /ci/cache/rustup
       RUSTUP_TOOLCHAIN: 1.99.1
-      CARGO_TARGET_DIR: /ci/cache/targets/${{ github.repository }}/${{ github.job }}
+      CARGO_TARGET_DIR: /ci/cache/targets/${{ github.repository }}/${{ github.job }}/${{ github.event_name }}-${{ github.ref_name }}
     needs: build
     steps:
       - name: Install dependencies (from the local pacman cache)
@@ -351,7 +356,7 @@ jobs:
       CARGO_HOME: /ci/cache/cargo
       RUSTUP_HOME: /ci/cache/rustup
       RUSTUP_TOOLCHAIN: 1.99.1
-      CARGO_TARGET_DIR: /ci/cache/targets/${{ github.repository }}/${{ github.job }}
+      CARGO_TARGET_DIR: /ci/cache/targets/${{ github.repository }}/${{ github.job }}/${{ github.event_name }}-${{ github.ref_name }}
     needs: build
     steps:
       - name: Install dependencies (from the local pacman cache)

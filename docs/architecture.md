@@ -285,7 +285,7 @@ flowchart TD
 
 | Member | Kind | Description |
 | --- | --- | --- |
-| `GetStatus` | method | Version, entries, roots, memory breakdown, scan state, errors, uptime. |
+| `GetStatus` | method | Version, entries, roots, memory breakdown, scan state, errors, uptime. The failed-scan path sample is redacted for callers outside the search group. |
 | `Rescan` | method | Trigger a full or per-root rescan; returns entries added. |
 | `GetConfig` / `SetConfig` | method | Read/write runtime config. |
 | `ListRoots` | method | Indexed root paths. |
