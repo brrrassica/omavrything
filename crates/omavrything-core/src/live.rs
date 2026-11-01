@@ -256,6 +256,44 @@ mod tests {
     }
 
     #[test]
+    fn renamed_child_file_updates_the_index() {
+        // Regression: the parent directory is indexed, so the file stores only
+        // its basename and the rename must rewrite it.
+        let base = temp_dir("renamed-child");
+        let dir = base.join("dir");
+        fs::create_dir_all(&dir).unwrap();
+        let from = dir.join("old.txt");
+        let to = dir.join("new.txt");
+        fs::write(&from, b"x").unwrap();
+
+        let mut index = Index::new();
+        let config = ScanConfig::with_roots(vec![base.clone()]);
+        apply(&mut index, &FsEvent::Created(dir.clone()), &config);
+        assert!(index.find(&from).is_some());
+
+        fs::rename(&from, &to).unwrap();
+        assert!(apply(
+            &mut index,
+            &FsEvent::Renamed {
+                from: from.clone(),
+                to: to.clone()
+            },
+            &config
+        ));
+
+        let idx = index.find(&to).expect("renamed path missing");
+        assert_eq!(index.path(idx), to.to_string_lossy());
+        assert_eq!(index.name(idx), "new.txt");
+        assert!(index.find(&from).is_none());
+        assert_eq!(index.search("old.txt", 10, 0).hits.len(), 0);
+        let hits = index.search("new.txt", 10, 0).hits;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, to.to_string_lossy());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn modified_updates_size() {
         let base = temp_dir("modified");
         let file = base.join("grow.txt");

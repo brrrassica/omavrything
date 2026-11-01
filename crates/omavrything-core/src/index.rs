@@ -391,6 +391,12 @@ fn parent_bytes(path: &[u8]) -> Option<&[u8]> {
     Some(&trimmed[..pos.max(1)])
 }
 
+/// The basename bytes of `path`: the bytes after the last `/`.
+fn basename_of(path: &[u8]) -> &[u8] {
+    let start = path.iter().rposition(|&b| b == b'/').map_or(0, |p| p + 1);
+    &path[start..]
+}
+
 /// Whether a record's stored bytes are its full path (directories and
 /// parentless records) rather than a basename (files with a parent).
 fn stores_full_path(rec: &FileRecord) -> bool {
@@ -1533,19 +1539,25 @@ impl Index {
         let old_prefix_bytes = old_prefix.as_bytes();
 
         let mut buf: Vec<u8> = Vec::new();
-        let affected: Vec<u32> = self
+        // Capture each affected record's *old* full path now, before any record is
+        // rewritten. Reconstructing it inside the mutation loop would observe the
+        // already-updated ancestor paths and compute the wrong suffix.
+        let affected: Vec<(u32, Vec<u8>)> = self
             .records
             .iter()
             .enumerate()
-            .filter(|(_, rec)| {
+            .filter_map(|(i, rec)| {
                 if rec.is_deleted() {
-                    return false;
+                    return None;
                 }
                 buf.clear();
                 write_full_path_bytes(rec, &self.records, &self.paths, &mut buf);
-                buf == old_bytes || buf.starts_with(old_prefix_bytes)
+                if buf == old_bytes || buf.starts_with(old_prefix_bytes) {
+                    Some((i as u32, buf.clone()))
+                } else {
+                    None
+                }
             })
-            .map(|(i, _)| i as u32)
             .collect();
         if affected.is_empty() {
             return false;
@@ -1559,11 +1571,8 @@ impl Index {
             .and_then(|p| self.find_str(p.to_string_lossy().as_ref()))
             .unwrap_or(u32::MAX);
 
-        for i in affected {
+        for (i, old_path) in affected {
             let rec = self.records[i as usize];
-            buf.clear();
-            write_full_path_bytes(&rec, &self.records, &self.paths, &mut buf);
-            let old_path = buf.clone();
             let new_path: String = if old_path == old_bytes {
                 new_key.to_string()
             } else {
@@ -1584,44 +1593,47 @@ impl Index {
                     self.live -= 1;
                 }
             }
-            self.map_insert(new_path.as_str(), i);
 
-            // Directories (and parentless records) store their full path, which
-            // changes. Files store only their basename: an exact rename to a
-            // different basename must rewrite it too. A file moved to a
-            // different-depth directory also needs its depth updated.
+            // The storage form depends on the record's *post-rename* parent, not
+            // its old one: a file moved into or out of the indexed tree switches
+            // between a full path and a basename. Using the old form would leave
+            // the arena bytes misinterpreted by `stores_full_path`.
+            let record_parent = if is_exact { new_parent } else { rec.parent };
+            let full_path = rec.is_dir() || record_parent == u32::MAX;
+            let stored_new: &[u8] = if full_path {
+                new_path.as_bytes()
+            } else {
+                basename_of(new_path.as_bytes())
+            };
+            // The arena is append-only, so appending is safe. Rewrite when the
+            // storage form changed (the same bytes now mean something different)
+            // or when the bytes themselves changed (a file's basename, or a
+            // directory's full path).
+            let form_changed = stores_full_path(&rec) != full_path;
+            let bytes_changed = stored_bytes(&rec, &self.paths) != stored_new;
+            if form_changed || bytes_changed {
+                let path_off = self.paths.len() as u32;
+                self.paths.extend_from_slice(stored_new);
+                let path_len = stored_new.len().min(u16::MAX as usize) as u16;
+                let rec = &mut self.records[i as usize];
+                rec.path_off = path_off;
+                rec.path_len = path_len;
+            }
+            // Depth is derived from the full new path for every affected record,
+            // including files whose basename did not change but whose ancestors
+            // moved to a different depth.
             let depth = new_path
                 .bytes()
                 .filter(|&b| b == b'/')
                 .count()
                 .min(u8::MAX as usize) as u8;
-            if stores_full_path(&rec) {
-                let path_off = self.paths.len() as u32;
-                self.paths.extend_from_slice(new_path.as_bytes());
-                let path_len = new_path.len().min(u16::MAX as usize) as u16;
-                let rec = &mut self.records[i as usize];
-                rec.path_off = path_off;
-                rec.path_len = path_len;
-                rec.depth = depth;
-            } else {
-                let new_bytes = new_path.as_bytes();
-                let start = new_bytes
-                    .iter()
-                    .rposition(|&b| b == b'/')
-                    .map_or(0, |p| p + 1);
-                let new_basename = &new_bytes[start..];
-                if is_exact && stored_bytes(&rec, &self.paths) != new_basename {
-                    let path_off = self.paths.len() as u32;
-                    self.paths.extend_from_slice(new_basename);
-                    let rec = &mut self.records[i as usize];
-                    rec.path_off = path_off;
-                    rec.path_len = new_basename.len().min(u16::MAX as usize) as u16;
-                }
-                self.records[i as usize].depth = depth;
-            }
+            self.records[i as usize].depth = depth;
             if is_exact {
                 self.records[i as usize].parent = new_parent;
             }
+            // Insert the new key only after the record's bytes, parent, and depth
+            // are consistent, so the path map never observes a half-applied rename.
+            self.map_insert(new_path.as_str(), i);
 
             // The candidate index stores the full path, which changed for every
             // affected record (including files, whose basename is unchanged but
@@ -2388,26 +2400,6 @@ mod tests {
     }
 
     #[test]
-    fn rename_updates_a_files_stored_basename() {
-        let mut index = Index::new();
-        index.insert(Path::new("/home/sam"), true, 0, 0);
-        let old = index.insert(Path::new("/home/sam/old.txt"), false, 1, 0);
-
-        assert!(index.rename(
-            Path::new("/home/sam/old.txt"),
-            Path::new("/home/sam/new.txt")
-        ));
-
-        assert!(index.find(Path::new("/home/sam/old.txt")).is_none());
-        let new = index
-            .find(Path::new("/home/sam/new.txt"))
-            .expect("new path not indexed");
-        assert_eq!(new, old);
-        assert_eq!(index.path(new), "/home/sam/new.txt");
-        assert_eq!(index.name(new), "new.txt");
-    }
-
-    #[test]
     fn rename_missing_path_is_a_noop() {
         let mut index = Index::new();
         index.insert(Path::new("/a.txt"), false, 1, 0);
@@ -2458,6 +2450,128 @@ mod tests {
         let out = index.search("new.txt", 10, 0);
         assert_eq!(out.hits.len(), 1);
         assert_eq!(out.hits[0].size, 1);
+    }
+
+    #[test]
+    fn rename_file_with_indexed_parent_rewrites_the_basename() {
+        // Regression: a file with an indexed parent stores only its basename,
+        // which a direct rename changes. The arena must be rewritten too.
+        let mut index = Index::new();
+        index.insert(Path::new("/home"), true, 0, 0);
+        index.insert(Path::new("/home/sam"), true, 0, 0);
+        let old = Path::new("/home/sam/old.txt");
+        let new = Path::new("/home/sam/new.txt");
+        let idx = index.insert(old, false, 5, 0);
+        assert_eq!(index.record(idx).parent, idx_of(&index, "/home/sam"));
+
+        assert!(index.rename(old, new));
+        assert!(index.find(old).is_none());
+        assert_eq!(index.find(new), Some(idx));
+        assert_eq!(index.path(idx), "/home/sam/new.txt");
+        assert_eq!(index.name(idx), "new.txt");
+        assert_eq!(index.record(idx).depth, 3);
+
+        let hit = &index.search("new.txt", 10, 0).hits[0];
+        assert_eq!(hit.path, "/home/sam/new.txt");
+        assert_eq!(hit.name, "new.txt");
+        assert_eq!(index.search("old.txt", 10, 0).hits.len(), 0);
+
+        // The arena is persisted verbatim, so the rewrite must survive a
+        // snapshot round trip rather than resurrecting the old basename.
+        let bytes = crate::snapshot::encode(&index, &[]);
+        let (back, _) = crate::snapshot::decode(&bytes).unwrap();
+        let back_idx = back.find(new).expect("renamed path missing after decode");
+        assert_eq!(back.path(back_idx), "/home/sam/new.txt");
+        assert_eq!(back.name(back_idx), "new.txt");
+    }
+
+    #[test]
+    fn rename_file_across_depths_updates_parent_and_depth() {
+        let mut index = Index::new();
+        index.insert(Path::new("/a"), true, 0, 0);
+        index.insert(Path::new("/a/b"), true, 0, 0);
+        let old = Path::new("/a/b/f.txt");
+        let new = Path::new("/a/f.txt");
+        let idx = index.insert(old, false, 1, 0);
+        assert_eq!(index.record(idx).depth, 3);
+
+        assert!(index.rename(old, new));
+        assert!(index.find(old).is_none());
+        assert_eq!(index.find(new), Some(idx));
+        assert_eq!(index.path(idx), "/a/f.txt");
+        assert_eq!(index.record(idx).parent, idx_of(&index, "/a"));
+        assert_eq!(index.record(idx).depth, 2);
+    }
+
+    #[test]
+    fn rename_directory_updates_descendant_file_depth() {
+        // A child file's basename does not change, but its depth does when an
+        // ancestor directory moves deeper.
+        let mut index = Index::new();
+        index.insert(Path::new("/a"), true, 0, 0);
+        index.insert(Path::new("/a/b"), true, 0, 0);
+        index.insert(Path::new("/a/b/f.txt"), false, 1, 0);
+        index.insert(Path::new("/x"), true, 0, 0);
+        index.insert(Path::new("/x/y"), true, 0, 0);
+
+        assert!(index.rename(Path::new("/a/b"), Path::new("/x/y/b")));
+        assert!(index.find(Path::new("/a/b/f.txt")).is_none());
+        let f = idx_of(&index, "/x/y/b/f.txt");
+        assert_eq!(index.path(f), "/x/y/b/f.txt");
+        assert_eq!(index.record(f).depth, 4);
+    }
+
+    #[test]
+    fn rename_file_into_an_indexed_parent_switches_to_a_basename() {
+        // Inserted before its parent, the file stores its full path. The rename
+        // must switch it to basename storage because the new parent is indexed.
+        let mut index = Index::new();
+        let idx = index.insert(Path::new("/data/f.txt"), false, 1, 0);
+        assert_eq!(index.record(idx).parent, u32::MAX);
+        index.insert(Path::new("/data"), true, 0, 0);
+
+        let new = Path::new("/data/g.txt");
+        assert!(index.rename(Path::new("/data/f.txt"), new));
+        assert_eq!(index.find(new), Some(idx));
+        assert_eq!(index.path(idx), "/data/g.txt");
+        assert_eq!(index.name(idx), "g.txt");
+        assert_eq!(index.record(idx).parent, idx_of(&index, "/data"));
+    }
+
+    #[test]
+    fn rename_file_out_of_the_indexed_tree_switches_to_a_full_path() {
+        // A file with an indexed parent stores its basename; moving it under an
+        // unindexed parent must store the full path instead.
+        let mut index = Index::new();
+        index.insert(Path::new("/home"), true, 0, 0);
+        let idx = index.insert(Path::new("/home/f.txt"), false, 1, 0);
+        assert_eq!(index.record(idx).parent, idx_of(&index, "/home"));
+
+        let new = Path::new("/elsewhere/g.txt");
+        assert!(index.rename(Path::new("/home/f.txt"), new));
+        assert_eq!(index.find(new), Some(idx));
+        assert_eq!(index.path(idx), "/elsewhere/g.txt");
+        assert_eq!(index.name(idx), "g.txt");
+        assert_eq!(index.record(idx).parent, u32::MAX);
+    }
+
+    #[test]
+    fn rename_over_existing_with_indexed_parent_keeps_one_record() {
+        let mut index = Index::new();
+        index.insert(Path::new("/home/sam"), true, 0, 0);
+        let old_idx = index.insert(Path::new("/home/sam/old.txt"), false, 1, 0);
+        index.insert(Path::new("/home/sam/new.txt"), false, 2, 0);
+
+        assert!(index.rename(
+            Path::new("/home/sam/old.txt"),
+            Path::new("/home/sam/new.txt")
+        ));
+        assert_eq!(index.len(), 2); // the parent directory plus one file
+        let idx = index.find(Path::new("/home/sam/new.txt")).unwrap();
+        assert_eq!(idx, old_idx);
+        assert_eq!(index.path(idx), "/home/sam/new.txt");
+        assert_eq!(index.name(idx), "new.txt");
+        assert_eq!(index.record(idx).size, 1);
     }
 
     #[test]

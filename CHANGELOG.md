@@ -4,6 +4,25 @@ Notable changes to `omavrything`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`Index::rename` now rewrites a file's stored basename when its parent
+  directory is indexed.** A direct file rename previously updated `by_path` and
+  the candidate index but left the record arena holding the old basename, so
+  `find(new)` and `find(old)` both returned `None`, search hits reported the old
+  path, later `Modified` events were dropped, a second rename could duplicate the
+  record, and the stale name survived snapshot round trips and compaction. Rename
+  now also chooses full-path vs basename storage from the post-rename parent, so
+  moves into or out of the indexed tree stay consistent.
+- **Directory renames now capture each descendant's old path before mutating the
+  tree.** Reconstructing it inside the mutation loop observed the already-moved
+  ancestor and computed the wrong suffix whenever the old and new prefixes
+  differed in length.
+- **Rename now recomputes `depth` for every affected record**, including files
+  whose basename did not change but whose ancestors moved to a different depth.
+
 ## [0.2.1] — 2026-10-25
 
 The standard-installation release. `omarchy plugin add <url> --enable` now yields
