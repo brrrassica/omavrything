@@ -35,6 +35,15 @@ Notable changes to `omavrything`. The format follows
 
 ### Changed
 
+- **The release archive is now reproducible.** `scripts/package-release.sh`
+  normalises entry timestamps (fixed ZIP epoch, UTC), modes (fixed umask),
+  ownership (no extra fields), and entry order (sorted), and refuses to publish
+  an archive that is not byte-identical when the staging tree is zipped twice.
+  Previously `zip -qr` recorded each file's staging mtime (always "now") and the
+  filesystem's traversal order, so a digest pinned from one build did not match
+  the archive built for the release — which broke `fetch-daemon.sh`'s pinned
+  verification. A rebuild from the same tree now yields the same SHA-256, so the
+  digest committed in `scripts/daemon-checksums.txt` matches the uploaded asset.
 - **Version bumped to `0.2.2`.** The shell plugin manifest, the workspace, the
   AUR `PKGBUILD`, and the man page are updated to match.
 - **CI now isolates each run's cargo target directory by event and ref.** A push

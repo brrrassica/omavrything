@@ -15,6 +15,9 @@
 # release can be assembled before a tag is pushed. --no-build reuses the
 # existing bin/ binaries instead of rebuilding.
 set -euo pipefail
+# A fixed umask keeps the staged directory/file modes identical across runs, so
+# the modes recorded in the archive do not depend on the builder's environment.
+umask 022
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$here"
@@ -147,13 +150,45 @@ EOF
 
 # Zip the staging directory. The archive contains a single top-level directory
 # named after the release so it extracts cleanly.
+#
+# The archive is built deterministically, so the digest pinned in
+# scripts/daemon-checksums.txt can be reproduced by rebuilding the same tree.
+# Without this, `zip` records each file's staging mtime (which is "now") and the
+# traversal order of the filesystem, so two builds of identical sources produce
+# different archives and a digest pinned from one build is meaningless for the
+# other. Deterministic means:
+#
+#   * a fixed timestamp (the earliest the ZIP format can represent) for every
+#     entry, set with TZ=UTC so the DOS time conversion is stable;
+#   * a fixed umask (above) for the staged modes;
+#   * entries fed to zip in LC_ALL=C sorted order via `-@`, instead of whatever
+#     order readdir() returns;
+#   * `-X` to drop the extra fields that carry uid/gid, device numbers, and
+#     sub-second timestamps.
+#
+# This makes the archive reproducible on a given toolchain. The release workflow
+# still publishes the exact file it built and pins that file's digest, so the
+# pin and the downloaded asset can never diverge.
 rm -f "$archive"
-if command -v zip >/dev/null 2>&1; then
-  (cd "$dist" && zip -qr "$name.zip" "$name")
-else
+if ! command -v zip >/dev/null 2>&1; then
   echo "error: 'zip' is required to build the release archive" >&2
   exit 1
 fi
+find "$stage" -exec touch -h -d '1980-01-01 00:00:00 UTC' {} +
+( cd "$dist" && find "$name" -print | LC_ALL=C sort | TZ=UTC zip -X -q "$name.zip" -@ )
+
+# Fail loudly if the archive is not reproducible: rebuilding the same staging
+# tree must produce the same bytes. This catches a non-deterministic input
+# (e.g. a generated file carrying a timestamp) before the digest is published.
+repro="$dist/$name.zip.repro"
+( cd "$dist" && find "$name" -print | LC_ALL=C sort | TZ=UTC zip -X -q "$(basename "$repro")" -@ )
+if ! cmp -s "$archive" "$repro"; then
+  echo "error: release archive is not reproducible" >&2
+  echo "       two builds of the same staging tree produced different zip files" >&2
+  rm -f "$repro"
+  exit 1
+fi
+rm -f "$repro"
 
 # The .sha256 asset published alongside the archive, for manual verification.
 # The plugin bootstrap does NOT trust it: it verifies against the digest pinned
