@@ -4,6 +4,45 @@ Notable changes to `omavrything`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] — 2026-11-01
+
+### Security
+
+- **`GetStatus` no longer discloses failed-scan pathnames to unprivileged local
+  users.** The method returns a bounded sample of directories whose traversal
+  failed. Because the system-bus policy lets every local user call `GetStatus`,
+  a user outside the `omavrything` search group could learn up to 32 pathnames
+  inside an indexed private subtree when such a subtree had a traversal failure.
+  The path sample is now redacted (the `scan_errors` count remains available)
+  unless the caller is root, the daemon itself, or a member of the search group.
+
+### Fixed
+
+- **`Index::rename` now rewrites a file's stored basename when its parent
+  directory is indexed.** A direct file rename previously updated `by_path` and
+  the candidate index but left the record arena holding the old basename, so
+  `find(new)` and `find(old)` both returned `None`, search hits reported the old
+  path, later `Modified` events were dropped, a second rename could duplicate the
+  record, and the stale name survived snapshot round trips and compaction. Rename
+  now also chooses full-path vs basename storage from the post-rename parent, so
+  moves into or out of the indexed tree stay consistent.
+- **Directory renames now capture each descendant's old path before mutating the
+  tree.** Reconstructing it inside the mutation loop observed the already-moved
+  ancestor and computed the wrong suffix whenever the old and new prefixes
+  differed in length.
+- **Rename now recomputes `depth` for every affected record**, including files
+  whose basename did not change but whose ancestors moved to a different depth.
+
+### Changed
+
+- **Version bumped to `0.2.2`.** The shell plugin manifest, the workspace, the
+  AUR `PKGBUILD`, and the man page are updated to match.
+- **CI now isolates each run's cargo target directory by event and ref.** A push
+  run and the pull-request run for the same commit previously shared one
+  `CARGO_TARGET_DIR`; two concurrent cargo invocations could then delete an
+  rlib that the other's doctest was still linking, failing the release test
+  with `extern location for omavrything_core does not exist`.
+
 ## [0.2.1] — 2026-10-25
 
 The standard-installation release. `omarchy plugin add <url> --enable` now yields

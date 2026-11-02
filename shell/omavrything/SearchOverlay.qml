@@ -64,6 +64,18 @@ Item {
   property var settings: ({})
   property string configCommand: "omavry"
 
+  // Versions shown at the bottom-right of the settings page: the installed
+  // plugin version (from the manifest the shell loaded) and the running
+  // daemon's version (reported by `omavry status`).
+  readonly property string pluginVersion: (root.manifest && root.manifest.version)
+    ? String(root.manifest.version) : ""
+  property string daemonVersion: ""
+  readonly property string versionLabel: {
+    var plugin = root.pluginVersion !== "" ? "v" + root.pluginVersion : "unknown"
+    var daemon = root.daemonVersion !== "" ? "v" + root.daemonVersion : "unavailable"
+    return "Plugin " + plugin + "  ·  Daemon " + daemon
+  }
+
   // Detected block volumes and their indexing status, shown at the bottom of
   // the settings panel. Refreshed while the panel is open so a mount/index
   // transition is visible without reopening it.
@@ -196,7 +208,9 @@ Item {
     root.settingsOpen = true
     root.settingsError = ""
     root.volumesError = ""
+    root.daemonVersion = ""
     configGetProc.running = true
+    daemonVersionProc.running = true
     root.refreshVolumes()
   }
 
@@ -243,6 +257,17 @@ Item {
     root.settings = parsed
     var opacity = Number(parsed.background_opacity)
     if (!isNaN(opacity) && opacity > 0) root.backgroundOpacity = opacity
+  }
+
+  // Parse `omavry status --json` and pick out the daemon version.
+  function applyDaemonVersion(text) {
+    var parsed
+    try { parsed = JSON.parse(text) } catch (e) { root.daemonVersion = ""; return }
+    if (!parsed || typeof parsed !== "object" || parsed.version === undefined) {
+      root.daemonVersion = ""
+      return
+    }
+    root.daemonVersion = String(parsed.version)
   }
 
   // Persist one setting through the daemon (polkit-gated D-Bus SetConfig).
@@ -523,6 +548,20 @@ Item {
     }
     onExited: function(exitCode) {
       if (exitCode !== 0) root.settingsError = "Daemon unavailable"
+    }
+  }
+
+  // Read the running daemon's version for the settings-page footer. GetStatus is
+  // readable by every local user, so this does not require polkit.
+  Process {
+    id: daemonVersionProc
+    command: [root.configCommand, "status", "--json"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.applyDaemonVersion(text)
+    }
+    onExited: function(exitCode) {
+      if (exitCode !== 0) root.daemonVersion = ""
     }
   }
 
@@ -1441,7 +1480,29 @@ Item {
               font.pixelSize: Style.font.bodySmall
               wrapMode: Text.WordWrap
             }
+
+            // Leave room for the pinned version footer so the last row can
+            // scroll clear of it.
+            Item {
+              width: parent.width
+              height: root.rowHeight
             }
+            }
+          }
+
+          // Version footer: the installed plugin version and the running
+          // daemon version, pinned to the bottom-right of the settings page.
+          Text {
+            anchors.right: parent.right
+            anchors.bottom: parent.bottom
+            anchors.margins: Style.space(6)
+            visible: root.settingsOpen
+            text: root.versionLabel
+            textFormat: Text.PlainText
+            color: root.foreground
+            opacity: 0.5
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
           }
         }
       }

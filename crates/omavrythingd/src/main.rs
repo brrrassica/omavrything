@@ -75,7 +75,7 @@ const DEFAULT_SNAPSHOT_INTERVAL: u64 = 300;
 /// steps.
 const EVICT_IDLE_SECS: u64 = 0;
 /// The group that may use the system socket.
-const SOCKET_GROUP: &str = "omavrything";
+pub(crate) const SOCKET_GROUP: &str = "omavrything";
 
 /// Serializes snapshot writes between the periodic writer and the shutdown
 /// handler, which share a fixed temp path.
