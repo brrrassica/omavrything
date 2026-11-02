@@ -4,6 +4,29 @@ Notable changes to `omavrything`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] — 2026-11-02
+
+### Security
+
+- **A same-version rebuild now reaches existing installations.** 0.2.2 shipped
+  two different daemon builds under the same version string: an earlier build
+  that disclosed failed-scan pathnames to unprivileged callers, and the fixed
+  build. `scripts/bootstrap.sh` skipped installation when
+  `omavrythingd --version` matched the manifest, so an installation made from the
+  earlier 0.2.2 build kept the vulnerable daemon after the plugin updated, and
+  `--force` did not help because it only bypassed the dismissal marker. The
+  version is bumped to `0.2.3` so the installed daemon no longer matches the
+  plugin, and `--force` now bypasses the already-installed shortcut so a
+  same-version rebuild can always be reinstalled. See the 0.2.2 `GetStatus`
+  redaction entry below for the underlying fix.
+
+### Changed
+
+- **Version bumped to `0.2.3`.** The shell plugin manifest, the workspace,
+  `Cargo.lock`, the AUR `PKGBUILD`, the man page, and the docs are updated to
+  match. Release artifacts for `0.2.3` still need to be built and pinned in
+  `scripts/daemon-checksums.txt` before the plugin can fetch them.
+
 ## [0.2.2] — 2026-11-01
 
 ### Security

@@ -54,13 +54,19 @@ manifest_version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/
 # never reach an existing daemon, because the old binary alone would satisfy the
 # marker. An outdated install falls through to the fetch + install below, which
 # is idempotent and restarts the daemon on the new binary.
+#
+# The version string is a coarse identity: two different builds of the same
+# version report the same number, so a rebuilt security fix can go undetected.
+# `--force` therefore bypasses this shortcut (not just the dismissal marker) and
+# reinstalls unconditionally, which is the recovery path for a same-version
+# rebuild. The plugin still bumps its manifest version for ordinary upgrades.
 installed_version=""
 if [[ -x "$DAEMON" ]]; then
   installed_version="$("$DAEMON" --version 2>/dev/null | awk '{print $2}' | head -n1 || true)"
 fi
 if [[ -x "$DAEMON" ]] || [[ -S "$SOCKET" ]]; then
-  if [[ -n "$manifest_version" && "$installed_version" == "$manifest_version" ]]; then
-    log "omavrythingd $installed_version is already installed"
+  if [[ "$force" == 0 && -n "$manifest_version" && "$installed_version" == "$manifest_version" ]]; then
+    log "omavrythingd $installed_version is already installed (use --force to reinstall)"
     exit 0
   fi
   log "omavrythingd ${installed_version:-unknown} differs from plugin ${manifest_version:-unknown}; updating"
