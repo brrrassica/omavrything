@@ -23,6 +23,13 @@ when prompted**. The daemon, the `omavrything` user/group, the systemd service,
 and the D-Bus/polkit policy are installed and started for you — no terminal and
 no manual command. Then bind a hotkey (§4).
 
+The bootstrap compares the installed daemon's `--version` with the plugin
+manifest. After a plugin update it re-runs the installer for the new version
+instead of treating the old binary as "already installed", so a security fix in
+the reviewed source reaches existing installations without a manual step. The
+checksum pins in `scripts/daemon-checksums.txt` must include the new version, or
+the fetch and installer refuse to proceed.
+
 The manual `sudo scripts/install.sh` path (§6) remains for **headless or offline**
 installs: a machine with no polkit agent, or one that cannot reach the release
 assets. It does the same work from a local build or a release archive.

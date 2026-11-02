@@ -32,9 +32,27 @@ Notable changes to `omavrything`. The format follows
   differed in length.
 - **Rename now recomputes `depth` for every affected record**, including files
   whose basename did not change but whose ancestors moved to a different depth.
+- **Delta folding no longer resurrects tombstoned inserts.** When the index was
+  evicted, a path created and then removed before the delta was folded was only
+  flagged `FLAG_DELETED` by `DeltaIndex::remove_path`; `Index::apply_delta`
+  ignored the flag and re-inserted every delta record through
+  `insert_with_flags`, which rebuilds the flags and loses the tombstone. The
+  path then appeared in search results until a rescan. The fold now skips
+  deleted delta records, and `DeltaIndex::len`/`is_empty` ignore them so a delta
+  holding only dead inserts neither counts toward the fold threshold nor keeps
+  `has_pending_delta` true.
 
 ### Changed
 
+- **The release archive is now reproducible.** `scripts/package-release.sh`
+  normalises entry timestamps (fixed ZIP epoch, UTC), modes (fixed umask),
+  ownership (no extra fields), and entry order (sorted), and refuses to publish
+  an archive that is not byte-identical when the staging tree is zipped twice.
+  Previously `zip -qr` recorded each file's staging mtime (always "now") and the
+  filesystem's traversal order, so a digest pinned from one build did not match
+  the archive built for the release — which broke `fetch-daemon.sh`'s pinned
+  verification. A rebuild from the same tree now yields the same SHA-256, so the
+  digest committed in `scripts/daemon-checksums.txt` matches the uploaded asset.
 - **Version bumped to `0.2.2`.** The shell plugin manifest, the workspace, the
   AUR `PKGBUILD`, and the man page are updated to match.
 - **CI now isolates each run's cargo target directory by event and ref.** A push

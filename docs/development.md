@@ -31,6 +31,11 @@ jobs:
   hermetic p50/p95 and cold-scan throughput against the performance budgets.
 - **package** — builds the release archive with `scripts/package-release.sh` and
   uploads it as a build artifact, so a broken release is caught before a tag.
+  The archive is reproducible: `package-release.sh` normalises entry timestamps,
+  modes, ownership, and ordering (and self-checks by zipping the staging tree
+  twice), so two builds of the same tree have the same SHA-256. This is what
+  makes a digest pinned in `scripts/daemon-checksums.txt` meaningful for the
+  published asset instead of only for the machine that happened to build it.
 
 Pushing a `v*` tag runs
 [`.github/workflows/release.yml`](../.github/workflows/release.yml), which builds
