@@ -1257,6 +1257,13 @@ impl Index {
             }
         }
         for rec in delta.records() {
+            // A path created and then removed before the fold is tombstoned by
+            // `DeltaIndex::remove_path`; re-inserting it here would resurrect a
+            // path that no longer exists, because `insert_with_flags` rebuilds
+            // the flags and drops the tombstone.
+            if rec.is_deleted() {
+                continue;
+            }
             let bytes = stored_bytes(rec, delta.paths());
             let path = Path::new(std::str::from_utf8(bytes).unwrap_or(""));
             if let Some(existing) = self.find(path) {
@@ -2005,6 +2012,11 @@ pub struct DeltaIndex {
     /// Full path -> index into `records`, so a repeated insert of the same path
     /// replaces the earlier one instead of appending a duplicate.
     index: HashMap<Box<str>, u32>,
+    /// Number of `records` entries tombstoned by [`DeltaIndex::remove_path`].
+    /// Tracked so `len`/`is_empty` stay O(1) and a delta that holds only dead
+    /// inserts is treated as empty: it is not scanned, and it does not count
+    /// toward the delta-fold threshold.
+    tombstones: usize,
 }
 
 impl DeltaIndex {
@@ -2025,6 +2037,10 @@ impl DeltaIndex {
         // Replace an existing insert for the same path in place.
         if let Some(&i) = self.index.get(path_str.as_ref()) {
             let rec = &mut self.records[i as usize];
+            if rec.is_deleted() {
+                // Re-inserting a path that was tombstoned makes it live again.
+                self.tombstones -= 1;
+            }
             rec.size = size_to_u32(size);
             rec.mtime = mtime_to_u32(mtime);
             rec.flags = flags;
@@ -2059,10 +2075,18 @@ impl DeltaIndex {
 
     /// Drop a pending insert for `path`, if any. Used when a path created while
     /// evicted is removed again before the delta is folded.
+    ///
+    /// The record is kept (the arena is append-only) and flagged
+    /// [`FLAG_DELETED`]. [`Index::apply_delta`] skips it, and `len`/`is_empty`
+    /// do not count it.
     pub fn remove_path(&mut self, path: &Path) {
         let key = path.to_string_lossy();
         if let Some(i) = self.index.remove(key.as_ref()) {
-            self.records[i as usize].flags |= FLAG_DELETED;
+            let rec = &mut self.records[i as usize];
+            if !rec.is_deleted() {
+                rec.flags |= FLAG_DELETED;
+                self.tombstones += 1;
+            }
         }
     }
 
@@ -2071,13 +2095,14 @@ impl DeltaIndex {
         self.index.contains_key(path.to_string_lossy().as_ref())
     }
 
-    /// The number of pending changes (inserts + removes).
+    /// The number of pending changes (live inserts + removes). Tombstoned
+    /// inserts are not counted: they no longer describe a live path.
     pub fn len(&self) -> usize {
-        self.records.len() + self.removes.len()
+        self.records.len().saturating_sub(self.tombstones) + self.removes.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.records.is_empty() && self.removes.is_empty()
+        self.records.len() == self.tombstones && self.removes.is_empty()
     }
 
     /// Drop every pending change.
@@ -2086,9 +2111,13 @@ impl DeltaIndex {
         self.paths.clear();
         self.removes.clear();
         self.index.clear();
+        self.tombstones = 0;
     }
 
     /// The inserted records (each storing its full path).
+    ///
+    /// This includes tombstoned entries; callers that materialize hits must
+    /// skip records where [`FileRecord::is_deleted`] is true.
     pub fn records(&self) -> &[FileRecord] {
         &self.records
     }
@@ -3103,6 +3132,85 @@ mod tests {
         assert!(index.find(Path::new("/c.txt")).is_some());
         // Live: the root, /b.txt, and /c.txt.
         assert_eq!(index.len(), 3);
+    }
+
+    #[test]
+    fn apply_delta_skips_tombstoned_inserts() {
+        // A path created and removed before the fold must not be resurrected
+        // (the bug: `insert_with_flags` rebuilt the flags and lost the
+        // tombstone, leaving a search hit for a nonexistent path).
+        let mut index = Index::new();
+        index.add_root(Path::new("/"), FsKind::Other);
+        index.insert(Path::new("/keep.txt"), false, 1, 0);
+
+        let mut delta = DeltaIndex::new();
+        delta.insert(
+            Path::new("/tmp/omavry-created-then-deleted.txt"),
+            false,
+            false,
+            9,
+            0,
+        );
+        delta.remove_path(Path::new("/tmp/omavry-created-then-deleted.txt"));
+        assert!(delta.is_empty(), "only a dead insert is pending");
+
+        index.apply_delta(&delta);
+
+        assert!(
+            index
+                .find(Path::new("/tmp/omavry-created-then-deleted.txt"))
+                .is_none()
+        );
+        assert_eq!(
+            index.search("created-then-deleted", 10, 0).hits.len(),
+            0,
+            "the tombstoned path must not be searchable"
+        );
+        // Live: the root and /keep.txt.
+        assert_eq!(index.len(), 2);
+    }
+
+    #[test]
+    fn delta_len_ignores_tombstoned_inserts() {
+        let mut delta = DeltaIndex::new();
+        delta.insert(Path::new("/a.txt"), false, false, 1, 0);
+        delta.insert(Path::new("/b.txt"), false, false, 2, 0);
+        assert_eq!(delta.len(), 2);
+        assert!(!delta.is_empty());
+
+        delta.remove_path(Path::new("/a.txt"));
+        assert_eq!(delta.len(), 1, "a dead insert must not count");
+        assert!(!delta.is_empty());
+
+        delta.remove_path(Path::new("/b.txt"));
+        assert_eq!(delta.len(), 0);
+        assert!(delta.is_empty());
+
+        // Re-inserting a tombstoned path makes it live again and counts once.
+        delta.insert(Path::new("/a.txt"), false, false, 3, 1);
+        assert_eq!(delta.len(), 1);
+        assert!(!delta.is_empty());
+        let live = delta.records().iter().filter(|r| !r.is_deleted()).count();
+        assert_eq!(live, 1);
+        let rec = delta.records().iter().find(|r| !r.is_deleted()).unwrap();
+        assert_eq!(rec.size, 3);
+    }
+
+    #[test]
+    fn delta_search_skips_tombstoned_inserts() {
+        let mut base = Index::new();
+        base.add_root(Path::new("/"), FsKind::Other);
+        base.insert(Path::new("/keep.txt"), false, 1, 0);
+        let bytes = crate::snapshot::encode(&base, &[]);
+        let image = crate::snapshot::IndexImage::from_bytes(&bytes).unwrap();
+
+        let mut delta = DeltaIndex::new();
+        delta.insert(Path::new("/tmp/ghost.txt"), false, false, 5, 0);
+        delta.remove_path(Path::new("/tmp/ghost.txt"));
+
+        let got = search_image_with_delta(image.records(), image.paths(), &delta, "ghost", 10, 0);
+        assert_eq!(got.total, 0);
+        assert!(got.hits.is_empty());
     }
 
     #[test]

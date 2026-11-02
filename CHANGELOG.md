@@ -32,6 +32,15 @@ Notable changes to `omavrything`. The format follows
   differed in length.
 - **Rename now recomputes `depth` for every affected record**, including files
   whose basename did not change but whose ancestors moved to a different depth.
+- **Delta folding no longer resurrects tombstoned inserts.** When the index was
+  evicted, a path created and then removed before the delta was folded was only
+  flagged `FLAG_DELETED` by `DeltaIndex::remove_path`; `Index::apply_delta`
+  ignored the flag and re-inserted every delta record through
+  `insert_with_flags`, which rebuilds the flags and loses the tombstone. The
+  path then appeared in search results until a rescan. The fold now skips
+  deleted delta records, and `DeltaIndex::len`/`is_empty` ignore them so a delta
+  holding only dead inserts neither counts toward the fold threshold nor keeps
+  `has_pending_delta` true.
 
 ### Changed
 
