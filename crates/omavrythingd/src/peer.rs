@@ -42,36 +42,94 @@ pub fn peer_cred(stream: &UnixStream) -> Option<PeerCred> {
 }
 
 /// The gid of a named group, if it exists.
+///
+/// Uses the reentrant `getgrnam_r`: the non-reentrant `getgrnam` returns a
+/// pointer into shared static storage, so concurrent lookups (the D-Bus
+/// `GetStatus` path runs on a multi-threaded runtime) could observe another
+/// caller's group entry.
 pub fn group_gid(name: &str) -> Option<libc::gid_t> {
     let c = CString::new(name).ok()?;
-    // SAFETY: `c` is a valid NUL-terminated string.
-    let grp = unsafe { libc::getgrnam(c.as_ptr()) };
-    if grp.is_null() {
-        None
-    } else {
-        // SAFETY: `grp` is non-null and points to a valid group entry.
-        Some(unsafe { (*grp).gr_gid })
+    let mut buf = vec![0 as libc::c_char; 1024];
+    loop {
+        let mut grp: libc::group = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::group = std::ptr::null_mut();
+        // SAFETY: `c` is NUL-terminated, `grp` and `buf` are valid, and
+        // `result` receives a pointer into `buf` or null.
+        let rc = unsafe {
+            libc::getgrnam_r(
+                c.as_ptr(),
+                &mut grp,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE {
+            // Buffer too small: grow (bounded) and retry.
+            if buf.len() >= 1 << 20 {
+                return None;
+            }
+            buf.resize(buf.len() * 2, 0);
+            continue;
+        }
+        if rc != 0 || result.is_null() {
+            return None;
+        }
+        // SAFETY: `result` points at `grp`, which `getgrnam_r` initialized.
+        return Some(unsafe { (*result).gr_gid });
+    }
+}
+
+/// Look up a passwd entry by uid using the reentrant `getpwuid_r`.
+///
+/// Returns the primary gid and the user name as owned data, so nothing points
+/// into shared or soon-to-be-freed storage. This replaces `getpwuid`, whose
+/// static entry is overwritten by every concurrent lookup.
+fn lookup_passwd(uid: libc::uid_t) -> Option<(libc::gid_t, CString)> {
+    let mut buf = vec![0 as libc::c_char; 1024];
+    loop {
+        let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: `pw` and `buf` are valid, and `result` receives a pointer
+        // into `buf` or null.
+        let rc =
+            unsafe { libc::getpwuid_r(uid, &mut pw, buf.as_mut_ptr(), buf.len(), &mut result) };
+        if rc == libc::ERANGE {
+            // Buffer too small: grow (bounded) and retry.
+            if buf.len() >= 1 << 20 {
+                return None;
+            }
+            buf.resize(buf.len() * 2, 0);
+            continue;
+        }
+        if rc != 0 || result.is_null() {
+            return None;
+        }
+        let gid = unsafe { (*result).pw_gid };
+        let name_ptr = unsafe { (*result).pw_name };
+        if name_ptr.is_null() {
+            return None;
+        }
+        // SAFETY: `pw_name` is a valid NUL-terminated string in `buf`.
+        let name = unsafe { CStr::from_ptr(name_ptr) };
+        return Some((gid, CString::new(name.to_bytes()).ok()?));
     }
 }
 
 /// Whether `uid` is a member of `gid` (primary or supplementary).
 pub fn uid_in_group(uid: libc::uid_t, gid: libc::gid_t) -> bool {
-    // SAFETY: `getpwuid` returns a pointer to a static entry or null.
-    let pw = unsafe { libc::getpwuid(uid) };
-    if pw.is_null() {
+    let Some((primary, name)) = lookup_passwd(uid) else {
         return false;
-    }
-    // SAFETY: `pw` is non-null.
-    let primary = unsafe { (*pw).pw_gid };
+    };
     if primary == gid {
         return true;
     }
-    // SAFETY: `pw_name` is a valid NUL-terminated string.
-    let name = unsafe { CStr::from_ptr((*pw).pw_name) };
 
     let mut groups = vec![0 as libc::gid_t; 32];
     let mut ngroups = groups.len() as libc::c_int;
-    // SAFETY: `groups` has `ngroups` elements.
+    // SAFETY: `name` is NUL-terminated and `groups` has `ngroups` elements.
+    // `getgrouplist` is MT-Safe; only the name lookup above needed the
+    // reentrant form.
     let rc =
         unsafe { libc::getgrouplist(name.as_ptr(), primary, groups.as_mut_ptr(), &mut ngroups) };
     if rc < 0 {
@@ -116,6 +174,34 @@ mod tests {
     #[test]
     fn root_is_in_the_root_group() {
         assert!(uid_in_group(0, 0));
+    }
+
+    #[test]
+    fn unknown_uid_is_not_in_the_root_group() {
+        // A uid that `getpwuid_r` cannot resolve must fail closed, not read
+        // another entry left over from a concurrent lookup.
+        assert!(!uid_in_group(u32::MAX, 0));
+    }
+
+    #[test]
+    fn concurrent_user_and_group_lookups_do_not_cross_talk() {
+        // Regression guard for the reentrancy fix: many threads resolve the
+        // same and different accounts/groups at once. With the old
+        // `getpwuid`/`getgrnam` static buffers this raced; with the reentrant
+        // forms each result is independent.
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            handles.push(std::thread::spawn(|| {
+                for _ in 0..200 {
+                    assert!(uid_in_group(0, 0));
+                    assert_eq!(group_gid("root"), Some(0));
+                    assert!(!uid_in_group(u32::MAX, 0));
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("lookup thread panicked");
+        }
     }
 
     #[test]

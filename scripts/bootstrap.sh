@@ -41,17 +41,39 @@ for arg in "$@"; do
   esac
 done
 
+# The version this plugin ships. Read it from the manifest so the installed
+# daemon can be compared against it.
+manifest_version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+  "$here/manifest.json" 2>/dev/null | head -n1)"
+[[ -n "$manifest_version" ]] ||
+  warn "could not read the version from manifest.json; treating any install as outdated"
+
 # Already installed? The binary is the install marker; the socket is the search
-# path. Either is enough to consider the system install present.
+# path. An install only counts as up to date when its daemon reports the same
+# version as this plugin: otherwise a security fix in the reviewed source would
+# never reach an existing daemon, because the old binary alone would satisfy the
+# marker. An outdated install falls through to the fetch + install below, which
+# is idempotent and restarts the daemon on the new binary.
+installed_version=""
+if [[ -x "$DAEMON" ]]; then
+  installed_version="$("$DAEMON" --version 2>/dev/null | awk '{print $2}' | head -n1 || true)"
+fi
 if [[ -x "$DAEMON" ]] || [[ -S "$SOCKET" ]]; then
-  log "omavrythingd is already installed"
-  exit 0
+  if [[ -n "$manifest_version" && "$installed_version" == "$manifest_version" ]]; then
+    log "omavrythingd $installed_version is already installed"
+    exit 0
+  fi
+  log "omavrythingd ${installed_version:-unknown} differs from plugin ${manifest_version:-unknown}; updating"
 fi
 
-# A previous dismissal: do not nag on every shell restart. The user can retry
-# with `omarchy-shell tech.alatcerdas.omavrything setup` (which passes --force).
-if [[ "$force" == 0 && -e "$DISMISSED_MARKER" ]]; then
-  log "system setup was previously dismissed; run 'omarchy-shell tech.alatcerdas.omavrything setup' to retry"
+# A previous dismissal: do not nag on every shell restart. The marker records
+# the version it dismissed, so a later plugin version (e.g. a security fix) can
+# prompt once more while repeated restarts on the same version stay quiet. The
+# user can always retry with `omarchy-shell tech.alatcerdas.omavrything setup`
+# (which passes --force).
+if [[ "$force" == 0 && "$manifest_version" != "" && -e "$DISMISSED_MARKER" ]] &&
+  [[ "$(cat "$DISMISSED_MARKER" 2>/dev/null || true)" == "$manifest_version" ]]; then
+  log "system setup for $manifest_version was previously dismissed; run 'omarchy-shell tech.alatcerdas.omavrything setup' to retry"
   exit 0
 fi
 
@@ -105,7 +127,8 @@ case "$rc" in
     ;;
   126)
     mkdir -p "$CACHE_DIR"
-    : >"$DISMISSED_MARKER"
+    # Record which version was dismissed so a later version can prompt again.
+    printf '%s\n' "$manifest_version" >"$DISMISSED_MARKER"
     warn "authentication was dismissed; run 'omarchy-shell tech.alatcerdas.omavrything setup' to retry"
     ;;
   127)
