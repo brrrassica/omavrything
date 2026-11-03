@@ -20,6 +20,25 @@ Notable changes to `omavrything`. The format follows
   same-version rebuild can always be reinstalled. See the 0.2.2 `GetStatus`
   redaction entry below for the underlying fix.
 
+### Fixed
+
+- **Live filesystem events now honor exclude globs.** `live::apply` and
+  `apply_delta` previously inserted created and renamed-in paths without
+  consulting `ScanConfig::excludes`, so an excluded file or a `.git` directory
+  stayed searchable until the next rescan. Created, modified, and rename
+  destinations are now pruned, and a rename into an excluded subtree drops the
+  source record (issue #32).
+- **A cold scan with multiple roots now computes every root's descendant range.**
+  All roots were bulk-inserted before any walk entry, so the candidate index's
+  incremental stack closed each root but the last at the next root's index; a
+  query matching a root name then returned only the root record. Subtree ranges
+  are now recomputed from the parent links after each batch insert (issue #30).
+- **Candidate queries now match path components above a configured root.** The
+  bulk build posted only basenames, so a term present only in an ancestor of the
+  root had no posting and the candidate scan returned zero results while the
+  linear scan matched the root and its descendants. A root now posts its full
+  lowercased path at both trigram levels (issue #31).
+
 ### Changed
 
 - **Version bumped to `0.2.3`.** The shell plugin manifest, the workspace,

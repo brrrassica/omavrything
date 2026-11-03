@@ -1155,4 +1155,71 @@ mod tests {
 
         let _ = fs::remove_dir_all(&base);
     }
+
+    #[test]
+    fn cold_scan_multi_root_root_name_matches_its_descendants() {
+        // Regression (issue #30): roots are bulk-inserted as one block before
+        // the walk entries, so `push_subtree` closed every root but the last at
+        // the next root's index. A root-name query then returned the root alone.
+        let base = temp_dir("scan-multi-root");
+        let alpha = base.join("alpha");
+        let beta = base.join("beta");
+        fs::create_dir_all(alpha.join("inner")).unwrap();
+        fs::create_dir_all(beta.join("inner")).unwrap();
+        fs::write(alpha.join("inner/report.txt"), b"a").unwrap();
+        fs::write(beta.join("inner/report.txt"), b"b").unwrap();
+
+        let config = ScanConfig::with_roots(vec![alpha, beta]);
+        let (mut index, _) = scan(&config);
+
+        for term in ["alpha", "beta"] {
+            let enabled = index.search(term, 100, 0);
+            index.set_candidate_enabled(false);
+            let disabled = index.search(term, 100, 0);
+            index.set_candidate_enabled(true);
+            assert_eq!(
+                enabled.total, 3,
+                "root plus its two descendants should match {term:?}: {:?}",
+                enabled.hits
+            );
+            assert_eq!(
+                enabled.total, disabled.total,
+                "candidate and linear scans must agree for {term:?}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn cold_scan_matches_a_path_component_above_the_root() {
+        // Regression (issue #31): the bulk build posted only each record's
+        // basename (level 1) and each directory's basename (level 2), so a term
+        // present only in a component *above* the configured root had no posting
+        // and the candidate scan returned nothing.
+        let base = temp_dir("scan-ancestor");
+        let ancestor = base.join("qaprobe-root");
+        let root = ancestor.join("mntdata");
+        fs::create_dir_all(root.join("inner")).unwrap();
+        fs::write(root.join("inner/report.txt"), b"x").unwrap();
+
+        let config = ScanConfig::with_roots(vec![root]);
+        let (mut index, _) = scan(&config);
+
+        let enabled = index.search("qaprobe", 100, 0);
+        index.set_candidate_enabled(false);
+        let disabled = index.search("qaprobe", 100, 0);
+
+        assert_eq!(
+            disabled.total, 3,
+            "the linear scan must match the root and its descendants: {:?}",
+            disabled.hits
+        );
+        assert_eq!(
+            enabled.total, disabled.total,
+            "candidate and linear scans must agree for an ancestor component"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
 }

@@ -413,10 +413,22 @@ impl CandidateIndex {
         if append {
             // Sorted bulk build: two-level. Level 1 = basename trigrams; level 2
             // = directory-name trigrams; maintain the subtree stack.
+            //
+            // A root record has no ancestor directory records, so components of
+            // its own path *above* the configured root would have no posting at
+            // all. Index its full path at both levels: level 1 covers the root
+            // record, and level 2 expands to its whole subtree, so a query that
+            // matches an ancestor component still finds every descendant
+            // (issue #31).
             let basename = basename_of(lower_path);
-            index_trigrams(&mut self.delta, &self.stop, idx, basename, append);
+            let indexed: &[u8] = if parent == u32::MAX {
+                lower_path
+            } else {
+                basename
+            };
+            index_trigrams(&mut self.delta, &self.stop, idx, indexed, append);
             if is_dir {
-                index_trigrams(&mut self.dir_delta, &self.stop, idx, basename, append);
+                index_trigrams(&mut self.dir_delta, &self.stop, idx, indexed, append);
             }
             self.push_subtree(idx, lower_path, is_dir);
         } else {
@@ -454,9 +466,12 @@ impl CandidateIndex {
 
     /// Replace the subtree-range array with one derived from the record parent
     /// links (E). The Index computes this so the ranges are correct even when
-    /// records are not sorted by path (e.g. after live updates). The dense
-    /// per-record array is compacted to the directories only.
+    /// records are not sorted by path (e.g. after live updates), or when a bulk
+    /// batch inserts several roots before their descendants (issue #30). The
+    /// supplied ranges are authoritative, so any directories still open on the
+    /// incremental stack are discarded.
     pub fn set_subtree_end(&mut self, ends: Vec<u32>) {
+        self.stack.clear();
         self.subtree_end = ends
             .into_iter()
             .enumerate()
