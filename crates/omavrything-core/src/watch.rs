@@ -167,9 +167,33 @@ impl Watcher {
             .collect();
         for cookie in expired {
             if let Some((path, _)) = self.pending_moves.remove(&cookie) {
+                // The subtree moved out of the watched tree, so its watch
+                // descriptors no longer map to a live path here.
+                self.forget_subtree(&path);
                 out.push(FsEvent::Removed(path));
             }
         }
+    }
+
+    /// Rewrite the watch-descriptor path map when a watched directory is
+    /// renamed in place. inotify keeps the descriptors valid across a rename,
+    /// so only the recorded prefixes are stale.
+    ///
+    /// A no-op for files and unwatched directories, which have no mapping at or
+    /// below `from`.
+    fn remap_subtree(&mut self, from: &Path, to: &Path) {
+        for dir in self.dirs.values_mut() {
+            if dir == from {
+                *dir = to.to_path_buf();
+            } else if let Ok(rest) = dir.strip_prefix(from) {
+                *dir = to.join(rest);
+            }
+        }
+    }
+
+    /// Drop the path mappings for a subtree that left the watched tree.
+    fn forget_subtree(&mut self, path: &Path) {
+        self.dirs.retain(|_, dir| !dir.starts_with(path));
     }
 
     /// Translate one raw inotify event into zero or more [`FsEvent`]s.
@@ -180,12 +204,19 @@ impl Watcher {
             return;
         }
 
-        // The watched directory itself was deleted or moved away.
-        if event.mask.contains(EventMask::DELETE_SELF) || event.mask.contains(EventMask::MOVE_SELF)
-        {
+        // The watched directory itself was deleted: forget its watch mapping.
+        if event.mask.contains(EventMask::DELETE_SELF) {
             if let Some(dir) = self.dirs.remove(&event.wd) {
                 out.push(FsEvent::Removed(dir));
             }
+            return;
+        }
+
+        // `MOVE_SELF` is also delivered for an in-tree rename, where the
+        // directory still exists and its watch descriptors remain valid. The
+        // parent's `MOVED_FROM`/`MOVED_TO` pair remaps the paths instead; a
+        // genuine move out of the tree is handled by the pending-move timeout.
+        if event.mask.contains(EventMask::MOVE_SELF) {
             return;
         }
 
@@ -207,6 +238,9 @@ impl Watcher {
         } else if event.mask.contains(EventMask::MOVED_TO) {
             if event.cookie != 0 {
                 if let Some((from, _)) = self.pending_moves.remove(&event.cookie) {
+                    // The watch descriptors survive an in-tree rename, so move
+                    // them (and every descendant's) onto the new prefix.
+                    self.remap_subtree(&from, &path);
                     out.push(FsEvent::Renamed { from, to: path });
                     return;
                 }
@@ -358,6 +392,69 @@ mod tests {
         assert!(
             !events.iter().any(|e| format!("{e:?}").contains(".cache")),
             "no event from an excluded subtree should be delivered: {events:?}"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn rename_keeps_the_subtree_watched_under_the_new_path() {
+        let base =
+            std::env::temp_dir().join(format!("omavrything-watch-renamed-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let old = base.join("olddir");
+        let new = base.join("newdir");
+        fs::create_dir_all(old.join("nested")).unwrap();
+
+        let mut watcher = Watcher::new().unwrap();
+        watcher.watch_dir(&base).unwrap();
+        assert_eq!(
+            watcher.watch_count(),
+            3,
+            "expected base + olddir + nested to be watched"
+        );
+
+        fs::rename(&old, &new).unwrap();
+
+        // Collect the batch until the rename arrives. A rename must be reported
+        // once, as `Renamed`, and not also as a `Removed` of the old path.
+        let mut buffer = [0u8; 4096];
+        let mut events = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let batch = watcher
+                .read_events(&mut buffer, Duration::from_millis(100))
+                .unwrap();
+            let renamed = batch.iter().any(|e| matches!(e, FsEvent::Renamed { .. }));
+            events.extend(batch);
+            if renamed {
+                break;
+            }
+        }
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, FsEvent::Renamed { from, to } if from == &old && to == &new)),
+            "expected a Renamed event for the directory: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, FsEvent::Removed(p) if p == &old)),
+            "an in-tree rename must not be reported as a removal: {events:?}"
+        );
+
+        // The renamed directory and its descendants must still be watched, now
+        // under the new prefix.
+        let file = new.join("nested").join("inside.txt");
+        fs::write(&file, b"x").unwrap();
+        let created = wait_for(
+            &mut watcher,
+            |e| matches!(e, FsEvent::Created(p) if p == &file),
+        );
+        assert!(
+            created.is_some(),
+            "expected a Created event under the new path"
         );
 
         let _ = fs::remove_dir_all(&base);

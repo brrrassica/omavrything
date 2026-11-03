@@ -263,11 +263,35 @@ pub fn scan(config: &ScanConfig) -> (Index, ScanReport) {
 pub fn scan_into_index(index: &mut Index, config: &ScanConfig) -> ScanReport {
     let excludes = GlobSet::new(&config.excludes);
     let roots = resolve_roots(config);
-    let mut report = ScanReport::default();
+    let mut report = ScanReport {
+        roots: roots.len(),
+        ..ScanReport::default()
+    };
 
+    // Insert the roots through the bulk `insert_append` path, exactly like the
+    // walk's entries. Inserting a root through the live path (`add_root` ->
+    // `insert`) only produces level-1 postings and no subtree range, so a query
+    // matching a root's name would exclude its descendants on a cold start
+    // (issue #26). They must precede the walk entries so record indices stay
+    // increasing for the bulk build.
+    let mut root_buffer = WalkBuffer::default();
+    for (root, _) in &roots {
+        root_buffer.push(root, true, false, 0, 0);
+    }
+    root_buffer.sort();
+    index.reserve(root_buffer.entries.len(), root_buffer.arena.len());
+    index.insert_batch(root_buffer.entries.iter().map(|e| BatchEntry {
+        path: root_buffer.path_bytes(e),
+        is_dir: e.is_dir,
+        is_symlink: e.is_symlink,
+        size: e.size,
+        mtime: e.mtime,
+    }));
+    // Register each root's mount metadata now that its record exists.
+    // `add_root` is idempotent: it finds the batched record instead of
+    // re-inserting it through the non-bulk path.
     for (root, fs_kind) in &roots {
         index.add_root(root, *fs_kind);
-        report.roots += 1;
     }
 
     // Walk every root in parallel, each subtree producing one buffer that is
@@ -1092,5 +1116,43 @@ mod tests {
             .unwrap();
         assert!(three.is_dir);
         assert_eq!(three.mtime, 30);
+    }
+
+    #[test]
+    fn cold_scan_root_name_matches_its_descendants() {
+        // Regression (issue #26): a root inserted through the live path only got
+        // level-1 postings, so a query matching the root's directory name
+        // returned the root alone on a cold scan instead of its descendants.
+        let base = temp_dir("scan-root-descendants");
+        fs::create_dir_all(base.join("sub/deeper")).unwrap();
+        fs::write(base.join("zzzfile.txt"), b"x").unwrap();
+        fs::write(base.join("sub/deeper.txt"), b"y").unwrap();
+
+        let config = ScanConfig::with_roots(vec![base.clone()]);
+        let (mut index, _) = scan(&config);
+        let term = base.file_name().unwrap().to_string_lossy().into_owned();
+
+        let enabled = index.search(&term, 100, 0);
+        index.set_candidate_enabled(false);
+        let disabled = index.search(&term, 100, 0);
+
+        assert_eq!(
+            enabled.total, 5,
+            "root plus its four descendants should match: {:?}",
+            enabled.hits
+        );
+        assert_eq!(
+            enabled.total, disabled.total,
+            "the candidate-enabled and linear scans must agree for a root name"
+        );
+
+        let mut enabled_paths: Vec<String> = enabled.hits.iter().map(|h| h.path.clone()).collect();
+        let mut disabled_paths: Vec<String> =
+            disabled.hits.iter().map(|h| h.path.clone()).collect();
+        enabled_paths.sort();
+        disabled_paths.sort();
+        assert_eq!(enabled_paths, disabled_paths);
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

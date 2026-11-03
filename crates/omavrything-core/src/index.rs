@@ -411,7 +411,7 @@ fn stored_bytes<'a>(rec: &FileRecord, paths: &'a [u8]) -> &'a [u8] {
 }
 
 /// Write a record's full path into `out`.
-fn write_full_path_bytes(
+pub(crate) fn write_full_path_bytes(
     rec: &FileRecord,
     records: &[FileRecord],
     paths: &[u8],
@@ -2088,6 +2088,37 @@ impl DeltaIndex {
                 self.tombstones += 1;
             }
         }
+    }
+
+    /// Drop pending inserts for `path` and every path beneath it. Used when a
+    /// directory is removed or renamed while the base image is evicted, so the
+    /// old subtree does not survive alongside its replacement. Returns whether
+    /// anything was dropped.
+    pub(crate) fn remove_subtree(&mut self, path: &Path) -> bool {
+        let key = path.to_string_lossy();
+        let prefix = if key.ends_with('/') {
+            key.to_string()
+        } else {
+            format!("{key}/")
+        };
+        let doomed: Vec<Box<str>> = self
+            .index
+            .keys()
+            .filter(|k| k.as_ref() == key.as_ref() || k.starts_with(&prefix))
+            .cloned()
+            .collect();
+        let mut changed = false;
+        for k in doomed {
+            if let Some(i) = self.index.remove(&k) {
+                let rec = &mut self.records[i as usize];
+                if !rec.is_deleted() {
+                    rec.flags |= FLAG_DELETED;
+                    self.tombstones += 1;
+                }
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Whether `path` has a pending insert.

@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use crate::index::{DeltaIndex, FileRecord, Index, PathIndex};
+use crate::index::{DeltaIndex, FileRecord, Index, PathIndex, write_full_path_bytes};
 use crate::scan::{ScanConfig, scan_subtree, scan_subtree_into_delta};
 
 /// A filesystem change observed by the watcher.
@@ -78,9 +78,9 @@ pub fn apply_delta(
 ) -> bool {
     match event {
         FsEvent::Created(path) => delta_created(delta, by_path, records, paths, path, config),
-        FsEvent::Removed(path) => delta_removed(delta, by_path, records, paths, path),
+        FsEvent::Removed(path) => delta_removed(delta, records, paths, path),
         FsEvent::Renamed { from, to } => {
-            let changed = delta_removed(delta, by_path, records, paths, from);
+            let changed = delta_removed(delta, records, paths, from);
             delta_created(delta, by_path, records, paths, to, config) || changed
         }
         FsEvent::Modified(path) => delta_modified(delta, by_path, records, paths, path),
@@ -114,20 +114,38 @@ fn delta_created(
 
 fn delta_removed(
     delta: &mut DeltaIndex,
-    by_path: &PathIndex,
     records: &[FileRecord],
     paths: &[u8],
     path: &Path,
 ) -> bool {
     let mut changed = false;
-    if let Some(idx) = by_path.get(&path.to_string_lossy(), records, paths) {
-        delta.remove(idx);
-        changed = true;
+    let key = path.to_string_lossy();
+    // For the filesystem root "/", the subtree prefix is "/" itself; for any
+    // other path it is "<key>/".
+    let prefix = if key.ends_with('/') {
+        key.to_string()
+    } else {
+        format!("{key}/")
+    };
+    let key_bytes = key.as_bytes();
+    let prefix_bytes = prefix.as_bytes();
+    let mut buf: Vec<u8> = Vec::new();
+    // inotify reports a directory removal or rename as one event, without
+    // per-child events, so drop the whole base subtree, not just the exact path.
+    for (i, rec) in records.iter().enumerate() {
+        if rec.is_deleted() {
+            continue;
+        }
+        buf.clear();
+        write_full_path_bytes(rec, records, paths, &mut buf);
+        if buf == key_bytes || buf.starts_with(prefix_bytes) {
+            delta.remove(i as u32);
+            changed = true;
+        }
     }
-    if delta.contains_path(path) {
-        delta.remove_path(path);
-        changed = true;
-    }
+    // Pending inserts of the old subtree were created while evicted, so they
+    // have no base record; tombstone them too.
+    changed |= delta.remove_subtree(path);
     changed
 }
 
@@ -289,6 +307,51 @@ mod tests {
         let hits = index.search("new.txt", 10, 0).hits;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, to.to_string_lossy());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn renamed_directory_drops_base_descendants_from_delta() {
+        // Regression: a directory rename arrives as one event, so the delta
+        // must remove the old subtree from the base image instead of only the
+        // directory record, or searches return both the old and new children.
+        let base = temp_dir("delta-renamed-dir");
+        let from = base.join("base");
+        let to = base.join("moved");
+        fs::create_dir_all(from.join("sub")).unwrap();
+        let old_child = from.join("sub/child.txt");
+        let new_child = to.join("sub/child.txt");
+        fs::write(&old_child, b"x").unwrap();
+
+        // Build the base image as an evicted index would hold it.
+        let mut index = Index::new();
+        let config = ScanConfig::with_roots(vec![base.clone()]);
+        apply(&mut index, &FsEvent::Created(base.clone()), &config);
+        assert!(index.find(&old_child).is_some());
+        let by_path = PathIndex::build(index.records(), index.paths());
+
+        // Rename while evicted, then fold the accumulated delta.
+        fs::rename(&from, &to).unwrap();
+        let mut delta = DeltaIndex::new();
+        assert!(apply_delta(
+            &mut delta,
+            &by_path,
+            index.records(),
+            index.paths(),
+            &FsEvent::Renamed {
+                from: from.clone(),
+                to: to.clone()
+            },
+            &config
+        ));
+        index.apply_delta(&delta);
+
+        assert!(index.find(&old_child).is_none());
+        assert!(index.find(&new_child).is_some());
+        let hits = index.search("child.txt", 10, 0).hits;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, new_child.to_string_lossy());
 
         let _ = fs::remove_dir_all(&base);
     }
