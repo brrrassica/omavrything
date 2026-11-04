@@ -10,11 +10,14 @@ name: Release
 # package cache, so pacman, the Rust toolchain, crates and build artifacts are
 # reused instead of being re-downloaded for every release.
 #
-# The Rust toolchain is PINNED to an exact release (1.99.1) rather than the
-# floating `stable` channel, so a release is reproducible and rustup never has
-# to re-resolve the channel over the network. $CARGO_HOME/bin goes on PATH and
-# the install runs under flock /ci/cache/locks/rustup.lock, so it neither
-# re-downloads the rustup installer nor races another job on the shared cache.
+# The compiler and linker are PINNED to the exact Arch packages that produced
+# the committed digests: `rust 1:1.99.1-1` (rustc commit 58cf8f9c3) and
+# `lld 23.1.3-4`. rustup is deliberately NOT used: even at the same version it
+# produces different binaries, and the system linker version is embedded in the
+# output. The Cargo registry path is also embedded in the binaries (dependency
+# panic locations), so the build uses CARGO_HOME=/home/sam/.cargo, matching the
+# build that committed the pins; that path is symlinked to the runner's
+# persistent cargo cache.
 #
 # The release is DIGEST-PINNED: the version-bump PR commits the SHA-256 of the
 # archive and of both binaries to scripts/daemon-checksums.txt. This workflow
@@ -45,20 +48,19 @@ jobs:
       volumes:
         - /home/github-runner/ci-cache/pacman-pkg:/var/cache/pacman/pkg
         - /home/github-runner/ci-cache/cargo:/ci/cache/cargo
-        - /home/github-runner/ci-cache/rustup:/ci/cache/rustup
         - /home/github-runner/ci-cache/targets:/ci/cache/targets
         - /home/github-runner/ci-cache/locks:/ci/cache/locks
     env:
-      CARGO_HOME: /ci/cache/cargo
-      RUSTUP_HOME: /ci/cache/rustup
-      RUSTUP_TOOLCHAIN: 1.99.1
+      # The pinned binaries embed this exact registry path in dependency panic
+      # locations. It is symlinked to the runner's cache in the step below.
+      CARGO_HOME: /home/sam/.cargo
       CARGO_TARGET_DIR: /ci/cache/targets/${{ github.repository }}/${{ github.job }}
     steps:
       - name: Install dependencies (from the local pacman cache)
         run: |
           mkdir -p "$CARGO_TARGET_DIR"
           flock /ci/cache/locks/pacman.lock \
-            pacman -Syu --noconfirm --needed --overwrite '*' git curl zip
+            pacman -Syu --noconfirm --needed --overwrite '*' git curl zip rust
 
       - uses: actions/checkout@v4
         with:
@@ -74,20 +76,29 @@ jobs:
           mkdir -p "$CARGO_TARGET_DIR"
           rm -rf target
           ln -s "$CARGO_TARGET_DIR" target
-      - name: Put the cached cargo/rustup shims on PATH
-        run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
-      # Install under the cache lock so the action below only has to confirm
-      # the toolchain is already present.
-      - name: Pre-install the pinned toolchain under the cache lock
+      # The committed pin was produced with the Arch rust package and
+      # lld 23.1.3-4, not rustup and not the newest lld. Both the linker
+      # version (in .comment) and the Cargo registry path (in dependency panic
+      # locations) are embedded in the binaries, so reproduce them exactly.
+      - name: Pin the compiler inputs
         run: |
-          flock /ci/cache/locks/rustup.lock \
-            rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update
-
-      - name: Install Rust toolchain (reused from RUSTUP_HOME)
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.99.1
+          set -euo pipefail
+          lld_version=23.1.3-4
+          args=()
+          for pkg in llvm-libs lld compiler-rt; do
+            cached="/var/cache/pacman/pkg/${pkg}-${lld_version}-x86_64.pkg.tar.zst"
+            if [[ -f "$cached" ]]; then
+              args+=("$cached")
+            else
+              args+=("https://archive.archlinux.org/packages/${pkg:0:1}/${pkg}/${pkg}-${lld_version}-x86_64.pkg.tar.zst")
+            fi
+          done
+          pacman -U --noconfirm "${args[@]}"
+          mkdir -p /home/sam
+          rm -rf /home/sam/.cargo
+          ln -s /ci/cache/cargo /home/sam/.cargo
+          ld.lld --version
 
       - name: Resolve the release tag
         id: tag
@@ -104,17 +115,19 @@ jobs:
       - name: Verify the pinned toolchain
         run: |
           set -euo pipefail
+          hash -r
+          command -v rustc
+          command -v cargo
           rustc -vV
           cargo --version
-          pacman -Q glibc gcc binutils 2>/dev/null || true
-          expected_rustc=58cf8f9c35b355199727627d07ae34a4e2846d67
-          actual_rustc="$(rustc -vV | sed -n 's/^commit-hash: //p')"
-          if [[ "$actual_rustc" != "$expected_rustc" ]]; then
-            echo "error: rustc is not the pinned 1.99.1 release" >&2
-            echo "       expected commit-hash $expected_rustc" >&2
-            echo "       got               $actual_rustc" >&2
-            exit 1
-          fi
+          ld.lld --version
+          pacman -Q rust lld llvm-libs compiler-rt glibc gcc binutils zip
+          test "$(rustc -vV | sed -n 's/^release: //p')" = "1.99.1"
+          test "$(rustc -vV | sed -n 's/^commit-hash: //p')" = "58cf8f9c35b355199727627d07ae34a4e2846d67"
+          cargo --version | grep -q '1.99.1'
+          pacman -Q rust | grep -q '^rust 1:1.99.1-1$'
+          ld.lld --version | grep -q 'LLD 23.1.3'
+          test "$CARGO_HOME" = "/home/sam/.cargo"
 
       - name: Build the release archive
         run: scripts/package-release.sh "${{ steps.tag.outputs.version }}"
