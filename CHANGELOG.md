@@ -41,8 +41,15 @@ Notable changes to `omavrything`. The format follows
 
 - **Version bumped to `0.2.4`.** The shell plugin manifest, the workspace,
   `Cargo.lock`, the AUR `PKGBUILD`, the man page, and the docs are updated to
-  match. Release artifacts for `0.2.4` still need to be built and pinned in
-  `scripts/daemon-checksums.txt` before the plugin can fetch them.
+  match. The `0.2.4` release archive and both binaries are built reproducibly
+  from this tree and pinned in `scripts/daemon-checksums.txt`, so the plugin can
+  fetch and install them.
+- **Release digests are pinned before the tag, not after it.** The release
+  workflow now rebuilds the archive from the tagged tree and fails if its
+  SHA-256 does not match `scripts/daemon-checksums.txt`. It no longer opens a
+  post-release digest pull request, which the 0.2.3 workflow could not create
+  (`GitHub Actions is not permitted to create or approve pull requests`) and
+  which forced a manual re-push just for the digest.
 
 ## [0.2.3] — 2026-11-02
 

@@ -33,9 +33,12 @@ jobs:
   uploads it as a build artifact, so a broken release is caught before a tag.
   The archive is reproducible: `package-release.sh` normalises entry timestamps,
   modes, ownership, and ordering (and self-checks by zipping the staging tree
-  twice), so two builds of the same tree have the same SHA-256. This is what
-  makes a digest pinned in `scripts/daemon-checksums.txt` meaningful for the
-  published asset instead of only for the machine that happened to build it.
+  twice), so two builds of the same tree have the same SHA-256. The binaries are
+  reproducible too: with the pinned Rust 1.99.1 toolchain and the committed
+  `Cargo.lock`, two clean builds in different target directories produce
+  byte-identical `omavrythingd` and `omavry` binaries. This is what makes a
+  digest pinned in `scripts/daemon-checksums.txt` meaningful for the published
+  asset instead of only for the machine that happened to build it.
 
 Pushing a `v*` tag runs
 [`.github/workflows/release.yml`](../.github/workflows/release.yml), which builds
@@ -61,11 +64,20 @@ The project is published on the **Omarchy Marketplace**, which tracks `main`, so
   request. A rejected push to `main` means the change should be re-targeted at
   `develop`; do not try to bypass the protection.
 
-To release, a maintainer merges `develop` into `main` via PR, updates
-[`CHANGELOG.md`](../CHANGELOG.md), then tags the merge commit on `main` with
-`v<version>` and pushes the tag. The tag triggers
-[`.github/workflows/release.yml`](../.github/workflows/release.yml), which builds
-the archive and creates the GitHub release. Releases are tag-driven and
+To release, the version-bump pull request updates
+[`CHANGELOG.md`](../CHANGELOG.md), bumps the version, and pins the release
+archive and both binaries in
+[`scripts/daemon-checksums.txt`](../scripts/daemon-checksums.txt). The pins are
+produced by building the archive from the exact tree that will be tagged, with
+the pinned Rust 1.99.1 toolchain and the committed `Cargo.lock`. The maintainer
+merges that PR into `main` and tags the merge commit with `v<version>`.
+
+The tag triggers
+[`.github/workflows/release.yml`](../.github/workflows/release.yml), which
+rebuilds the archive from the tagged tree and verifies its SHA-256 against the
+pin before it publishes anything. A missing pin or a digest mismatch fails the
+release instead of silently re-pinning it, so the published asset is always the
+one the reviewed source committed to. Releases are tag-driven and
 branch-independent; the branch model only governs how the tagged commit is
 produced.
 

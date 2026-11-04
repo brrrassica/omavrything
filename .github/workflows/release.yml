@@ -15,6 +15,14 @@ name: Release
 # to re-resolve the channel over the network. $CARGO_HOME/bin goes on PATH and
 # the install runs under flock /ci/cache/locks/rustup.lock, so it neither
 # re-downloads the rustup installer nor races another job on the shared cache.
+#
+# The release is DIGEST-PINNED: the version-bump PR commits the SHA-256 of the
+# archive and of both binaries to scripts/daemon-checksums.txt. This workflow
+# rebuilds the archive from the tag and verifies it against that pin before it
+# publishes anything; a missing or mismatched pin fails the release. It does NOT
+# re-pin the digests after publishing: that post-tag step in the 0.2.3 workflow
+# could not even open its PR (GitHub Actions is not permitted to create pull
+# requests) and forced a manual re-push just for the digest.
 on:
   push:
     tags:
@@ -27,8 +35,6 @@ on:
 
 permissions:
   contents: write
-  # The digest-pinning step opens a PR because main is protected.
-  pull-requests: write
 
 jobs:
   release:
@@ -90,8 +96,64 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
 
+      # The digest pin is only meaningful if the compiler is the one the pin
+      # was produced with. 1.99.1 is the Rust release (commit 58cf8f9c3) the
+      # version-bump PR used; the Arch container supplies the matching glibc,
+      # gcc and binutils. Print the library versions so a mismatch is visible in
+      # the log, and fail if rustc is not the pinned commit.
+      - name: Verify the pinned toolchain
+        run: |
+          set -euo pipefail
+          rustc -vV
+          cargo --version
+          pacman -Q glibc gcc binutils 2>/dev/null || true
+          expected_rustc=58cf8f9c35b355199727627d07ae34a4e2846d67
+          actual_rustc="$(rustc -vV | sed -n 's/^commit-hash: //p')"
+          if [[ "$actual_rustc" != "$expected_rustc" ]]; then
+            echo "error: rustc is not the pinned 1.99.1 release" >&2
+            echo "       expected commit-hash $expected_rustc" >&2
+            echo "       got               $actual_rustc" >&2
+            exit 1
+          fi
+
       - name: Build the release archive
         run: scripts/package-release.sh "${{ steps.tag.outputs.version }}"
+
+      # The archive and both binaries must match the digests committed in the
+      # tagged tree. If this fails, the release is not the reviewed artifact:
+      # fail before creating the GitHub release rather than re-pinning it.
+      - name: Verify the archive against the pinned digests
+        run: |
+          set -euo pipefail
+          version="${{ steps.tag.outputs.version }}"
+          arch="$(uname -m)"
+          name="omavrything-${version}-${arch}"
+          pinned="scripts/daemon-checksums.txt"
+          [[ -f "$pinned" ]] || {
+            echo "error: $pinned is missing from the tagged tree" >&2
+            exit 1
+          }
+          verify() {
+            local file="$1"
+            local expected actual
+            expected="$(awk -v f="$file" '$2 == f { print $1; exit }' "$pinned")"
+            if [[ -z "$expected" ]]; then
+              echo "error: no pinned digest for $file in $pinned" >&2
+              echo "       the version-bump PR must pin the release before tagging" >&2
+              exit 1
+            fi
+            actual="$(sha256sum "dist/$file" | awk '{print $1}')"
+            if [[ "$actual" != "$expected" ]]; then
+              echo "error: reproducible build mismatch for $file" >&2
+              echo "       pinned $expected" >&2
+              echo "       built  $actual" >&2
+              exit 1
+            fi
+            echo "verified $file  $expected"
+          }
+          verify "${name}.zip"
+          verify "${name}/bin/omavrythingd"
+          verify "${name}/bin/omavry"
 
       - name: Create the GitHub release
         uses: softprops/action-gh-release@v2
@@ -124,41 +186,3 @@ jobs:
             immediately; the group change takes effect on your next login.
 
             See `docs/install.md` inside the archive for the full setup.
-
-      # package-release.sh wrote the pinned digests for this release to
-      # dist/daemon-checksums.txt. The plugin's fetch-on-first-run bootstrap
-      # (scripts/fetch-daemon.sh) and the installer (scripts/install.sh) verify
-      # against scripts/daemon-checksums.txt, and the plugin clones the default
-      # branch, so commit the generated file there; otherwise the bootstrap and
-      # the installer fail closed and refuse to install the release. This is the
-      # provenance binding: the shipped binaries are tied to the reviewed commit
-      # that carries the digests.
-      #
-      # main is protected (changes must go through a PR), so open a PR with the
-      # digest update instead of pushing directly. When the file is already up to
-      # date the action makes no branch and no PR.
-      - name: Stage the pinned digests
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git fetch origin main
-          git checkout -B main origin/main
-          cp dist/daemon-checksums.txt scripts/daemon-checksums.txt
-
-      - name: Open a PR with the pinned digests
-        uses: peter-evans/create-pull-request@v7
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          base: main
-          branch: chore/release-${{ steps.tag.outputs.version }}-digests
-          delete-branch: true
-          add-paths: scripts/daemon-checksums.txt
-          commit-message: "chore(release): pin omavrything-${{ steps.tag.outputs.version }} digests"
-          title: "chore(release): pin omavrything-${{ steps.tag.outputs.version }} digests"
-          body: |
-            Pins the SHA-256 digests for `omavrything-${{ steps.tag.outputs.version }}` in
-            `scripts/daemon-checksums.txt`, binding the published release artifacts to
-            the reviewed source that the plugin clones.
-
-            Generated by the Release workflow for `${{ steps.tag.outputs.tag }}`.
