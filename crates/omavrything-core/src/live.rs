@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+use crate::glob::GlobSet;
 use crate::index::{DeltaIndex, FileRecord, Index, PathIndex, write_full_path_bytes};
 use crate::scan::{ScanConfig, scan_subtree, scan_subtree_into_delta};
 
@@ -21,10 +22,21 @@ pub enum FsEvent {
 
 /// Apply one event to the index. Returns whether the index changed.
 pub fn apply(index: &mut Index, event: &FsEvent, config: &ScanConfig) -> bool {
+    let excludes = GlobSet::new(&config.excludes);
     match event {
-        FsEvent::Created(path) => apply_created(index, path, config),
+        FsEvent::Created(path) => {
+            if is_excluded(&excludes, path) {
+                return false;
+            }
+            apply_created(index, path, config)
+        }
         FsEvent::Removed(path) => index.remove(path),
         FsEvent::Renamed { from, to } => {
+            if is_excluded(&excludes, to) {
+                // Moving into an excluded subtree must drop the source record.
+                // Otherwise the path stays searchable until the next rescan.
+                return index.remove(from);
+            }
             if index.rename(from, to) {
                 true
             } else {
@@ -32,8 +44,19 @@ pub fn apply(index: &mut Index, event: &FsEvent, config: &ScanConfig) -> bool {
                 apply_created(index, to, config)
             }
         }
-        FsEvent::Modified(path) => apply_modified(index, path),
+        FsEvent::Modified(path) => {
+            if is_excluded(&excludes, path) {
+                false
+            } else {
+                apply_modified(index, path)
+            }
+        }
     }
+}
+
+/// Whether `path` is pruned by the configured exclude globs.
+fn is_excluded(excludes: &GlobSet, path: &Path) -> bool {
+    !excludes.is_empty() && excludes.matches(path)
 }
 
 fn apply_created(index: &mut Index, path: &Path, config: &ScanConfig) -> bool {
@@ -76,14 +99,30 @@ pub fn apply_delta(
     event: &FsEvent,
     config: &ScanConfig,
 ) -> bool {
+    let excludes = GlobSet::new(&config.excludes);
     match event {
-        FsEvent::Created(path) => delta_created(delta, by_path, records, paths, path, config),
+        FsEvent::Created(path) => {
+            if is_excluded(&excludes, path) {
+                return false;
+            }
+            delta_created(delta, by_path, records, paths, path, config)
+        }
         FsEvent::Removed(path) => delta_removed(delta, records, paths, path),
         FsEvent::Renamed { from, to } => {
             let changed = delta_removed(delta, records, paths, from);
-            delta_created(delta, by_path, records, paths, to, config) || changed
+            if is_excluded(&excludes, to) {
+                changed
+            } else {
+                delta_created(delta, by_path, records, paths, to, config) || changed
+            }
         }
-        FsEvent::Modified(path) => delta_modified(delta, by_path, records, paths, path),
+        FsEvent::Modified(path) => {
+            if is_excluded(&excludes, path) {
+                false
+            } else {
+                delta_modified(delta, by_path, records, paths, path)
+            }
+        }
     }
 }
 
@@ -370,6 +409,116 @@ mod tests {
         fs::write(&file, b"much longer contents").unwrap();
         assert!(apply(&mut index, &FsEvent::Modified(file), &config));
         assert_eq!(index.search("grow.txt", 10, 0).hits[0].size, 20);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn excluded_paths_are_not_added_by_live_events() {
+        // Regression (issue #32): `apply` never consulted the excludes, so a
+        // created (or renamed-in) excluded file/directory was indexed even
+        // though a rescan would drop it.
+        let base = temp_dir("excluded");
+        let mut config = ScanConfig::with_roots(vec![base.clone()]);
+        config.excludes = vec!["**/*.tmp".into(), "**/skip/**".into()];
+
+        let mut index = Index::new();
+
+        let noise = base.join("noise.tmp");
+        fs::write(&noise, b"x").unwrap();
+        assert!(!apply(
+            &mut index,
+            &FsEvent::Created(noise.clone()),
+            &config
+        ));
+        assert!(index.find(&noise).is_none());
+        assert_eq!(index.search("noise.tmp", 10, 0).hits.len(), 0);
+
+        let skip = base.join("skip");
+        fs::create_dir_all(skip.join("sub")).unwrap();
+        fs::write(skip.join("sub/secret.txt"), b"x").unwrap();
+        assert!(!apply(&mut index, &FsEvent::Created(skip.clone()), &config));
+        assert!(index.find(&skip).is_none());
+        assert!(index.find(&skip.join("sub/secret.txt")).is_none());
+        assert_eq!(index.search("secret.txt", 10, 0).hits.len(), 0);
+
+        // A rename whose destination is excluded must drop the old record and
+        // leave the destination unindexed.
+        let old = base.join("old.txt");
+        fs::write(&old, b"x").unwrap();
+        assert!(apply(&mut index, &FsEvent::Created(old.clone()), &config));
+        let moved = base.join("moved.tmp");
+        fs::rename(&old, &moved).unwrap();
+        assert!(apply(
+            &mut index,
+            &FsEvent::Renamed {
+                from: old.clone(),
+                to: moved.clone()
+            },
+            &config
+        ));
+        assert!(index.find(&old).is_none());
+        assert!(index.find(&moved).is_none());
+        assert_eq!(index.search("old.txt", 10, 0).hits.len(), 0);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn excluded_directory_without_trailing_glob_is_not_indexed() {
+        // Regression (issue #36): the watcher does not watch an excluded
+        // directory, but its parent still delivers a `CREATE` for it. With the
+        // common `**/.cache` spelling (no trailing `/**`) only the directory
+        // itself matches the exclude, so the event must be dropped before the
+        // subtree scan runs.
+        let base = temp_dir("excluded-cache");
+        let cache = base.join(".cache");
+        fs::create_dir_all(cache.join("sub")).unwrap();
+        fs::write(cache.join("sub/big.bin"), b"x").unwrap();
+
+        let mut config = ScanConfig::with_roots(vec![base.clone()]);
+        config.excludes = vec!["**/.cache".into()];
+
+        let mut index = Index::new();
+        assert!(!apply(
+            &mut index,
+            &FsEvent::Created(cache.clone()),
+            &config
+        ));
+        assert!(index.find(&cache).is_none());
+        assert!(index.find(&cache.join("sub")).is_none());
+        assert!(index.find(&cache.join("sub/big.bin")).is_none());
+        assert_eq!(index.search("big", 10, 0).hits.len(), 0);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn delta_events_ignore_an_excluded_directory_root() {
+        // The evicted-image path must apply the same exclusion rule: a create
+        // for an excluded directory adds no base records and no delta entries.
+        let base = temp_dir("excluded-cache-delta");
+        let cache = base.join(".cache");
+        fs::create_dir_all(cache.join("sub")).unwrap();
+        fs::write(cache.join("sub/big.bin"), b"x").unwrap();
+
+        let mut config = ScanConfig::with_roots(vec![base.clone()]);
+        config.excludes = vec!["**/.cache".into()];
+
+        let mut index = Index::new();
+        let by_path = PathIndex::build(index.records(), index.paths());
+        let mut delta = DeltaIndex::new();
+        assert!(!apply_delta(
+            &mut delta,
+            &by_path,
+            index.records(),
+            index.paths(),
+            &FsEvent::Created(cache.clone()),
+            &config
+        ));
+        index.apply_delta(&delta);
+        assert!(index.find(&cache).is_none());
+        assert!(index.find(&cache.join("sub/big.bin")).is_none());
 
         let _ = fs::remove_dir_all(&base);
     }

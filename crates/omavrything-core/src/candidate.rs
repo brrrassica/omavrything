@@ -258,6 +258,17 @@ const STOP_LIST_DIVISOR: usize = 10;
 /// small index keeps every posting list.
 const STOP_LIST_MIN_RECORDS: usize = 1000;
 
+/// The maximum number of **distinct** trigrams a single term may contribute
+/// before the candidate index declines to narrow the scan.
+///
+/// A term long enough to exceed this is far longer than any path component, so
+/// the linear matcher cannot find a match for it anyway; declining to narrow is
+/// therefore semantically safe. The bound keeps a crafted request from making
+/// one term expand thousands of posting lists (and their subtree ranges) at
+/// once, which is what allowed a 64 KiB repetitive term to exhaust the daemon's
+/// memory.
+const MAX_TERM_TRIGRAMS: usize = 4096;
+
 /// The stop-list divisor, overridable with `OMAVRYTHING_STOP_LIST_DIVISOR` for
 /// measurement (R10). 0 disables the stop-list.
 fn stop_list_divisor() -> usize {
@@ -413,10 +424,22 @@ impl CandidateIndex {
         if append {
             // Sorted bulk build: two-level. Level 1 = basename trigrams; level 2
             // = directory-name trigrams; maintain the subtree stack.
+            //
+            // A root record has no ancestor directory records, so components of
+            // its own path *above* the configured root would have no posting at
+            // all. Index its full path at both levels: level 1 covers the root
+            // record, and level 2 expands to its whole subtree, so a query that
+            // matches an ancestor component still finds every descendant
+            // (issue #31).
             let basename = basename_of(lower_path);
-            index_trigrams(&mut self.delta, &self.stop, idx, basename, append);
+            let indexed: &[u8] = if parent == u32::MAX {
+                lower_path
+            } else {
+                basename
+            };
+            index_trigrams(&mut self.delta, &self.stop, idx, indexed, append);
             if is_dir {
-                index_trigrams(&mut self.dir_delta, &self.stop, idx, basename, append);
+                index_trigrams(&mut self.dir_delta, &self.stop, idx, indexed, append);
             }
             self.push_subtree(idx, lower_path, is_dir);
         } else {
@@ -454,9 +477,12 @@ impl CandidateIndex {
 
     /// Replace the subtree-range array with one derived from the record parent
     /// links (E). The Index computes this so the ranges are correct even when
-    /// records are not sorted by path (e.g. after live updates). The dense
-    /// per-record array is compacted to the directories only.
+    /// records are not sorted by path (e.g. after live updates), or when a bulk
+    /// batch inserts several roots before their descendants (issue #30). The
+    /// supplied ranges are authoritative, so any directories still open on the
+    /// incremental stack are discarded.
     pub fn set_subtree_end(&mut self, ends: Vec<u32>) {
+        self.stack.clear();
         self.subtree_end = ends
             .into_iter()
             .enumerate()
@@ -612,7 +638,13 @@ impl CandidateIndex {
             return None;
         }
 
-        let mut lists: Vec<Vec<u32>> = Vec::with_capacity(needle.len() - 2);
+        // Deduplicate the query trigrams. A repetitive term (a long run of one
+        // character, up to the 64 KiB request limit) would otherwise expand the
+        // same posting list tens of thousands of times and exhaust memory; the
+        // repeated trigram contributes no extra constraint, so keeping one copy
+        // yields the same candidate superset.
+        let mut seen: HashSet<u32> = HashSet::with_capacity((needle.len() - 2).min(256));
+        let mut trigrams: Vec<u32> = Vec::new();
         for w in needle.windows(3) {
             let tg = pack_trigram(w[0], w[1], w[2]);
             // A stop-listed trigram is too common to constrain the scan; skip it
@@ -620,30 +652,66 @@ impl CandidateIndex {
             if self.stop.contains(&tg) {
                 continue;
             }
-            match self.postings_for(tg) {
-                Some(list) => lists.push(list),
-                // A missing trigram means no record contains it, so no record
-                // contains the term.
-                None => return Some(Vec::new()),
+            if seen.insert(tg) {
+                trigrams.push(tg);
+                // Bound the work one term may create. A term with this many
+                // distinct trigrams is longer than any path component, so no
+                // record can contain it; falling back to the linear scan keeps
+                // the result correct while capping the memory and CPU spent.
+                if trigrams.len() > MAX_TERM_TRIGRAMS {
+                    return None;
+                }
             }
         }
 
         // Every trigram was stop-listed: the term cannot narrow the scan.
-        if lists.is_empty() {
+        if trigrams.is_empty() {
             return None;
         }
 
-        // Intersect smallest-first to keep the working set small.
-        lists.sort_by_key(|l| l.len());
-        let mut acc = lists[0].clone();
-        for list in &lists[1..] {
-            acc = intersect_sorted(&acc, list);
-            if acc.is_empty() {
-                return Some(acc);
+        // Fetch the most selective lists first so the accumulator shrinks
+        // quickly, then intersect **one list at a time**. Only the accumulator
+        // and the current list are resident, instead of a separate expanded
+        // `Vec` for every trigram in the term.
+        trigrams.sort_by_key(|&tg| self.posting_hint(tg));
+        let mut acc: Option<Vec<u32>> = None;
+        for tg in trigrams {
+            let Some(list) = self.postings_for(tg) else {
+                // A missing trigram means no record contains it, so no record
+                // contains the term.
+                return Some(Vec::new());
+            };
+            acc = Some(match acc {
+                None => list,
+                Some(prev) => intersect_sorted(&prev, &list),
+            });
+            if acc.as_ref().is_some_and(|a| a.is_empty()) {
+                return Some(Vec::new());
             }
         }
 
-        Some(acc)
+        acc
+    }
+
+    /// A cheap size estimate for a trigram's posting list, used to intersect the
+    /// most selective lists first without decoding them.
+    fn posting_hint(&self, tg: u32) -> usize {
+        let mut hint = 0usize;
+        if let Some(slot) = self.csr.slot_of(tg) {
+            let s = slot as usize;
+            hint += (self.csr.offsets[s + 1] - self.csr.offsets[s]) as usize;
+        }
+        if let Some(slot) = self.dir_csr.slot_of(tg) {
+            let s = slot as usize;
+            hint += (self.dir_csr.offsets[s + 1] - self.dir_csr.offsets[s]) as usize;
+        }
+        if let Some(list) = self.delta.get(&tg) {
+            hint += list.len();
+        }
+        if let Some(list) = self.dir_delta.get(&tg) {
+            hint += list.len();
+        }
+        hint
     }
 
     /// The posting list for a trigram: the union of the level-1 basename
@@ -1176,5 +1244,70 @@ mod tests {
         assert!(cands.contains(&1));
         let cands = c.candidates(&Query::parse("report")).unwrap();
         assert!(cands.contains(&0) && cands.contains(&1));
+    }
+
+    #[test]
+    fn bulk_parentless_records_index_their_full_path() {
+        // Regression (issue #34): the bulk build indexed only the basename of
+        // each record and relied on ancestor directory records for the rest, so
+        // a scan root or parentless file had no posting for the components above
+        // it. Such a record must index its whole path.
+        let mut c = CandidateIndex::new();
+        c.insert_append(0, b"/tmp/qa-probe-scan", true, u32::MAX);
+        c.insert_append(1, b"/tmp/qa-probe-scan/inner", true, 0);
+        c.insert_append(2, b"/tmp/qa-probe-scan/inner/file.txt", false, 1);
+        // A parentless file has no ancestor record at all.
+        c.insert_append(3, b"/var/qa-parentless/report.txt", false, u32::MAX);
+        c.finish_bulk();
+
+        for term in ["tmp", "qa-probe"] {
+            let cands = c
+                .candidates(&Query::parse(term))
+                .unwrap_or_else(|| panic!("{term:?} must narrow"));
+            assert!(
+                cands.contains(&0) && cands.contains(&1) && cands.contains(&2),
+                "{term:?} must match the root and every descendant: {cands:?}"
+            );
+        }
+        let cands = c
+            .candidates(&Query::parse("var"))
+            .expect("parentless file component must narrow");
+        assert!(cands.contains(&3), "parentless file must match: {cands:?}");
+    }
+
+    #[test]
+    fn repetitive_terms_do_not_expand_one_trigram_repeatedly() {
+        // Regression: a long repetitive term (up to the 64 KiB request limit)
+        // produced one trigram per window and expanded the same posting list
+        // thousands of times, exhausting memory. Deduplication must make the
+        // result identical to expanding the single repeated trigram once.
+        let mut c = CandidateIndex::new();
+        let n = 500u32;
+        for i in 0..n {
+            let p = format!("/data/aaa-{i:04}.txt");
+            c.insert_append(i, p.as_bytes(), false, u32::MAX);
+        }
+        c.finish_bulk();
+
+        let cands = c
+            .candidates(&Query::parse(&"a".repeat(4096)))
+            .expect("a single distinct trigram must narrow");
+        let direct = c.postings_for(pack_trigram(b'a', b'a', b'a')).unwrap();
+        assert_eq!(cands, direct);
+        assert_eq!(cands.len() as u32, n);
+    }
+
+    #[test]
+    fn overlong_terms_decline_to_narrow() {
+        // A term with more distinct trigrams than any path component can hold
+        // falls back to the linear scan instead of expanding thousands of lists.
+        let c = build(&["/home/sam/aaa.txt"]);
+        let mut state = 1u32;
+        let mut term = String::with_capacity(MAX_TERM_TRIGRAMS * 8);
+        for _ in 0..MAX_TERM_TRIGRAMS * 8 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            term.push((b'a' + (state % 26) as u8) as char);
+        }
+        assert!(c.candidates(&Query::parse(&term)).is_none());
     }
 }

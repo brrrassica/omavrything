@@ -485,15 +485,53 @@ impl<'a> IndexImage<'a> {
             Records::Owned(v)
         };
 
-        // Validate every record's path range and count the live records.
+        // Validate every record's path range and parent link, and count the live
+        // records. A parent must be either the sentinel or an in-range record
+        // index: path materialization indexes `records` with it directly.
+        let recs = records.as_slice();
         let mut live = 0usize;
-        for rec in records.as_slice() {
+        for rec in recs {
             let end = rec.path_off as usize + rec.path_len as usize;
             if end > paths.len() {
                 return Err(SnapshotError::Truncated);
             }
+            if rec.parent != u32::MAX && rec.parent as usize >= recs.len() {
+                return Err(SnapshotError::Truncated);
+            }
             if !rec.is_deleted() {
                 live += 1;
+            }
+        }
+
+        // Reject parent cycles: `subtree_ends` walks these links and would loop
+        // forever. A parent may point at a later index (a rename can move a
+        // record under a directory created after it), so walk each chain with a
+        // progress marker rather than requiring ascending links.
+        let mut state = vec![0u8; recs.len()];
+        let mut chain = Vec::new();
+        for start in 0..recs.len() {
+            if state[start] != 0 {
+                continue;
+            }
+            chain.clear();
+            let mut p = start as u32;
+            loop {
+                if p == u32::MAX {
+                    break;
+                }
+                let pi = p as usize;
+                if state[pi] == 2 {
+                    break;
+                }
+                if state[pi] == 1 {
+                    return Err(SnapshotError::Truncated);
+                }
+                state[pi] = 1;
+                chain.push(pi);
+                p = recs[pi].parent;
+            }
+            for pi in chain.iter().copied() {
+                state[pi] = 2;
             }
         }
 
@@ -908,6 +946,34 @@ mod tests {
         fs::metadata(path).unwrap().mode() & 0o777
     }
 
+    fn records_section_range(bytes: &[u8]) -> std::ops::Range<usize> {
+        let section_count = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+        for i in 0..section_count {
+            let base = HEADER_FIXED + i * SECTION_ENTRY;
+            let kind = u32::from_le_bytes(bytes[base..base + 4].try_into().unwrap());
+            if kind == SECTION_RECORDS {
+                let offset =
+                    u64::from_le_bytes(bytes[base + 8..base + 16].try_into().unwrap()) as usize;
+                let len =
+                    u64::from_le_bytes(bytes[base + 16..base + 24].try_into().unwrap()) as usize;
+                return offset..offset + len;
+            }
+        }
+        panic!("snapshot has no records section");
+    }
+
+    fn set_record_parent(bytes: &mut [u8], record: usize, parent: u32) {
+        let range = records_section_range(bytes);
+        let base = range.start + 8 + record * RECORD_BYTES;
+        bytes[base + 8..base + 12].copy_from_slice(&parent.to_le_bytes());
+    }
+
+    fn refresh_checksum(bytes: &mut [u8]) {
+        let body_len = bytes.len() - 8;
+        let checksum = fnv1a64(&bytes[..body_len]);
+        bytes[body_len..].copy_from_slice(&checksum.to_le_bytes());
+    }
+
     #[test]
     fn writes_owner_only_snapshot() {
         use std::os::unix::fs::PermissionsExt;
@@ -988,6 +1054,63 @@ mod tests {
             decode(&versioned),
             Err(SnapshotError::UnsupportedVersion(999))
         ));
+    }
+
+    #[test]
+    fn decode_rejects_invalid_parent_links() {
+        let index = sample_index();
+        let good = encode(&index, &[]);
+
+        // A parent outside the record array would panic path materialization.
+        let mut oob = good.clone();
+        set_record_parent(&mut oob, 0, 999_999);
+        refresh_checksum(&mut oob);
+        assert!(matches!(decode(&oob), Err(SnapshotError::Truncated)));
+        assert!(matches!(
+            IndexImage::from_bytes(&oob),
+            Err(SnapshotError::Truncated)
+        ));
+
+        // A self-parent and a two-record cycle would hang `subtree_ends`.
+        let mut self_cycle = good.clone();
+        set_record_parent(&mut self_cycle, 0, 0);
+        refresh_checksum(&mut self_cycle);
+        assert!(matches!(decode(&self_cycle), Err(SnapshotError::Truncated)));
+        assert!(matches!(
+            IndexImage::from_bytes(&self_cycle),
+            Err(SnapshotError::Truncated)
+        ));
+
+        let mut cycle = good.clone();
+        set_record_parent(&mut cycle, 0, 1);
+        set_record_parent(&mut cycle, 1, 0);
+        refresh_checksum(&mut cycle);
+        assert!(matches!(decode(&cycle), Err(SnapshotError::Truncated)));
+        assert!(matches!(
+            IndexImage::from_bytes(&cycle),
+            Err(SnapshotError::Truncated)
+        ));
+    }
+
+    #[test]
+    fn load_falls_back_to_prev_on_invalid_parent_link() {
+        let dir = temp_dir("bad-parent-prev");
+        let path = dir.join("index.snapshot");
+        let index = sample_index();
+        // The second write moves the first snapshot to `.prev`.
+        save(&index, &[], &path).unwrap();
+        save(&index, &[], &path).unwrap();
+
+        let mut bad = encode(&index, &[]);
+        set_record_parent(&mut bad, 0, 999_999);
+        refresh_checksum(&mut bad);
+        fs::write(&path, &bad).unwrap();
+
+        let (loaded, _) = load(&path).unwrap();
+        assert_eq!(loaded.len(), index.len());
+        assert_eq!(loaded.search("report", 10, 0).hits.len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

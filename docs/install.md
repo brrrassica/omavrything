@@ -1,6 +1,6 @@
 # Installation and setup
 
-`omavrything` is at **v0.2.3**, released and used day to day. Install it as an
+`omavrything` is at **v0.2.4**, released and used day to day. Install it as an
 Omarchy plugin (§0), or from a release archive or source (§1–2). It targets
 **Omarchy Quattro (4.x)** only — Hyprland, `omarchy-shell` (Quickshell), Arch
 Linux. There is no backwards compatibility with earlier Omarchy releases that
@@ -28,7 +28,9 @@ manifest. After a plugin update it re-runs the installer for the new version
 instead of treating the old binary as "already installed", so a security fix in
 the reviewed source reaches existing installations without a manual step. The
 checksum pins in `scripts/daemon-checksums.txt` must include the new version, or
-the fetch and installer refuse to proceed.
+the fetch and installer refuse to proceed. The pins are committed in the
+version-bump pull request, before the `v<version>` tag is pushed, so there is no
+post-release digest push.
 
 The manual `sudo scripts/install.sh` path (§6) remains for **headless or offline**
 installs: a machine with no polkit agent, or one that cannot reach the release

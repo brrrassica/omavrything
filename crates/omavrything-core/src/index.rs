@@ -1230,6 +1230,13 @@ impl Index {
             inserted += 1;
         }
         if inserted > 0 {
+            // Recompute subtree ranges from the parent links rather than trusting
+            // the incremental stack. A scan inserts every root before any walk
+            // entry, so the stack would close each root but the last long before
+            // its own descendants are appended (issue #30).
+            if self.candidate_enabled {
+                self.candidate.set_subtree_end(subtree_ends(&self.records));
+            }
             self.invalidate_cache();
         }
         inserted
