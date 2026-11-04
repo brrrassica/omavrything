@@ -969,15 +969,26 @@ impl Index {
         }
         self.invalidate_cache();
 
+        // Compute the whole remap table before rewriting any record: a live
+        // record may link to a parent with a greater index (a file moved into a
+        // directory created after it), and that parent's new index is not known
+        // until every tombstone before it has been counted.
         let mut remap = vec![u32::MAX; self.records.len()];
+        let mut live = 0u32;
+        for (i, rec) in self.records.iter().enumerate() {
+            if !rec.is_deleted() {
+                remap[i] = live;
+                live += 1;
+            }
+        }
+
         let mut records = Vec::with_capacity(self.live);
         let mut paths = Vec::with_capacity(self.paths.len());
 
-        for (i, rec) in self.records.iter().enumerate() {
+        for rec in self.records.iter() {
             if rec.is_deleted() {
                 continue;
             }
-            remap[i] = records.len() as u32;
 
             let path_off = paths.len() as u32;
             paths.extend_from_slice(stored_bytes(rec, &self.paths));
@@ -2662,6 +2673,37 @@ mod tests {
         // Parent links are remapped to the compacted record indices.
         assert_eq!(index.record(b).parent, home);
         assert_eq!(index.search("b.txt", 10, 0).hits.len(), 1);
+    }
+
+    #[test]
+    fn compact_preserves_forward_parent_links() {
+        // Renaming a file into a directory created after it produces a child
+        // whose parent index is greater than its own. Compaction must still
+        // remap that parent instead of rewriting the child as parentless.
+        let mut index = Index::new();
+        index.add_root(Path::new("/"), FsKind::Other);
+        index.insert(Path::new("/home"), true, 0, 0);
+        let file = index.insert(Path::new("/home/file.txt"), false, 1, 0);
+        index.insert(Path::new("/home/newdir"), true, 0, 0);
+        assert!(index.rename(
+            Path::new("/home/file.txt"),
+            Path::new("/home/newdir/file.txt")
+        ));
+        let newdir = idx_of(&index, "/home/newdir");
+        assert_eq!(index.record(file).parent, newdir);
+        assert!(index.record(file).parent > file);
+
+        // Any tombstone triggers compaction.
+        index.insert(Path::new("/home/dead.txt"), false, 0, 0);
+        assert!(index.remove(Path::new("/home/dead.txt")));
+        index.compact();
+
+        assert_eq!(index.find(Path::new("/home/newdir/file.txt")), Some(file));
+        assert_eq!(index.path(file), "/home/newdir/file.txt");
+        assert_eq!(index.record(file).parent, newdir);
+        let out = index.search("file", 10, 0);
+        assert_eq!(out.total, 1);
+        assert_eq!(out.hits[0].path, "/home/newdir/file.txt");
     }
 
     #[test]
