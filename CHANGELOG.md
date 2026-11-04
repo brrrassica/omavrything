@@ -83,8 +83,8 @@ Notable changes to `omavrything`. The format follows
 
 - **Version bumped to `0.2.3`.** The shell plugin manifest, the workspace,
   `Cargo.lock`, the AUR `PKGBUILD`, the man page, and the docs are updated to
-  match. Release artifacts for `0.2.3` still need to be built and pinned in
-  `scripts/daemon-checksums.txt` before the plugin can fetch them.
+  match. The `0.2.3` release archive and both binaries are published and pinned
+  in `scripts/daemon-checksums.txt`, so the plugin can fetch and install them.
 
 ## [0.2.2] — 2026-11-01
 
