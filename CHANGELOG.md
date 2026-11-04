@@ -4,6 +4,46 @@ Notable changes to `omavrything`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.4] — 2026-11-04
+
+### Security
+
+- **A repetitive query term can no longer exhaust the daemon's memory.**
+  `CandidateIndex::term_candidates` expanded and retained one posting list per
+  trigram window, including repeated identical trigrams. A permitted ~64 KiB
+  term built from one repeated character could therefore expand the same large
+  posting list tens of thousands of times — about 24 GB of transient payload for
+  an index with 100,000 descendants — before matching or pagination ran. Query
+  trigrams are now deduplicated, the intersection is streamed one posting list
+  at a time (most selective first, so only the accumulator and the current list
+  are resident), and a term with more than `MAX_TERM_TRIGRAMS` distinct trigrams
+  declines to narrow so the linear matcher handles it instead. The candidate set
+  remains a superset of the matches.
+
+### Fixed
+
+- **Candidate narrowing covers scan-root and parentless path components
+  (issue #34).** A bulk record with `parent == u32::MAX` — a configured scan
+  root or a file whose parent was never indexed — now posts its full lowercased
+  path at the record level (and at the directory level for a directory). A query
+  matching a component above the root, such as `tmp` for `/tmp/qa-probe-scan`,
+  now returns the same records as the linear scan instead of zero.
+- **Excluded subtrees stay excluded even when a subtree scan is handed the
+  excluded root (issue #36).** `live::apply` and `apply_delta` already pruned
+  created and renamed-in paths, but `scan_subtree` and `scan_subtree_into_delta`
+  walked a root without testing it against the excludes. A parent watcher still
+  delivers a `CREATE` for an excluded directory (with the common `**/.cache`
+  spelling only the root matches), so the subtree scanners now reject an
+  excluded walk root. The record itself and every descendant stay out of the
+  index.
+
+### Changed
+
+- **Version bumped to `0.2.4`.** The shell plugin manifest, the workspace,
+  `Cargo.lock`, the AUR `PKGBUILD`, the man page, and the docs are updated to
+  match. Release artifacts for `0.2.4` still need to be built and pinned in
+  `scripts/daemon-checksums.txt` before the plugin can fetch them.
+
 ## [0.2.3] — 2026-11-02
 
 ### Security

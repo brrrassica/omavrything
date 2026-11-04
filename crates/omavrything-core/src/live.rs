@@ -463,4 +463,63 @@ mod tests {
 
         let _ = fs::remove_dir_all(&base);
     }
+
+    #[test]
+    fn excluded_directory_without_trailing_glob_is_not_indexed() {
+        // Regression (issue #36): the watcher does not watch an excluded
+        // directory, but its parent still delivers a `CREATE` for it. With the
+        // common `**/.cache` spelling (no trailing `/**`) only the directory
+        // itself matches the exclude, so the event must be dropped before the
+        // subtree scan runs.
+        let base = temp_dir("excluded-cache");
+        let cache = base.join(".cache");
+        fs::create_dir_all(cache.join("sub")).unwrap();
+        fs::write(cache.join("sub/big.bin"), b"x").unwrap();
+
+        let mut config = ScanConfig::with_roots(vec![base.clone()]);
+        config.excludes = vec!["**/.cache".into()];
+
+        let mut index = Index::new();
+        assert!(!apply(
+            &mut index,
+            &FsEvent::Created(cache.clone()),
+            &config
+        ));
+        assert!(index.find(&cache).is_none());
+        assert!(index.find(&cache.join("sub")).is_none());
+        assert!(index.find(&cache.join("sub/big.bin")).is_none());
+        assert_eq!(index.search("big", 10, 0).hits.len(), 0);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn delta_events_ignore_an_excluded_directory_root() {
+        // The evicted-image path must apply the same exclusion rule: a create
+        // for an excluded directory adds no base records and no delta entries.
+        let base = temp_dir("excluded-cache-delta");
+        let cache = base.join(".cache");
+        fs::create_dir_all(cache.join("sub")).unwrap();
+        fs::write(cache.join("sub/big.bin"), b"x").unwrap();
+
+        let mut config = ScanConfig::with_roots(vec![base.clone()]);
+        config.excludes = vec!["**/.cache".into()];
+
+        let mut index = Index::new();
+        let by_path = PathIndex::build(index.records(), index.paths());
+        let mut delta = DeltaIndex::new();
+        assert!(!apply_delta(
+            &mut delta,
+            &by_path,
+            index.records(),
+            index.paths(),
+            &FsEvent::Created(cache.clone()),
+            &config
+        ));
+        index.apply_delta(&delta);
+        assert!(index.find(&cache).is_none());
+        assert!(index.find(&cache.join("sub/big.bin")).is_none());
+
+        let _ = fs::remove_dir_all(&base);
+    }
 }

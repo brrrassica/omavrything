@@ -349,6 +349,14 @@ pub fn scan_into_index(index: &mut Index, config: &ScanConfig) -> ScanReport {
 /// updates when a new directory appears.
 pub fn scan_subtree(index: &mut Index, root: &Path, config: &ScanConfig) {
     let excludes = GlobSet::new(&config.excludes);
+    // `walk` prunes excluded entries but not the walk root itself, and callers
+    // may hand us an excluded directory directly. Rejecting it here keeps the
+    // scanner's contract (an excluded subtree is never indexed) independent of
+    // the caller, including when the root matches a pattern such as `**/.cache`
+    // that has no trailing `/**` (issue #36).
+    if !excludes.is_empty() && excludes.matches(root) {
+        return;
+    }
     let root_dev = fs::metadata(root).map(|m| m.dev()).ok();
     let errors = ScanErrors::new();
     let boundaries = mount_boundaries();
@@ -383,6 +391,11 @@ pub fn scan_subtree(index: &mut Index, root: &Path, config: &ScanConfig) {
 /// new directory appears while the base image is evicted.
 pub fn scan_subtree_into_delta(delta: &mut DeltaIndex, root: &Path, config: &ScanConfig) {
     let excludes = GlobSet::new(&config.excludes);
+    // See `scan_subtree`: an excluded walk root must not contribute entries,
+    // even when it was reached through a parent's create event (issue #36).
+    if !excludes.is_empty() && excludes.matches(root) {
+        return;
+    }
     let root_dev = fs::metadata(root).map(|m| m.dev()).ok();
     let errors = ScanErrors::new();
     let boundaries = mount_boundaries();
@@ -1152,6 +1165,30 @@ mod tests {
         enabled_paths.sort();
         disabled_paths.sort();
         assert_eq!(enabled_paths, disabled_paths);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn subtree_scan_rejects_an_excluded_walk_root() {
+        // Regression (issue #36): `walk` checks excludes on the entries it
+        // reads, not on the directory it is handed, so a live create event for
+        // an excluded directory would still index the whole subtree. With the
+        // `**/.cache` spelling (no trailing `/**`) only the root matches.
+        let base = temp_dir("scan-excluded-subtree");
+        let cache = base.join(".cache");
+        fs::create_dir_all(cache.join("sub")).unwrap();
+        fs::write(cache.join("sub/big.bin"), b"x").unwrap();
+
+        let config = ScanConfig {
+            excludes: vec!["**/.cache".into()],
+            ..ScanConfig::with_roots(vec![base.clone()])
+        };
+        let mut index = Index::new();
+        scan_subtree(&mut index, &cache, &config);
+        assert!(index.find(&cache.join("sub")).is_none());
+        assert!(index.find(&cache.join("sub/big.bin")).is_none());
+        assert_eq!(index.search("big.bin", 10, 0).hits.len(), 0);
 
         let _ = fs::remove_dir_all(&base);
     }
