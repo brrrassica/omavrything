@@ -4,6 +4,20 @@ Notable changes to `omavrything`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Compaction and snapshot encoding no longer reinterpret a live child of a
+  tombstoned parent as a top-level file.** A delta fold can replace a directory
+  record (tombstoning the old one) while its children stay live. Both
+  `Index::compact` and `snapshot::encode` remapped the dead parent to the
+  parentless sentinel but kept the child's basename storage, so the basename was
+  then treated as a full path and the record became unreachable by its real path.
+  Both paths now write the full path for such orphaned records. Regression tests:
+  `compact_keeps_full_paths_when_a_parent_is_tombstoned` and
+  `encode_keeps_full_paths_when_a_parent_is_tombstoned`.
+
 ## [0.2.4] — 2026-11-04
 
 ### Security
