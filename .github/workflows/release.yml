@@ -10,11 +10,22 @@ name: Release
 # package cache, so pacman, the Rust toolchain, crates and build artifacts are
 # reused instead of being re-downloaded for every release.
 #
-# The Rust toolchain is PINNED to an exact release (1.99.1) rather than the
-# floating `stable` channel, so a release is reproducible and rustup never has
-# to re-resolve the channel over the network. $CARGO_HOME/bin goes on PATH and
-# the install runs under flock /ci/cache/locks/rustup.lock, so it neither
-# re-downloads the rustup installer nor races another job on the shared cache.
+# The compiler and linker are PINNED to the exact Arch packages that produced
+# the committed digests: `rust 1:1.99.1-1` (rustc commit 58cf8f9c3) and
+# `lld 23.1.3-4`. rustup is deliberately NOT used: even at the same version it
+# produces different binaries, and the system linker version is embedded in the
+# output. The Cargo registry path is also embedded in the binaries (dependency
+# panic locations), so the build uses CARGO_HOME=/home/sam/.cargo, matching the
+# build that committed the pins; that path is symlinked to the runner's
+# persistent cargo cache.
+#
+# The release is DIGEST-PINNED: the version-bump PR commits the SHA-256 of the
+# archive and of both binaries to scripts/daemon-checksums.txt. This workflow
+# rebuilds the archive from the tag and verifies it against that pin before it
+# publishes anything; a missing or mismatched pin fails the release. It does NOT
+# re-pin the digests after publishing: that post-tag step in the 0.2.3 workflow
+# could not even open its PR (GitHub Actions is not permitted to create pull
+# requests) and forced a manual re-push just for the digest.
 on:
   push:
     tags:
@@ -27,8 +38,6 @@ on:
 
 permissions:
   contents: write
-  # The digest-pinning step opens a PR because main is protected.
-  pull-requests: write
 
 jobs:
   release:
@@ -39,20 +48,19 @@ jobs:
       volumes:
         - /home/github-runner/ci-cache/pacman-pkg:/var/cache/pacman/pkg
         - /home/github-runner/ci-cache/cargo:/ci/cache/cargo
-        - /home/github-runner/ci-cache/rustup:/ci/cache/rustup
         - /home/github-runner/ci-cache/targets:/ci/cache/targets
         - /home/github-runner/ci-cache/locks:/ci/cache/locks
     env:
-      CARGO_HOME: /ci/cache/cargo
-      RUSTUP_HOME: /ci/cache/rustup
-      RUSTUP_TOOLCHAIN: 1.99.1
+      # The pinned binaries embed this exact registry path in dependency panic
+      # locations. It is symlinked to the runner's cache in the step below.
+      CARGO_HOME: /home/sam/.cargo
       CARGO_TARGET_DIR: /ci/cache/targets/${{ github.repository }}/${{ github.job }}
     steps:
       - name: Install dependencies (from the local pacman cache)
         run: |
           mkdir -p "$CARGO_TARGET_DIR"
           flock /ci/cache/locks/pacman.lock \
-            pacman -Syu --noconfirm --needed --overwrite '*' git curl zip
+            pacman -Syu --noconfirm --needed --overwrite '*' git curl zip rust
 
       - uses: actions/checkout@v4
         with:
@@ -68,20 +76,29 @@ jobs:
           mkdir -p "$CARGO_TARGET_DIR"
           rm -rf target
           ln -s "$CARGO_TARGET_DIR" target
-      - name: Put the cached cargo/rustup shims on PATH
-        run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
-      # Install under the cache lock so the action below only has to confirm
-      # the toolchain is already present.
-      - name: Pre-install the pinned toolchain under the cache lock
+      # The committed pin was produced with the Arch rust package and
+      # lld 23.1.3-4, not rustup and not the newest lld. Both the linker
+      # version (in .comment) and the Cargo registry path (in dependency panic
+      # locations) are embedded in the binaries, so reproduce them exactly.
+      - name: Pin the compiler inputs
         run: |
-          flock /ci/cache/locks/rustup.lock \
-            rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update
-
-      - name: Install Rust toolchain (reused from RUSTUP_HOME)
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.99.1
+          set -euo pipefail
+          lld_version=23.1.3-4
+          args=()
+          for pkg in llvm-libs lld compiler-rt; do
+            cached="/var/cache/pacman/pkg/${pkg}-${lld_version}-x86_64.pkg.tar.zst"
+            if [[ -f "$cached" ]]; then
+              args+=("$cached")
+            else
+              args+=("https://archive.archlinux.org/packages/${pkg:0:1}/${pkg}/${pkg}-${lld_version}-x86_64.pkg.tar.zst")
+            fi
+          done
+          pacman -U --noconfirm "${args[@]}"
+          mkdir -p /home/sam
+          rm -rf /home/sam/.cargo
+          ln -s /ci/cache/cargo /home/sam/.cargo
+          ld.lld --version
 
       - name: Resolve the release tag
         id: tag
@@ -90,8 +107,66 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
 
+      # The digest pin is only meaningful if the compiler is the one the pin
+      # was produced with. 1.99.1 is the Rust release (commit 58cf8f9c3) the
+      # version-bump PR used; the Arch container supplies the matching glibc,
+      # gcc and binutils. Print the library versions so a mismatch is visible in
+      # the log, and fail if rustc is not the pinned commit.
+      - name: Verify the pinned toolchain
+        run: |
+          set -euo pipefail
+          hash -r
+          command -v rustc
+          command -v cargo
+          rustc -vV
+          cargo --version
+          ld.lld --version
+          pacman -Q rust lld llvm-libs compiler-rt glibc gcc binutils zip
+          test "$(rustc -vV | sed -n 's/^release: //p')" = "1.99.1"
+          test "$(rustc -vV | sed -n 's/^commit-hash: //p')" = "58cf8f9c35b355199727627d07ae34a4e2846d67"
+          cargo --version | grep -q '1.99.1'
+          pacman -Q rust | grep -q '^rust 1:1.99.1-1$'
+          ld.lld --version | grep -q 'LLD 23.1.3'
+          test "$CARGO_HOME" = "/home/sam/.cargo"
+
       - name: Build the release archive
         run: scripts/package-release.sh "${{ steps.tag.outputs.version }}"
+
+      # The archive and both binaries must match the digests committed in the
+      # tagged tree. If this fails, the release is not the reviewed artifact:
+      # fail before creating the GitHub release rather than re-pinning it.
+      - name: Verify the archive against the pinned digests
+        run: |
+          set -euo pipefail
+          version="${{ steps.tag.outputs.version }}"
+          arch="$(uname -m)"
+          name="omavrything-${version}-${arch}"
+          pinned="scripts/daemon-checksums.txt"
+          [[ -f "$pinned" ]] || {
+            echo "error: $pinned is missing from the tagged tree" >&2
+            exit 1
+          }
+          verify() {
+            local file="$1"
+            local expected actual
+            expected="$(awk -v f="$file" '$2 == f { print $1; exit }' "$pinned")"
+            if [[ -z "$expected" ]]; then
+              echo "error: no pinned digest for $file in $pinned" >&2
+              echo "       the version-bump PR must pin the release before tagging" >&2
+              exit 1
+            fi
+            actual="$(sha256sum "dist/$file" | awk '{print $1}')"
+            if [[ "$actual" != "$expected" ]]; then
+              echo "error: reproducible build mismatch for $file" >&2
+              echo "       pinned $expected" >&2
+              echo "       built  $actual" >&2
+              exit 1
+            fi
+            echo "verified $file  $expected"
+          }
+          verify "${name}.zip"
+          verify "${name}/bin/omavrythingd"
+          verify "${name}/bin/omavry"
 
       - name: Create the GitHub release
         uses: softprops/action-gh-release@v2
@@ -124,41 +199,3 @@ jobs:
             immediately; the group change takes effect on your next login.
 
             See `docs/install.md` inside the archive for the full setup.
-
-      # package-release.sh wrote the pinned digests for this release to
-      # dist/daemon-checksums.txt. The plugin's fetch-on-first-run bootstrap
-      # (scripts/fetch-daemon.sh) and the installer (scripts/install.sh) verify
-      # against scripts/daemon-checksums.txt, and the plugin clones the default
-      # branch, so commit the generated file there; otherwise the bootstrap and
-      # the installer fail closed and refuse to install the release. This is the
-      # provenance binding: the shipped binaries are tied to the reviewed commit
-      # that carries the digests.
-      #
-      # main is protected (changes must go through a PR), so open a PR with the
-      # digest update instead of pushing directly. When the file is already up to
-      # date the action makes no branch and no PR.
-      - name: Stage the pinned digests
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git fetch origin main
-          git checkout -B main origin/main
-          cp dist/daemon-checksums.txt scripts/daemon-checksums.txt
-
-      - name: Open a PR with the pinned digests
-        uses: peter-evans/create-pull-request@v7
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          base: main
-          branch: chore/release-${{ steps.tag.outputs.version }}-digests
-          delete-branch: true
-          add-paths: scripts/daemon-checksums.txt
-          commit-message: "chore(release): pin omavrything-${{ steps.tag.outputs.version }} digests"
-          title: "chore(release): pin omavrything-${{ steps.tag.outputs.version }} digests"
-          body: |
-            Pins the SHA-256 digests for `omavrything-${{ steps.tag.outputs.version }}` in
-            `scripts/daemon-checksums.txt`, binding the published release artifacts to
-            the reviewed source that the plugin clones.
-
-            Generated by the Release workflow for `${{ steps.tag.outputs.tag }}`.
