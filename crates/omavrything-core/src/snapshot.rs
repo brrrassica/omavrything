@@ -33,13 +33,14 @@
 //! ([`load`]) or by memory-mapping it ([`load_mmap`], F6); the latter avoids the
 //! intermediate read buffer. [`warm_start_with`] selects between them.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use crate::index::{FileRecord, FsKind, Index, Root, SearchOutcome};
+use crate::index::{FileRecord, FsKind, Index, Root, SearchOutcome, write_full_path_bytes};
 use crate::scan::{ScanConfig, ScanReport, resolve_roots, scan, scan_into_index};
 
 const MAGIC: &[u8; 8] = b"OMAVIMG\0";
@@ -254,6 +255,13 @@ pub fn encode(index: &Index, identities: &[RootIdentity]) -> Vec<u8> {
     let mut records_section: Vec<u8> = Vec::with_capacity(8 + live as usize * RECORD_BYTES);
     put_u32(&mut records_section, live);
     records_section.extend_from_slice(&[0u8; 4]);
+    // A live child can outlive its parent record: a delta fold replaces
+    // (tombstones) a directory while its descendants stay live. The encoder
+    // remaps the dead parent to the sentinel, so the child must be written with
+    // its full path; keeping the basename would make the loader interpret it as
+    // the whole path.
+    let mut extra_paths: Vec<u8> = Vec::new();
+    let mut full: Vec<u8> = Vec::new();
     for rec in records.iter() {
         if rec.is_deleted() {
             continue;
@@ -263,24 +271,43 @@ pub fn encode(index: &Index, identities: &[RootIdentity]) -> Vec<u8> {
         } else {
             remap[rec.parent as usize]
         };
+        let (path_off, path_len) = if parent == u32::MAX && rec.parent != u32::MAX {
+            full.clear();
+            write_full_path_bytes(rec, records, index.paths(), &mut full);
+            let off = index.paths().len() as u32 + extra_paths.len() as u32;
+            let len = full.len().min(u16::MAX as usize) as u16;
+            extra_paths.extend_from_slice(&full);
+            (off, len)
+        } else {
+            (rec.path_off, rec.path_len)
+        };
         let out = FileRecord {
             size: rec.size,
             mtime: rec.mtime,
             parent,
-            path_off: rec.path_off,
-            path_len: rec.path_len,
+            path_off,
+            path_len,
             depth: rec.depth,
             flags: rec.flags,
         };
         records_section.extend_from_slice(record_bytes(&out));
     }
 
-    let paths_section = index.paths();
+    // Copy the path arena only when an orphaned child needed a new full path;
+    // otherwise keep the zero-copy borrow of the index's own arena.
+    let paths_section: Cow<'_, [u8]> = if extra_paths.is_empty() {
+        Cow::Borrowed(index.paths())
+    } else {
+        let mut paths = Vec::with_capacity(index.paths().len() + extra_paths.len());
+        paths.extend_from_slice(index.paths());
+        paths.extend_from_slice(&extra_paths);
+        Cow::Owned(paths)
+    };
 
     let sections: [(u32, &[u8]); 4] = [
         (SECTION_ROOTS, roots_section.as_slice()),
         (SECTION_RECORDS, records_section.as_slice()),
-        (SECTION_PATHS, paths_section),
+        (SECTION_PATHS, paths_section.as_ref()),
         (SECTION_ROOT_STRINGS, root_strings.as_slice()),
     ];
     let section_count = sections.len();
@@ -923,6 +950,7 @@ fn fnv1a64(data: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::DeltaIndex;
     use std::path::Path;
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -1130,6 +1158,36 @@ mod tests {
         assert_eq!(back_ids, ids);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn encode_keeps_full_paths_when_a_parent_is_tombstoned() {
+        // A delta fold can replace a directory record while its children stay
+        // live. The encoder remaps the dead parent to the sentinel, so the child
+        // must be written with its full path, not the basename it stored while
+        // the parent was alive.
+        let mut index = Index::new();
+        index.add_root(Path::new("/"), FsKind::Other);
+        index.insert(Path::new("/home"), true, 0, 0);
+        let dir = index.insert(Path::new("/home/dir"), true, 0, 0);
+        index.insert(Path::new("/home/dir/file.txt"), false, 1, 0);
+
+        let mut delta = DeltaIndex::new();
+        delta.remove(dir);
+        delta.insert(Path::new("/home/dir"), true, false, 0, 0);
+        index.apply_delta(&delta);
+
+        let bytes = encode(&index, &[]);
+        let (decoded, _) = decode(&bytes).unwrap();
+        let file = decoded
+            .find(Path::new("/home/dir/file.txt"))
+            .expect("the live child must survive the snapshot with its full path");
+        assert_eq!(decoded.path(file), "/home/dir/file.txt");
+        assert_eq!(decoded.name(file), "file.txt");
+        assert_eq!(
+            decoded.search("file.txt", 10, 0).hits[0].path,
+            "/home/dir/file.txt"
+        );
     }
 
     #[test]

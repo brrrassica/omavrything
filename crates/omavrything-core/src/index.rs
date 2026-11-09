@@ -969,30 +969,55 @@ impl Index {
         }
         self.invalidate_cache();
 
+        // Compute the whole remap table before rewriting any record: a live
+        // record may link to a parent with a greater index (a file moved into a
+        // directory created after it), and that parent's new index is not known
+        // until every tombstone before it has been counted.
         let mut remap = vec![u32::MAX; self.records.len()];
+        let mut live = 0u32;
+        for (i, rec) in self.records.iter().enumerate() {
+            if !rec.is_deleted() {
+                remap[i] = live;
+                live += 1;
+            }
+        }
+
         let mut records = Vec::with_capacity(self.live);
         let mut paths = Vec::with_capacity(self.paths.len());
+        let mut full: Vec<u8> = Vec::new();
 
-        for (i, rec) in self.records.iter().enumerate() {
+        for rec in self.records.iter() {
             if rec.is_deleted() {
                 continue;
             }
-            remap[i] = records.len() as u32;
-
-            let path_off = paths.len() as u32;
-            paths.extend_from_slice(stored_bytes(rec, &self.paths));
 
             let parent = if rec.parent == u32::MAX {
                 u32::MAX
             } else {
                 remap[rec.parent as usize]
             };
+            // A live child can outlive its parent record: a delta fold replaces
+            // (tombstones) a directory while its descendants stay live. Remapping
+            // that parent to the sentinel makes the record parentless, so it must
+            // store its full path; keeping the basename would make
+            // `stores_full_path` reinterpret it as the whole path.
+            let stored: &[u8] = if parent == u32::MAX && rec.parent != u32::MAX {
+                full.clear();
+                write_full_path_bytes(rec, &self.records, &self.paths, &mut full);
+                &full
+            } else {
+                stored_bytes(rec, &self.paths)
+            };
+            let path_off = paths.len() as u32;
+            let path_len = stored.len().min(u16::MAX as usize) as u16;
+            paths.extend_from_slice(stored);
+
             records.push(FileRecord {
                 size: rec.size,
                 mtime: rec.mtime,
                 parent,
                 path_off,
-                path_len: rec.path_len,
+                path_len,
                 depth: rec.depth,
                 flags: rec.flags,
             });
@@ -2662,6 +2687,65 @@ mod tests {
         // Parent links are remapped to the compacted record indices.
         assert_eq!(index.record(b).parent, home);
         assert_eq!(index.search("b.txt", 10, 0).hits.len(), 1);
+    }
+
+    #[test]
+    fn compact_preserves_forward_parent_links() {
+        // Renaming a file into a directory created after it produces a child
+        // whose parent index is greater than its own. Compaction must still
+        // remap that parent instead of rewriting the child as parentless.
+        let mut index = Index::new();
+        index.add_root(Path::new("/"), FsKind::Other);
+        index.insert(Path::new("/home"), true, 0, 0);
+        let file = index.insert(Path::new("/home/file.txt"), false, 1, 0);
+        index.insert(Path::new("/home/newdir"), true, 0, 0);
+        assert!(index.rename(
+            Path::new("/home/file.txt"),
+            Path::new("/home/newdir/file.txt")
+        ));
+        let newdir = idx_of(&index, "/home/newdir");
+        assert_eq!(index.record(file).parent, newdir);
+        assert!(index.record(file).parent > file);
+
+        // Any tombstone triggers compaction.
+        index.insert(Path::new("/home/dead.txt"), false, 0, 0);
+        assert!(index.remove(Path::new("/home/dead.txt")));
+        index.compact();
+
+        assert_eq!(index.find(Path::new("/home/newdir/file.txt")), Some(file));
+        assert_eq!(index.path(file), "/home/newdir/file.txt");
+        assert_eq!(index.record(file).parent, newdir);
+        let out = index.search("file", 10, 0);
+        assert_eq!(out.total, 1);
+        assert_eq!(out.hits[0].path, "/home/newdir/file.txt");
+    }
+
+    #[test]
+    fn compact_keeps_full_paths_when_a_parent_is_tombstoned() {
+        // A delta fold can replace a directory record while its children stay
+        // live, so the old parent index becomes a tombstone. Compaction remaps
+        // that link to the sentinel; a basename-stored child must then switch to
+        // full-path storage or its basename is reinterpreted as a whole path.
+        let mut index = Index::new();
+        index.add_root(Path::new("/"), FsKind::Other);
+        index.insert(Path::new("/home"), true, 0, 0);
+        let dir = index.insert(Path::new("/home/dir"), true, 0, 0);
+        index.insert(Path::new("/home/dir/file.txt"), false, 1, 0);
+
+        let mut delta = DeltaIndex::new();
+        delta.remove(dir);
+        delta.insert(Path::new("/home/dir"), true, false, 0, 0);
+        index.apply_delta(&delta);
+        index.compact();
+
+        let file = index
+            .find(Path::new("/home/dir/file.txt"))
+            .expect("the live child must still resolve by its full path");
+        assert_eq!(index.path(file), "/home/dir/file.txt");
+        assert_eq!(index.name(file), "file.txt");
+        let out = index.search("file.txt", 10, 0);
+        assert_eq!(out.total, 1);
+        assert_eq!(out.hits[0].path, "/home/dir/file.txt");
     }
 
     #[test]

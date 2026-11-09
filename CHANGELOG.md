@@ -4,6 +4,38 @@ Notable changes to `omavrything`. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.2.5] — 2026-11-09
+
+### Fixed
+
+- **Compaction and snapshot encoding no longer reinterpret a live child of a
+  tombstoned parent as a top-level file (issue #43).** A delta fold can replace a
+  directory record (tombstoning the old one) while its children stay live. Both
+  `Index::compact` and `snapshot::encode` remapped the dead parent to the
+  parentless sentinel but kept the child's basename storage, so the basename was
+  then treated as a full path and the record became unreachable by its real path.
+  Both paths now write the full path for such orphaned records. Regression tests:
+  `compact_keeps_full_paths_when_a_parent_is_tombstoned` and
+  `encode_keeps_full_paths_when_a_parent_is_tombstoned`.
+- **`Index::compact` preserves forward parent links (issue #42, duplicate of
+  #40).** A live record can point at a parent with a greater record index — a
+  file moved into a directory created after it, or one loaded from a snapshot.
+  The remap table is now built in a prepass over every live record before the
+  rewrite, mirroring `snapshot::encode`, so such a child keeps its parent instead
+  of collapsing to `u32::MAX` and having its stored basename misread as a full
+  path. Regression test: `compact_preserves_forward_parent_links`.
+
+### Changed
+
+- **Version bumped to `0.2.5`.** The shell plugin manifest, the workspace,
+  `Cargo.lock`, the AUR `PKGBUILD`, the man page, and the docs are updated to
+  match. The `0.2.5` archive and both binaries are built on the pinned
+  toolchain, verified byte-identical across independent target directories, and
+  pinned in `scripts/daemon-checksums.txt` alongside the existing `0.2.1`–`0.2.4`
+  entries.
+
 ## [0.2.4] — 2026-11-04
 
 ### Security
