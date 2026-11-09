@@ -28,7 +28,9 @@ manifest. After a plugin update it re-runs the installer for the new version
 instead of treating the old binary as "already installed", so a security fix in
 the reviewed source reaches existing installations without a manual step. The
 checksum pins in `scripts/daemon-checksums.txt` must include the new version, or
-the fetch and installer refuse to proceed.
+the fetch and installer refuse to proceed. The pins are committed in the
+version-bump pull request, before the `v<version>` tag is pushed, so there is no
+post-release digest push.
 
 The manual `sudo scripts/install.sh` path (§6) remains for **headless or offline**
 installs: a machine with no polkit agent, or one that cannot reach the release
