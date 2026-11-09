@@ -289,7 +289,7 @@ pub fn parse_data_runs(bytes: &[u8]) -> Vec<(u64, u64)> {
         i += 1;
         let len_size = (header & 0x0F) as usize;
         let off_size = (header >> 4) as usize;
-        if len_size == 0 || i + len_size + off_size > bytes.len() {
+        if len_size == 0 || len_size > 8 || off_size > 8 || i + len_size + off_size > bytes.len() {
             break;
         }
         let mut len = 0u64;
@@ -339,6 +339,15 @@ mod tests {
         // A run at LCN 100 then a sparse/backward run at LCN 90 (offset -10).
         let runs = parse_data_runs(&[0x11, 0x01, 0x64, 0x11, 0x01, 0xF6, 0x00]);
         assert_eq!(runs, vec![(100, 1), (90, 1)]);
+    }
+
+    #[test]
+    fn rejects_oversized_run_list_fields() {
+        // len_size = 1, off_size = 9: the offset field would shift by 64.
+        assert!(parse_data_runs(&[0x91, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0]).is_empty());
+
+        // len_size = 9, off_size = 1: the length field would shift by 64.
+        assert!(parse_data_runs(&[0x19, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0x04, 0]).is_empty());
     }
 
     #[test]
