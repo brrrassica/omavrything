@@ -755,8 +755,10 @@ fn run_scheduler(
             } else {
                 index.with_index_mut(|idx| {
                     let report = apply_rescan(idx, plan);
-                    // A rescan appends the new entries and leaves the vectors at
-                    // their doubled capacity; reclaim it (rc6 RSS spike).
+                    // A rescan tombstones stale records and appends the new
+                    // entries; drop the tombstones once they dominate, then
+                    // reclaim the doubled capacity (rc6 RSS spike).
+                    idx.compact_if_needed();
                     idx.shrink();
                     (report, idx.len() as u64)
                 })

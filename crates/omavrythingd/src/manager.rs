@@ -28,7 +28,19 @@ enum State {
     /// (the `Image` variant is a mapping plus a map).
     Owned(Box<Index>),
     /// The index is evicted: only the mapping and the resident path map remain.
-    Image { mmap: Arc<Mmap>, by_path: PathIndex },
+    ///
+    /// `roots` and `len` are cached at eviction time. `GetStatus` and
+    /// `ListRoots` are callable by every local UID without polkit, and
+    /// `IndexImage::from_bytes` verifies an FNV-1a checksum over the whole
+    /// snapshot body, so re-parsing the mapping on every call would let a local
+    /// caller force repeated O(snapshot) hashing. The cached values make those
+    /// methods O(1).
+    Image {
+        mmap: Arc<Mmap>,
+        by_path: PathIndex,
+        roots: Vec<Root>,
+        len: usize,
+    },
 }
 
 /// Owns the index and its eviction lifecycle.
@@ -163,8 +175,16 @@ impl IndexManager {
     pub fn apply_event(&self, event: &FsEvent, config: &ScanConfig) -> bool {
         let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
         let (changed, fold) = match &mut *state {
-            State::Owned(index) => (live::apply(index, event, config), false),
-            State::Image { mmap, by_path } => {
+            State::Owned(index) => {
+                let changed = live::apply(index, event, config);
+                // The arenas are append-only, so sustained create/remove churn
+                // leaves tombstones behind. Compact once they dominate, so the
+                // owned index stays bounded even when snapshots are disabled
+                // (the same retention bug the evicted delta had).
+                index.compact_if_needed();
+                (changed, false)
+            }
+            State::Image { mmap, by_path, .. } => {
                 let Ok(image) = IndexImage::from_bytes(&mmap[..]) else {
                     return false;
                 };
@@ -261,9 +281,15 @@ impl IndexManager {
             return false;
         };
         let by_path = PathIndex::build(image.records(), image.paths());
+        // Cache the metadata the unauthenticated status methods need, so they
+        // do not re-parse (and re-checksum) the mapping on every call.
+        let roots = image.roots().to_vec();
+        let len = image.len();
         *state = State::Image {
             mmap: Arc::new(mmap),
             by_path,
+            roots,
+            len,
         };
         true
     }
@@ -333,9 +359,9 @@ impl IndexManager {
         let state = self.state.read().unwrap_or_else(|e| e.into_inner());
         match &*state {
             State::Owned(index) => index.roots().to_vec(),
-            State::Image { mmap, .. } => IndexImage::from_bytes(&mmap[..])
-                .map(|image| image.roots().to_vec())
-                .unwrap_or_default(),
+            // Cached at eviction time: no re-parse (and no O(snapshot) checksum)
+            // on this unauthenticated path.
+            State::Image { roots, .. } => roots.clone(),
         }
     }
 
@@ -344,9 +370,8 @@ impl IndexManager {
         let state = self.state.read().unwrap_or_else(|e| e.into_inner());
         match &*state {
             State::Owned(index) => index.len(),
-            State::Image { mmap, .. } => IndexImage::from_bytes(&mmap[..])
-                .map(|image| image.len())
-                .unwrap_or(0),
+            // Cached at eviction time (see `roots`).
+            State::Image { len, .. } => *len,
         }
     }
 
@@ -355,7 +380,7 @@ impl IndexManager {
         let state = self.state.read().unwrap_or_else(|e| e.into_inner());
         match &*state {
             State::Owned(index) => index.memory_bytes(),
-            State::Image { mmap, by_path } => {
+            State::Image { mmap, by_path, .. } => {
                 let delta = self.delta.read().unwrap_or_else(|e| e.into_inner());
                 mmap.len() as u64 + by_path.memory_bytes() + delta.memory_bytes()
             }
@@ -367,7 +392,7 @@ impl IndexManager {
         let state = self.state.read().unwrap_or_else(|e| e.into_inner());
         match &*state {
             State::Owned(index) => index.capacity_bytes(),
-            State::Image { mmap, by_path } => mmap.len() as u64 + by_path.memory_bytes(),
+            State::Image { mmap, by_path, .. } => mmap.len() as u64 + by_path.memory_bytes(),
         }
     }
 
@@ -420,6 +445,33 @@ mod tests {
         index.insert(Path::new("/home/report.pdf"), false, 10, 1);
         index.insert(Path::new("/home/notes.md"), false, 20, 2);
         index
+    }
+
+    #[test]
+    fn evicted_roots_and_len_are_served_from_the_cache() {
+        // `GetStatus` and `ListRoots` are callable by every local UID without
+        // polkit. When evicted, they must read the metadata cached at eviction
+        // time rather than re-parsing (and re-checksumming) the whole snapshot
+        // on every call.
+        let dir = temp_dir("evict-meta");
+        let snap = dir.join("index.snapshot");
+        let manager = IndexManager::new(sample(), Vec::new(), Some(snap));
+
+        let roots_before = manager.roots();
+        let len_before = manager.len();
+        assert_eq!(len_before, 3); // root + report.pdf + notes.md
+
+        manager.evict();
+        assert!(manager.is_evicted());
+
+        // The cached metadata matches the owned index exactly, and repeated
+        // calls are stable.
+        assert_eq!(manager.roots().len(), roots_before.len());
+        assert_eq!(manager.roots()[0].path, roots_before[0].path);
+        assert_eq!(manager.len(), len_before);
+        assert_eq!(manager.len(), len_before);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

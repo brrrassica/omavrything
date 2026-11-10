@@ -37,8 +37,39 @@ Notable changes to `omavrything`. The format follows
   `compaction_keeps_live_inserts_and_their_paths`, and
   `an_evicted_manager_bounds_delta_retention_under_create_remove_churn`.
 
+- **The owned index no longer retains tombstones without bound.** The same
+  append-only retention the evicted delta had also affected the resident index:
+  `Index::compact` was only reached on snapshot encode and after NTFS indexing,
+  so with snapshots disabled (`snapshot_interval = 0` / `no_snapshot`) a
+  long-running daemon under sustained create/remove churn grew without bound.
+  `Index::compact_if_needed` now compacts once tombstones are both numerous
+  (>= 1024) and at least half of the records, and is called on the live-update
+  and rescan paths. Regression tests:
+  `repeated_create_remove_cycles_do_not_grow_the_owned_index` and
+  `compact_if_needed_is_a_noop_below_the_threshold`.
+- **`GetStatus` and `ListRoots` no longer re-parse the whole snapshot per call.**
+  Both are callable by every local UID without polkit, and when the index was
+  evicted each call ran `IndexImage::from_bytes`, which verifies an FNV-1a
+  checksum over the entire snapshot body — an O(snapshot) cost a local caller
+  could force repeatedly. The evicted state now caches the roots and live count
+  at eviction time, making those methods O(1). Regression test:
+  `evicted_roots_and_len_are_served_from_the_cache`.
+- **`blkid` probes are now bounded everywhere.** `volumes::probe_fstype` and the
+  NTFS crate's `probe_blkid`/`list_ntfs_partitions` ran `blkid` with no deadline;
+  a hung probe (a failing device, a stuck udev) would wedge the caller, and the
+  hotplug monitor calls `list_ntfs_partitions` on every pass. Both now kill and
+  reap the child after 5 s. Regression tests:
+  `command_timeout_kills_a_hung_process` and
+  `command_timeout_returns_output_for_a_fast_process`.
+
 ### Security
 
+- **The docs-site workflow no longer runs on the release runner.** `pages.yml`
+  executes repo code (`site/build.py`, `pip install`) and ran on the same
+  on-premise host as the write-privileged release job, so a merged change to the
+  build script could persist state a later release build would consume. It now
+  runs on GitHub-hosted `ubuntu-latest` (and its invalid `actions/checkout@v7`
+  was corrected to `@v4`).
 - **CI and release no longer share a writable Cargo cache.** Pull-request and
   push-to-`main` jobs now run on GitHub-hosted runners; push-to-`develop` keeps
   the on-premise runner. Both run the same `archlinux:base-devel` image and the

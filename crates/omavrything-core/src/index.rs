@@ -38,6 +38,12 @@ const PARALLEL_THRESHOLD: usize = 50_000;
 /// keeps the hot matching loop cache-friendly.
 const PARALLEL_CHUNK: usize = 4096;
 
+/// Compact the owned index once it holds this many tombstones **and** at least
+/// half of its records are dead. Larger than the delta's threshold because
+/// [`Index::compact`] also rebuilds the candidate index and rehashes the path
+/// map, so it is worth waiting for a bigger batch.
+const COMPACT_MIN_TOMBSTONES: usize = 1024;
+
 /// `flags` bit: the record is a directory.
 pub const FLAG_DIR: u8 = 1 << 0;
 /// `flags` bit: the record is a symlink.
@@ -958,6 +964,35 @@ impl Index {
             candidate_capacity_bytes: self.candidate.capacity_bytes(),
             candidate: self.candidate.memory_breakdown(),
         }
+    }
+
+    /// The number of tombstoned records: dead records still occupying the
+    /// append-only arenas. Derived from `live`, which every mutation keeps
+    /// current, so this is O(1).
+    pub fn tombstones(&self) -> usize {
+        self.records.len().saturating_sub(self.live)
+    }
+
+    /// Compact once tombstones are both numerous and at least half of the
+    /// records.
+    ///
+    /// The arenas are append-only, so a create/remove cycle leaves a dead record
+    /// and its path bytes behind. [`Index::compact`] is otherwise only reached on
+    /// snapshot encode and after NTFS indexing, so with snapshots disabled
+    /// (`snapshot_interval = 0` / `no_snapshot`) a long-running daemon under
+    /// sustained churn would grow without bound — the same retention bug the
+    /// evicted-index delta had. Compacting at the halfway point bounds retained
+    /// records at roughly twice the live set, and the amortized cost is O(1) per
+    /// tombstone. A no-op below the threshold, so it is cheap on the hot path.
+    pub fn compact_if_needed(&mut self) {
+        let tombstones = self.tombstones();
+        if tombstones < COMPACT_MIN_TOMBSTONES {
+            return;
+        }
+        if tombstones * 2 < self.records.len() {
+            return;
+        }
+        self.compact();
     }
 
     /// Rebuild the arenas and record vector, dropping tombstones and reclaiming
@@ -2826,6 +2861,59 @@ mod tests {
         index.compact();
         assert_eq!(index.records().len(), before);
         assert_eq!(index.len(), 1);
+    }
+
+    #[test]
+    fn repeated_create_remove_cycles_do_not_grow_the_owned_index() {
+        // The owned index has the same append-only retention as the delta: a
+        // create followed by a removal leaves a tombstone and its path bytes.
+        // `compact_if_needed` must bound retained records independently of the
+        // number of cycles, so a daemon with snapshots disabled does not grow
+        // without bound under churn.
+        let mut index = Index::new();
+        index.add_root(Path::new("/"), FsKind::Other);
+        let path = Path::new("/churn/tmp-file-with-a-reasonably-long-name.txt");
+
+        for _ in 0..5000 {
+            index.insert(path, false, 42, 0);
+            index.remove(path);
+            index.compact_if_needed();
+            // The logical state stays empty after every complete cycle.
+            assert_eq!(index.len(), 1, "only the root stays live");
+            // Retained records stay bounded: never more than one batch of
+            // tombstones accumulated between compactions.
+            assert!(
+                index.records().len() <= COMPACT_MIN_TOMBSTONES * 2 + 1,
+                "retained records grew to {} after 5000 create/remove cycles",
+                index.records().len()
+            );
+        }
+        // Tombstones oscillate between 0 and the threshold: compaction fires
+        // once they reach it, so retention never exceeds one batch.
+        assert!(
+            index.tombstones() < COMPACT_MIN_TOMBSTONES,
+            "tombstones must stay below the compaction threshold, got {}",
+            index.tombstones()
+        );
+    }
+
+    #[test]
+    fn compact_if_needed_is_a_noop_below_the_threshold() {
+        let mut index = Index::new();
+        index.add_root(Path::new("/"), FsKind::Other);
+        for i in 0..(COMPACT_MIN_TOMBSTONES / 2) {
+            let p = format!("/gone/{i}.tmp");
+            index.insert(Path::new(&p), false, 0, 0);
+            index.remove(Path::new(&p));
+        }
+        let before = index.records().len();
+        index.compact_if_needed();
+        assert_eq!(
+            index.records().len(),
+            before,
+            "below the threshold nothing is reclaimed"
+        );
+        assert!(index.tombstones() > 0);
     }
 
     #[test]

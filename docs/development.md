@@ -18,6 +18,10 @@ runner that later performs a write-privileged release:
   `ubuntu-latest`, still inside the same `archlinux:base-devel` container.
 - Push-to-`develop` jobs run on the **on-premise** runner
   (`[self-hosted, opencode-sam]`).
+- The docs-site workflow ([`.github/workflows/pages.yml`](../.github/workflows/pages.yml))
+  also runs on GitHub-hosted `ubuntu-latest`: it executes repo code
+  (`site/build.py`, `pip install`) and must not share a host with the release
+  job.
 - The release workflow runs only on the on-premise runner and uses its own
   `/home/github-runner/release-cache` Cargo/target volume that CI can never
   write, with `persist-credentials: false` on checkout.

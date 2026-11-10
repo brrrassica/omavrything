@@ -9,7 +9,6 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -289,14 +288,13 @@ fn flush(
 
 /// Probe a single device's filesystem type with `blkid`.
 pub fn probe_fstype(device: &Path) -> Option<String> {
-    let output = Command::new("blkid")
-        .arg("-o")
-        .arg("value")
-        .arg("-s")
-        .arg("TYPE")
-        .arg(device)
-        .output()
-        .ok()?;
+    let device_str = device.to_string_lossy();
+    let output = crate::ntfs::run_command_timeout(
+        "blkid",
+        &["-o", "value", "-s", "TYPE", &device_str],
+        PROBE_TIMEOUT,
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }
