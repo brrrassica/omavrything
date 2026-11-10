@@ -47,8 +47,12 @@ jobs:
       image: archlinux:base-devel
       volumes:
         - /home/github-runner/ci-cache/pacman-pkg:/var/cache/pacman/pkg
-        - /home/github-runner/ci-cache/cargo:/ci/cache/cargo
-        - /home/github-runner/ci-cache/targets:/ci/cache/targets
+        # NOTE: no `ci-cache/cargo` and no CI target cache here. Untrusted PR
+        # jobs run on GitHub-hosted runners and can never write this volume, so
+        # a `config.toml`/`rustc-wrapper` left by a PR job cannot reach the
+        # write-privileged release build. See the marketplace review finding.
+        - /home/github-runner/release-cache/cargo:/ci/cache/cargo
+        - /home/github-runner/release-cache/targets:/ci/cache/targets
         - /home/github-runner/ci-cache/locks:/ci/cache/locks
     env:
       # The pinned binaries embed this exact registry path in dependency panic
@@ -66,6 +70,11 @@ jobs:
         with:
           # Check out the tag being released, not the default branch.
           ref: ${{ github.event.inputs.tag || github.ref }}
+          # Do NOT persist the job token in the checkout's git config: this job
+          # has `contents: write`, and a release build (or anything it shells
+          # out to) must not inherit a credential it does not need. The release
+          # step receives the token explicitly instead.
+          persist-credentials: false
 
 
       # The build output lives in the runner's persistent cache, but the
@@ -171,6 +180,10 @@ jobs:
       - name: Create the GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          # Explicit token: `persist-credentials: false` above means the
+          # checkout's git config carries no credential, so the release action
+          # is the only step that receives one.
+          token: ${{ secrets.GITHUB_TOKEN }}
           tag_name: ${{ steps.tag.outputs.tag }}
           name: omavrything ${{ steps.tag.outputs.tag }}
           # The .sha256 asset is published for manual verification only. The

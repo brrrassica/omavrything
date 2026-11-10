@@ -11,6 +11,22 @@ glibc, and package availability catches problems that an Ubuntu build would miss
 The release archive is built the same way, so the shipped binaries match the
 target platform.
 
+**Runner placement is a security boundary.** Untrusted code must never run on a
+runner that later performs a write-privileged release:
+
+- `pull_request` and push-to-`main` jobs run on **GitHub-hosted**
+  `ubuntu-latest`, still inside the same `archlinux:base-devel` container.
+- Push-to-`develop` jobs run on the **on-premise** runner
+  (`[self-hosted, opencode-sam]`).
+- The release workflow runs only on the on-premise runner and uses its own
+  `/home/github-runner/release-cache` Cargo/target volume that CI can never
+  write, with `persist-credentials: false` on checkout.
+
+Both paths pin the same toolchain (`1.99.1`, `nightly-2026-10-22`) and use the
+same image, so a build is identical wherever it runs. This prevents a PR job
+from leaving a `$CARGO_HOME/config.toml` `rustc-wrapper` that a later release
+build would execute.
+
 The workflow ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) has seven
 jobs:
 

@@ -6,6 +6,49 @@ Notable changes to `omavrything`. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **Automatic NTFS discovery no longer remounts a pre-existing writable mount.**
+  Startup and hotplug used to run `mount -o remount,ro` on a mount the daemon did
+  not own (a udisks2 auto-mount at login), silently taking write access away from
+  the whole desktop whenever the daemon started or restarted. Automatic discovery
+  now leaves existing mounts and their options untouched; a writable volume is
+  indexed by the generic walker instead. Remounting read-only is now an explicit
+  per-volume opt-in via the new `ntfs_remount_readonly` config key (a list of
+  NTFS UUIDs), and an explicit `MountNtfs`/`MountVolume` request still remounts
+  because the user asked for it. ADR-018 is updated. Regression test:
+  `automatic_discovery_never_remounts_a_preexisting_writable_mount`.
+- **`ListVolumes` no longer starts an unbounded number of block-device probes.**
+  The method is callable by every local UID without polkit, and each call used to
+  spawn its own `blkid` child on the blocking pool with no deadline. The probe is
+  now coalesced into one shared call with a 2 s result cache, a bounded waiter
+  count (a burst past it gets `LimitsExceeded`), and a 5 s child deadline after
+  which the child is killed and reaped. Regression tests:
+  `concurrent_probes_coalesce_into_one_child`,
+  `a_burst_past_the_waiter_bound_is_rejected_as_busy`, and
+  `a_cached_result_is_served_without_probing`.
+- **The evicted-index delta no longer retains dead record/path bytes without
+  bound.** A create followed by a removal of an initially absent path nets zero
+  live changes, but the append-only arenas kept one record and its path bytes per
+  cycle, and the fold gate consulted only the logical length so it never fired.
+  The delta now compacts (dropping tombstones and rebuilding the path arena) once
+  tombstones are both numerous (>= 32) and at least half of the records.
+  Regression tests: `repeated_create_remove_cycles_do_not_grow_the_delta`,
+  `compaction_keeps_live_inserts_and_their_paths`, and
+  `an_evicted_manager_bounds_delta_retention_under_create_remove_churn`.
+
+### Security
+
+- **CI and release no longer share a writable Cargo cache.** Pull-request and
+  push-to-`main` jobs now run on GitHub-hosted runners; push-to-`develop` keeps
+  the on-premise runner. Both run the same `archlinux:base-devel` image and the
+  same pinned toolchain, so the digest-pinned release stays reproducible. The
+  release job uses its own `release-cache` volume that CI can never write, and
+  checks out with `persist-credentials: false` (the release step receives the
+  token explicitly). This closes the path where a PR job could leave a
+  `$CARGO_HOME/config.toml` `rustc-wrapper` that a later write-privileged release
+  build would execute.
+
 ## [0.2.5] — 2026-11-09
 
 ### Fixed

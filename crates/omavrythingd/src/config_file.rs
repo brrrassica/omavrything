@@ -81,6 +81,15 @@ pub struct FileConfig {
     /// across daemon restarts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volumes: Option<Vec<String>>,
+    /// NTFS volume UUIDs whose **pre-existing writable** mount the daemon may
+    /// remount read-only during automatic discovery (startup/hotplug).
+    ///
+    /// This is an explicit, per-volume opt-in and is **empty by default**: a
+    /// pre-existing mount always keeps the options the desktop chose unless the
+    /// volume is listed here. An explicit `MountNtfs`/`MountVolume` request from
+    /// the settings UI never needs to be listed (the user is asking for it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ntfs_remount_readonly: Option<Vec<String>>,
 }
 
 impl FileConfig {
@@ -124,6 +133,13 @@ impl FileConfig {
             for volume in volumes {
                 if !Path::new(volume).is_absolute() {
                     return Err(format!("volume is not absolute: {volume}"));
+                }
+            }
+        }
+        if let Some(uuids) = &self.ntfs_remount_readonly {
+            for uuid in uuids {
+                if uuid.trim().is_empty() {
+                    return Err("ntfs_remount_readonly entry is empty".into());
                 }
             }
         }
@@ -198,6 +214,15 @@ impl FileConfig {
             }
             "volumes" => {
                 self.volumes = Some(
+                    value
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect(),
+                );
+            }
+            "ntfs_remount_readonly" => {
+                self.ntfs_remount_readonly = Some(
                     value
                         .split(',')
                         .map(|s| s.trim().to_string())

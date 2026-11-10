@@ -153,6 +153,7 @@ fn main() {
         snapshot: args.snapshot.clone(),
         watch: args.watch,
         ntfs: args.ntfs,
+        ntfs_remount_readonly: args.ntfs_remount_readonly.clone(),
         log_level: args.log_level,
         background_opacity: args.background_opacity,
         candidate_index: args.candidate_index,
@@ -451,8 +452,9 @@ fn run_startup(
         )));
         let startup_index = Arc::clone(&index);
         let startup_policy = Arc::clone(&policy);
+        let startup_config = Arc::clone(&config);
         spawn_thread("omavry-ntfs", CONTROL_STACK, move || {
-            run_ntfs_startup(startup_index, startup_policy, ownership)
+            run_ntfs_startup(startup_index, startup_policy, startup_config, ownership)
         });
     }
 
@@ -817,6 +819,7 @@ fn contain_panic<T>(job: impl FnOnce() -> T) -> Result<T, ()> {
 pub(crate) fn run_ntfs_startup(
     index: Arc<IndexManager>,
     policy: Arc<Mutex<ntfs::NtfsPolicy>>,
+    config: Arc<SharedConfig>,
     ownership: Arc<Mutex<ntfs::MountOwnership>>,
 ) {
     // B10: reconcile the ownership state left by a SIGKILL or crash — unmount
@@ -876,12 +879,19 @@ pub(crate) fn run_ntfs_startup(
         // whole startup thread and no later partition is indexed at all. The index
         // and policy locks are reached through `unwrap_or_else(|e| e.into_inner())`
         // everywhere, so a lock poisoned by a contained panic stays usable.
+        // Automatic discovery must never change a pre-existing mount's options
+        // (the desktop owns that mount). Only a volume explicitly listed in
+        // `ntfs_remount_readonly` is remounted read-only here; every other
+        // writable mount is left untouched and the MFT path refuses it, so the
+        // generic walker indexes it read-only instead.
+        let allow_remount = config.may_remount_readonly(part.uuid.as_deref());
         match contain_panic(|| {
             ntfs::mount_index_and_remember_with_ownership(
                 index.as_ref(),
                 policy.as_ref(),
                 ownership.as_ref(),
                 part,
+                allow_remount,
             )
         }) {
             Ok(Ok(mount_point)) => info!(
@@ -1333,6 +1343,9 @@ struct Args {
     evict_idle_secs: u64,
     dbus: bool,
     ntfs: bool,
+    /// NTFS UUIDs whose pre-existing writable mount automatic discovery may
+    /// remount read-only (empty: never remount during discovery).
+    ntfs_remount_readonly: Vec<String>,
     metadata: bool,
     log_level: LogLevel,
     background_opacity: f64,
@@ -1444,6 +1457,11 @@ impl Args {
         let watch = raw.watch.or(state.watch).or(base.watch).unwrap_or(true);
         let dbus = raw.dbus.or(state.dbus).or(base.dbus).unwrap_or(true);
         let ntfs = raw.ntfs.or(state.ntfs).or(base.ntfs).unwrap_or(true);
+        let ntfs_remount_readonly = state
+            .ntfs_remount_readonly
+            .clone()
+            .or(base.ntfs_remount_readonly)
+            .unwrap_or_default();
         let metadata = if raw.no_metadata {
             false
         } else {
@@ -1472,6 +1490,7 @@ impl Args {
             evict_idle_secs,
             dbus,
             ntfs,
+            ntfs_remount_readonly,
             metadata,
             log_level,
             background_opacity,

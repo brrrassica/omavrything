@@ -369,10 +369,19 @@ path (rejected: the base scan would pay a per-match path check).
 **Decision:** The generic filesystem walker **never** descends into
 `/run/media` (the udisks2 removable-media root): it is filtered out of the walk
 roots in `resolve_roots` and pruned in the walker's descend check. Removable
-media is indexed only by the daemon's NTFS MFT path. When that path finds a
-pre-existing mount that is writable (a udisks2 auto-mount at login), it
-**remounts it read-only and keeps it read-only** for the daemon's lifetime,
-rather than refusing to index it.
+media is indexed only by the daemon's NTFS MFT path.
+
+When that path finds a **pre-existing** mount that is writable (a udisks2
+auto-mount at login), the daemon's behaviour depends on who asked:
+
+* **Automatic discovery** (startup, hotplug) **never remounts** a mount it does
+  not own. The desktop's options are left exactly as they are. The MFT path
+  refuses the writable mount and the volume stays indexed by the generic walker
+  (read-only access) — or, on `/run/media`, is simply not indexed.
+* **An explicit `ntfs_remount_readonly` UUID** in the config opts that specific
+  volume in to automatic read-only remounting.
+* **An explicit `MountNtfs`/`MountVolume` request** remounts read-only, because
+  the user asked for that volume to be indexed via the MFT path.
 
 **Rationale:** Before this, the walker indexed `/run/media` (it was deliberately
 a scan root) while the MFT path refused the same writable mount, so the volume
@@ -383,14 +392,20 @@ walker cannot make a mount read-only, so letting it index removable media
 silently bypassed the dirty-bit safety rule. Making the MFT path the sole owner
 of removable media removes the double-index and the contradiction.
 
-**Consequences:** A writable NTFS mount is remounted read-only, so the desktop
-loses write access to that partition while the daemon runs (the user accepted
-this trade-off: safety over write access). The daemon needs `CAP_SYS_ADMIN` to
-remount, which the systemd unit already grants. A remount failure is logged and
-the partition is skipped (never indexed writable). Non-NTFS removable media
-(e.g. a vfat USB stick) is not auto-indexed, since the MFT path only handles
-NTFS; a targeted rescan of a volume the user explicitly mounted can still index
-it (`allow_removable`).
+**Consequences:** A pre-existing writable NTFS mount keeps its desktop options
+during automatic discovery: startup and hotplug never remount a mount the daemon
+does not own, so the desktop never silently loses write access because the
+daemon (re)started. Such a volume is indexed by the generic walker instead (or,
+on `/run/media`, not indexed automatically). A volume whose UUID is listed in
+`ntfs_remount_readonly`, or that the user mounts explicitly via
+`MountNtfs`/`MountVolume`, **is** remounted read-only and the desktop loses write
+access to that partition while the daemon runs (the deliberate trade-off: safety
+over write access, B12). The daemon needs `CAP_SYS_ADMIN` to remount, which the
+systemd unit already grants. A remount failure is logged and the partition is
+skipped (never indexed writable). Non-NTFS removable media (e.g. a vfat USB
+stick) is not auto-indexed, since the MFT path only handles NTFS; a targeted
+rescan of a volume the user explicitly mounted can still index it
+(`allow_removable`).
 
 **Alternatives considered:** Keeping the walker indexing `/run/media` and only
 fixing the log (rejected: the read-only invariant stays bypassed and the volume

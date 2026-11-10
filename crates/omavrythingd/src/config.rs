@@ -4,7 +4,7 @@
 //! Changes made through [`SharedConfig::set`] are applied to the running daemon
 //! and persisted to the state config file, so they survive a restart.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::RwLock;
@@ -25,6 +25,9 @@ pub struct ConfigInit {
     pub snapshot: Option<PathBuf>,
     pub watch: bool,
     pub ntfs: bool,
+    /// NTFS volume UUIDs whose pre-existing writable mount automatic discovery
+    /// may remount read-only. Empty by default (see [`FileConfig`]).
+    pub ntfs_remount_readonly: Vec<String>,
     pub log_level: LogLevel,
     pub background_opacity: f64,
     /// Whether the n-gram candidate index is built (F10).
@@ -60,6 +63,9 @@ pub struct SharedConfig {
     background_opacity: AtomicU64,
     /// Whether the n-gram candidate index is built (F10).
     candidate_index: AtomicBool,
+    /// NTFS UUIDs whose pre-existing writable mount automatic discovery may
+    /// remount read-only. Empty means "never touch a pre-existing mount".
+    ntfs_remount_readonly: RwLock<HashSet<String>>,
     state: RwLock<FileConfig>,
     state_path: Option<PathBuf>,
 }
@@ -79,6 +85,7 @@ impl SharedConfig {
             unwatched: Mutex::new(Vec::new()),
             last_scan_errors: Mutex::new((0, Vec::new())),
             ntfs: AtomicBool::new(init.ntfs),
+            ntfs_remount_readonly: RwLock::new(init.ntfs_remount_readonly.into_iter().collect()),
             log_level: RwLock::new(init.log_level),
             background_opacity: AtomicU64::new(init.background_opacity.to_bits()),
             candidate_index: AtomicBool::new(init.candidate_index),
@@ -179,6 +186,20 @@ impl SharedConfig {
     /// Whether NTFS detection and indexing is enabled.
     pub fn ntfs(&self) -> bool {
         self.ntfs.load(Ordering::Relaxed)
+    }
+
+    /// Whether automatic discovery may remount a pre-existing writable mount of
+    /// the NTFS volume with `uuid` read-only. False unless the UUID is listed in
+    /// `ntfs_remount_readonly`, so startup never changes a mount the daemon does
+    /// not own.
+    pub fn may_remount_readonly(&self, uuid: Option<&str>) -> bool {
+        let Some(uuid) = uuid else {
+            return false;
+        };
+        self.ntfs_remount_readonly
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(uuid)
     }
 
     /// The current log level.
@@ -285,6 +306,17 @@ impl SharedConfig {
                 let v = parse_bool(value)?;
                 self.candidate_index.store(v, Ordering::Relaxed);
             }
+            "ntfs_remount_readonly" => {
+                let uuids: HashSet<String> = value
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                *self
+                    .ntfs_remount_readonly
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner()) = uuids;
+            }
             other => return Err(format!("unknown config key: {other}")),
         }
         self.persist(key, value)
@@ -335,6 +367,15 @@ impl SharedConfig {
         );
         map.insert("candidate_index".into(), self.candidate_index().to_string());
         map.insert("volumes".into(), self.remembered_volumes().join(","));
+        let mut remount: Vec<String> = self
+            .ntfs_remount_readonly
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect();
+        remount.sort();
+        map.insert("ntfs_remount_readonly".into(), remount.join(","));
         map
     }
 }
@@ -353,6 +394,7 @@ mod tests {
             snapshot: None,
             watch: true,
             ntfs: true,
+            ntfs_remount_readonly: Vec::new(),
             log_level: LogLevel::Info,
             background_opacity: 0.75,
             candidate_index: true,
@@ -370,6 +412,38 @@ mod tests {
         assert_eq!(c.snapshot_interval(), 120);
         assert!(c.set("excludes", "**/.git/**, **/node_modules/**").is_ok());
         assert_eq!(c.scan().excludes, vec!["**/.git/**", "**/node_modules/**"]);
+    }
+
+    #[test]
+    fn ntfs_remount_readonly_defaults_to_nothing() {
+        // The startup finding: automatic discovery may only remount a volume
+        // whose UUID was explicitly listed. An empty policy (the default) must
+        // refuse every volume.
+        let c = cfg();
+        assert!(c.ntfs_remount_readonly.read().unwrap().is_empty());
+        assert!(!c.may_remount_readonly(Some("0123456789ABCDEF")));
+        // A volume without a UUID is never remountable.
+        assert!(!c.may_remount_readonly(None));
+    }
+
+    #[test]
+    fn set_ntfs_remount_readonly_opts_in_only_the_listed_uuids() {
+        let c = cfg();
+        assert!(
+            c.set("ntfs_remount_readonly", "AAAA-BBBB, CCCC-DDDD")
+                .is_ok()
+        );
+        assert!(c.may_remount_readonly(Some("AAAA-BBBB")));
+        assert!(c.may_remount_readonly(Some("CCCC-DDDD")));
+        assert!(!c.may_remount_readonly(Some("EEEE-FFFF")));
+        assert_eq!(
+            c.as_map().get("ntfs_remount_readonly").map(String::as_str),
+            Some("AAAA-BBBB,CCCC-DDDD")
+        );
+
+        // Clearing the list restores the default "never remount".
+        assert!(c.set("ntfs_remount_readonly", "").is_ok());
+        assert!(!c.may_remount_readonly(Some("AAAA-BBBB")));
     }
 
     #[test]
@@ -407,6 +481,7 @@ mod tests {
             snapshot: None,
             watch: true,
             ntfs: true,
+            ntfs_remount_readonly: Vec::new(),
             log_level: LogLevel::Info,
             background_opacity: 0.75,
             candidate_index: true,

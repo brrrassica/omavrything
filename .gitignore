@@ -17,6 +17,11 @@
 /site/dist/
 _site/
 
+# CI dependency/build caches (actions/cache restores these into the workspace)
+/.ci-cargo
+/.ci-rustup
+/.ci-target
+
 # Fuzzing artifacts
 /fuzz/target
 /fuzz/corpus

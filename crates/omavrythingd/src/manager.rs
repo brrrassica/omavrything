@@ -311,6 +311,15 @@ impl IndexManager {
             .is_empty()
     }
 
+    /// Test-only view of the delta's retained size: `(records, memory_bytes)`.
+    /// Retained records include tombstones, so this is what the retained-memory
+    /// bound is asserted against.
+    #[cfg(test)]
+    pub fn delta_retained(&self) -> (usize, u64) {
+        let delta = self.delta.read().unwrap_or_else(|e| e.into_inner());
+        (delta.records().len(), delta.memory_bytes())
+    }
+
     /// Whether the index is currently evicted.
     pub fn is_evicted(&self) -> bool {
         matches!(
@@ -540,6 +549,48 @@ mod tests {
 
         assert!(!manager.evict(), "a failed write must not report eviction");
         assert!(!manager.is_evicted());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_evicted_manager_bounds_delta_retention_under_create_remove_churn() {
+        // The retained-memory finding: while the index is evicted, a processed
+        // create followed by a deletion of an initially absent path nets zero
+        // live changes but must not grow the delta without bound.
+        let dir = temp_dir("delta-retention");
+        let snap = dir.join("index.snapshot");
+        let manager = Arc::new(IndexManager::new(sample(), Vec::new(), Some(snap)));
+        manager.evict();
+        assert!(manager.is_evicted(), "the manager must start evicted");
+
+        let config = ScanConfig::with_roots(vec![PathBuf::from("/")]);
+        let root = dir.join("churn");
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("tmp-file-with-a-reasonably-long-name.txt");
+
+        for _ in 0..300 {
+            // Create the file so `symlink_metadata` succeeds, then process the
+            // event and remove it again.
+            std::fs::write(&file, b"x").unwrap();
+            manager.apply_event(&FsEvent::Created(file.clone()), &config);
+            std::fs::remove_file(&file).unwrap();
+            manager.apply_event(&FsEvent::Removed(file.clone()), &config);
+
+            // The logical delta stays empty after each complete cycle...
+            assert!(
+                !manager.has_pending_delta(),
+                "a create/remove cycle must net zero live changes"
+            );
+            // ...and the retained records/bytes stay bounded regardless of how
+            // many cycles have run.
+            let (records, bytes) = manager.delta_retained();
+            assert!(
+                records <= 128,
+                "retained delta records grew to {records} after churn"
+            );
+            assert!(bytes < 16 * 1024, "retained delta bytes grew to {bytes}");
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
