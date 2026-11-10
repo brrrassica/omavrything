@@ -29,7 +29,7 @@
 #   makepkg --printsrcinfo > .SRCINFO
 
 pkgname=omavrything
-pkgver=0.2.5
+pkgver=0.2.6
 pkgrel=1
 pkgdesc="Instant, index-backed file search for Omarchy Quattro, inspired by Voidtools Everything"
 arch=('x86_64' 'aarch64')

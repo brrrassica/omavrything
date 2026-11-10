@@ -6,6 +6,8 @@ Notable changes to `omavrything`. The format follows
 
 ## [Unreleased]
 
+## [0.2.6] — 2026-11-10
+
 ### Fixed
 
 - **Automatic NTFS discovery no longer remounts a pre-existing writable mount.**
