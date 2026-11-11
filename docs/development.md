@@ -26,16 +26,56 @@ runner that later performs a write-privileged release:
   `/home/github-runner/release-cache` Cargo/target volume that CI can never
   write, with `persist-credentials: false` on checkout.
 
-Both paths pin the same toolchain (`1.99.1`, `nightly-2026-10-22`) and use the
-same image, so a build is identical wherever it runs. This prevents a PR job
-from leaving a `$CARGO_HOME/config.toml` `rustc-wrapper` that a later release
-build would execute.
+Both paths pin the same toolchain (`1.99.1`, `nightly-2026-10-22`) and run the
+same container image, **pinned by digest** (`archlinux:base-devel` at a fixed
+`sha256:` digest), so a build is identical wherever it runs and no job
+re-resolves the floating `:base-devel` tag and re-pulls its layers over the
+network. Rotating the digest is a deliberate change that requires re-pinning the
+release digests, because a newer base image can alter the compiler inputs (the
+0.2.4/0.2.5 failure class). The on-premise runner pre-pulls the pinned digest so
+a cold container start reads from local disk.
+
+Caching is split by runner. The three cargo-compiling jobs exist in two
+variants selected by `if`:
+
+- **GitHub-hosted variants** (`build`, `fuzz`, `package`): use `actions/cache`
+  keyed by `Cargo.lock`, with the cache directories inside the workspace. The
+  transfer rides Azure's internal network and costs the repo uplink nothing; a
+  hosted runner has no host filesystem to bind-mount.
+- **Self-hosted variants** (`build-self-hosted`, `fuzz-self-hosted`,
+  `package-self-hosted`, develop pushes only): mount a dedicated host volume,
+  `/home/github-runner/ci-selfhost-cache/cargo` at `/ci/selfhost/cargo`, and do
+  **not** use `actions/cache`. On a self-hosted runner `actions/cache` was
+  downloading and re-uploading gigabyte-scale rustup + target caches over the
+  public uplink (measured at full line rate), for bytes already on local disk.
+  The bind-mount keeps them local: a warm run makes zero network cache calls.
+
+The self-hosted CI volume is its **own** path, distinct from the release cache:
+
+```
+release.yml           -> /home/github-runner/release-cache     (write-privileged)
+prepare-release.yml   -> /home/github-runner/gate-cache        (pre-tag gate)
+ci.yml                -> /home/github-runner/ci-selfhost-cache  (develop-push CI)
+```
+
+This separation is why a CI job cannot leave a `$CARGO_HOME/config.toml`
+`rustc-wrapper` that a later release build would execute — and why a PR job,
+which never runs on the self-hosted runner and can never mount a host volume,
+cannot reach any of them. Each self-hosted CI job also fails fast with the exact
+`mkdir -p` command if its volume is absent, rather than surfacing an obscure
+mount error. Provision the runner once:
+
+```sh
+sudo mkdir -p /home/github-runner/ci-selfhost-cache/{pacman-pkg,locks,cargo}
+docker pull archlinux/base-devel@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
+```
 
 The workflow ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) has seven
-jobs:
+job roles (the three cargo-compiling ones in two runner variants):
 
-- **build** — `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test`
-  (debug and release), and `cargo build`.
+- **build** — `cargo fmt --check`, `cargo clippy -D warnings`, and `cargo test`
+  (debug and release). A separate `cargo build` was dropped: `cargo test`
+  already compiles every workspace target.
 - **qml** — `scripts/lint-qml.sh` runs `qmllint` over the shell plugin's QML
   (`qt6-declarative`). The omarchy shell modules are absent in the container, so
   the `qs.*` imports are reported as warnings; the job still catches QML syntax
