@@ -42,11 +42,20 @@ conflicts=('omavrything-git')
 options=('!lto')
 install="$pkgname.install"
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-# TODO(release): the hash below is still the v0.1.0 tarball. The v0.2.5
-# sources hash cannot be computed before the tag exists, so run `updpkgsums`
-# after pushing v0.2.5 and before the package is published to the AUR. It
-# is not on the AUR yet.
-sha256sums=('62757fe2452bc1471188e206c78bdb465adb37d04c372ee297ce45000de89d73')
+# The source hash is over the GitHub tag tarball, which cannot exist before the
+# tag, so it cannot be validated in the pre-tag gate. It IS validated by the
+# release workflow's "Verify the PKGBUILD source hash against the tag tarball"
+# step, which downloads the real tarball and prints the correct value into the
+# job summary.
+#
+# This hash is deliberately a clearly-invalid placeholder rather than a previous
+# release's value: the 0.1.0 hash silently survived three releases precisely
+# because it looked plausible. A placeholder makes `makepkg` fail loudly until
+# it is refreshed.
+#
+# After tagging: `cd packaging && sudo pacman -S --needed pacman-contrib &&
+# updpkgsums` (or copy the value from the release job summary).
+sha256sums=('0000000000000000000000000000000000000000000000000000000000000000')
 
 build() {
   cd "$pkgname-$pkgver"

@@ -91,6 +91,37 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "verifying version $version"
 
+      # Fail fast with an actionable message instead of an obscure mount or
+      # cargo error. These volumes and the pinned linker packages are runner
+      # state that this workflow does not own, and a missing one otherwise
+      # surfaces as a confusing failure halfway through a release.
+      - name: Check the runner prerequisites
+        run: |
+          set -euo pipefail
+          missing=0
+          for dir in /var/cache/pacman/pkg /ci/cache/locks /ci/cache/cargo; do
+            if [[ ! -d "$dir" ]]; then
+              echo "error: runner volume is not mounted: $dir" >&2
+              missing=1
+            fi
+          done
+          if [[ "$missing" -ne 0 ]]; then
+            {
+              echo ""
+              echo "The self-hosted runner is missing a required volume. Create it:"
+              echo ""
+              echo "    sudo mkdir -p /home/github-runner/gate-cache/cargo"
+              echo "    sudo mkdir -p /home/github-runner/ci-cache/{pacman-pkg,locks}"
+              echo ""
+              echo "gate-cache/cargo is mounted at /ci/cache/cargo for this job. It is"
+              echo "separate from release.yml's release-cache/cargo on purpose: the same"
+              echo "container path must be used (it is embedded in the binaries) but the"
+              echo "bytes must not be shared with the write-privileged release job."
+            } >&2
+            exit 1
+          fi
+          echo "runner volumes present"
+
       - name: Install dependencies
         run: |
           flock /ci/cache/locks/pacman.lock \
@@ -142,12 +173,37 @@ jobs:
           ld.lld --version | grep -q 'LLD 23.1.3'
           test "$CARGO_HOME" = "/home/sam/.cargo"
 
+      # Metadata FIRST: these files are inside the archive, so a version
+      # mismatch must be fixed before the digest is computed, not after.
+      - name: Verify the release metadata agrees with the version
+        run: scripts/verify-release-metadata.sh "${{ steps.version.outputs.version }}"
+
+      # FREEZE CHECK. This must run before the build: it proves no archive input
+      # changed since the pin was taken. A change here means the committed pin
+      # cannot describe the tree, and the reason is a doc/manifest edit rather
+      # than a toolchain difference -- which is exactly the 0.2.5 failure.
+      - name: Verify no archive input changed since the pin
+        run: scripts/archive-inputs.sh --check
+
       - name: Build the release archive
         run: scripts/package-release.sh "${{ steps.version.outputs.version }}"
 
       # THE GATE. Fails unless the committed pin already describes this build.
       - name: Verify the committed pin describes this build
         run: scripts/verify-release-pin.sh "${{ steps.version.outputs.version }}"
+
+      # Report the tree identity so a release run on the merge commit can be
+      # proven to be the same tree this gate validated.
+      - name: Report the archive input fingerprint
+        if: always()
+        run: |
+          {
+            echo "### Archive input fingerprint"
+            echo
+            echo '```'
+            echo "$(scripts/archive-inputs.sh)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # Report the digests so the pin can be taken from this run, never from a
       # laptop. This runs after the gate, so a red run still shows the values

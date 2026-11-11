@@ -97,15 +97,46 @@ removing or overwriting an entry. Hand-editing that file is what dropped release
 pins from `develop` at 0.2.3, 0.2.4 and 0.2.5. The `checksums-superset` CI job
 additionally fails any candidate tree that is missing an entry `main` carries.
 
+**4. Metadata and freeze checks.**
+[`scripts/verify-release-metadata.sh`](../scripts/verify-release-metadata.sh)
+proves every version reference agrees with the release version: `manifest.json`
+(the download URL), `Cargo.toml`/`Cargo.lock` (what `--version` reports, which
+`bootstrap.sh` compares to decide whether to upgrade), `PKGBUILD` `pkgver`, and
+the user-facing docs and man page shipped inside the archive. A mismatch here
+breaks the plugin bootstrap or the upgrade path even when the digests are
+perfect.
+
+[`scripts/archive-inputs.sh`](../scripts/archive-inputs.sh) fingerprints every
+file that goes into the archive (mode + SHA-256 + path) and pins it in
+`scripts/archive-inputs.txt`. Two things follow:
+
+- editing a doc, the manifest, `data/**`, `shell/**`, or a staged script after
+  pinning is **detected without rebuilding**, which is exactly the 0.2.5
+  failure;
+- the pre-tag gate (on the release branch) and the release job (on the tagged
+  merge commit) both recompute it. If the two trees differ in any archive
+  input, the release fails instead of publishing bytes nobody validated. This
+  closes the "gate validated a different tree than the tag" gap.
+
 The release flow is therefore:
 
 ```sh
+rm -rf dist                           # never reuse a previous build's output
 scripts/package-release.sh            # build dist/ + dist/daemon-checksums.txt
-scripts/checksums-add.sh              # merge the pin, append-only
-scripts/verify-release-pin.sh         # local gate (optional; CI runs it too)
+scripts/checksums-add.sh              # append-only pin + archive-inputs.txt
+scripts/verify-release-metadata.sh    # versions agree everywhere
+scripts/archive-inputs.sh --check     # nothing drifted since the pin
+scripts/verify-release-pin.sh         # digests match
 # push the release branch, run prepare-release.yml, confirm green
-# only then: tag and let release.yml publish
+# merge to main, run prepare-release.yml on main again, confirm green
+# only then: tag -s and let release.yml publish
 ```
+
+The release job additionally refuses a tag that is not annotated, or that no
+longer resolves to the commit it was created on — the 0.2.5 tag was re-pointed
+after the fact, which no digest check can catch. After publishing it downloads
+the tag tarball and reports the correct `PKGBUILD` `sha256sums` in the job
+summary, so the AUR step is a copy rather than a remembered `updpkgsums`.
 
 Pushing a `v*` tag runs
 [`.github/workflows/release.yml`](../.github/workflows/release.yml), which builds

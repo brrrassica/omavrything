@@ -25,8 +25,6 @@ Notable changes to `omavrything`. The format follows
     the committed pin file **append-only**, so it can no longer drop a released
     pin (the failure that hit 0.2.3, 0.2.4 and 0.2.5 when the file was edited by
     hand on one branch).
-  - A `checksums-superset` CI job that fails any tree missing an entry `main`
-    carries.
 
 ### Fixed
 

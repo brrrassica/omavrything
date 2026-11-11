@@ -438,6 +438,17 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    /// The probe tests share the process-global `PROBE_STATE`, so without
+    /// serialisation one test's reset can clear the cache between another test's
+    /// two calls and make it look like a cache miss.
+    /// `a_cached_result_is_served_without_probing` was intermittently failing
+    /// for exactly that reason. Each probe test holds this guard for its body.
+    static PROBE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_probe_tests() -> std::sync::MutexGuard<'static, ()> {
+        PROBE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn parses_all_filesystems_and_skips_swap() {
         let text = "\
@@ -479,6 +490,7 @@ TYPE=swap
         use std::sync::Barrier;
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
+        let _serial = lock_probe_tests();
         reset_probe_state();
         let runs = Arc::new(AtomicUsize::new(0));
         let barrier = Arc::new(Barrier::new(MAX_PROBE_WAITERS + 1));
@@ -524,6 +536,7 @@ TYPE=swap
 
     #[test]
     fn a_burst_past_the_waiter_bound_is_rejected_as_busy() {
+        let _serial = lock_probe_tests();
         reset_probe_state();
         // Simulate an in-flight probe that already has the maximum number of
         // waiters. The next caller must be rejected immediately instead of
@@ -543,6 +556,7 @@ TYPE=swap
 
     #[test]
     fn a_cached_result_is_served_without_probing() {
+        let _serial = lock_probe_tests();
         reset_probe_state();
         assert!(matches!(
             shared_probe(|| vec![test_volume("/dev/omavry-first")]),

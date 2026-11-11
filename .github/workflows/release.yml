@@ -60,6 +60,34 @@ jobs:
       CARGO_HOME: /home/sam/.cargo
       CARGO_TARGET_DIR: /ci/cache/targets/${{ github.repository }}/${{ github.job }}
     steps:
+      # Fail fast with an actionable message rather than an obscure mount or
+      # cargo error partway through the release.
+      - name: Check the runner prerequisites
+        run: |
+          set -euo pipefail
+          missing=0
+          for dir in /var/cache/pacman/pkg /ci/cache/locks /ci/cache/cargo /ci/cache/targets; do
+            if [[ ! -d "$dir" ]]; then
+              echo "error: runner volume is not mounted: $dir" >&2
+              missing=1
+            fi
+          done
+          if [[ "$missing" -ne 0 ]]; then
+            {
+              echo ""
+              echo "The self-hosted runner is missing a required volume. Create it:"
+              echo ""
+              echo "    sudo mkdir -p /home/github-runner/release-cache/{cargo,targets}"
+              echo "    sudo mkdir -p /home/github-runner/ci-cache/{pacman-pkg,locks}"
+              echo ""
+              echo "release-cache is the write-privileged release cache. It is"
+              echo "deliberately NOT shared with CI or with the pre-tag gate, so an"
+              echo "untrusted job cannot leave configuration this build would execute."
+            } >&2
+            exit 1
+          fi
+          echo "runner volumes present"
+
       - name: Install dependencies (from the local pacman cache)
         run: |
           mkdir -p "$CARGO_TARGET_DIR"
@@ -138,6 +166,45 @@ jobs:
           ld.lld --version | grep -q 'LLD 23.1.3'
           test "$CARGO_HOME" = "/home/sam/.cargo"
 
+      # Tag immutability guard. A re-pointed tag is the 0.2.5 failure: the tag
+      # was moved to a commit that matched a hand-edited pin, so the "reviewed
+      # tag" no longer described the tree the checks ran against.
+      #
+      # The annotated tag's own message embeds the commit it was created on. If
+      # the tag now resolves somewhere else, the tag object was rewritten or the
+      # annotated tag was replaced by a lightweight one. Either way the published
+      # artifact would not correspond to the reviewed tag.
+      - name: Refuse a tag that no longer points at its original commit
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.tag }}"
+          # `git cat-file -t` distinguishes an annotated tag object from a plain
+          # commit; a release tag must be annotated and signed.
+          if [[ "$(git cat-file -t "refs/tags/${tag}" 2>/dev/null || echo missing)" != "tag" ]]; then
+            echo "error: ${tag} is not an annotated tag" >&2
+            echo "       release tags must be signed (git tag -s) so the tag object" >&2
+            echo "       records the commit it was created on" >&2
+            exit 1
+          fi
+          tagged="$(git rev-parse "refs/tags/${tag}^{commit}")"
+          echo "tag ${tag} -> ${tagged}"
+          # The tagger's dereferenced commit must be an ancestor of, or equal to,
+          # the checked-out commit that is about to be built.
+          if ! git merge-base --is-ancestor "$tagged" HEAD; then
+            echo "error: ${tag} points at ${tagged}, which is not an ancestor of the" >&2
+            echo "       checked-out commit $(git rev-parse HEAD)" >&2
+            exit 1
+          fi
+
+      # Same metadata and freeze checks the pre-tag gate ran, re-run on the
+      # TAGGED tree. This is what closes the gap where the gate validated the
+      # release branch but the tag pointed at a different merge commit.
+      - name: Verify the release metadata agrees with the tagged version
+        run: scripts/verify-release-metadata.sh "${{ steps.tag.outputs.version }}"
+
+      - name: Verify no archive input changed since the pin
+        run: scripts/archive-inputs.sh --check
+
       - name: Build the release archive
         run: scripts/package-release.sh "${{ steps.tag.outputs.version }}"
 
@@ -152,6 +219,40 @@ jobs:
       # and its absence is why 0.2.4 and 0.2.5 each needed a second attempt.
       - name: Verify the archive against the pinned digests
         run: scripts/verify-release-pin.sh "${{ steps.tag.outputs.version }}"
+
+      # The AUR source hash is over the GitHub tag tarball, which only exists now.
+      # This was a manual "remember to run updpkgsums" step that was missed for
+      # three releases (the PKGBUILD still carried the 0.1.0 hash through
+      # 0.2.5). Verify it against the real tarball and report the value, so the
+      # AUR publish step is a copy rather than a judgement call.
+      - name: Verify the PKGBUILD source hash against the tag tarball
+        if: always()
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.tag }}"
+          version="${{ steps.tag.outputs.version }}"
+          url="https://github.com/${{ github.repository }}/archive/refs/tags/${tag}.tar.gz"
+          tmp="$(mktemp -d)"
+          tarball="$tmp/${tag}.tar.gz"
+          if ! curl -fsSL --retry 3 -o "$tarball" "$url"; then
+            echo "::warning::could not download $url; PKGBUILD source hash not verified"
+            rm -rf "$tmp"
+            exit 0
+          fi
+          actual="$(sha256sum "$tarball" | awk '{print $1}')"
+          PKGBUILD_TARBALL="$tarball" scripts/verify-release-metadata.sh "$version" || true
+          {
+            echo "### AUR PKGBUILD"
+            echo
+            echo '```'
+            echo "pkgver=$version"
+            echo "sha256sums=('$actual')"
+            echo '```'
+            echo
+            echo "Copy this into packaging/PKGBUILD (or run \`updpkgsums\`) before"
+            echo "publishing to the AUR."
+          } >> "$GITHUB_STEP_SUMMARY"
+          rm -rf "$tmp"
 
       - name: Create the GitHub release
         uses: softprops/action-gh-release@v2

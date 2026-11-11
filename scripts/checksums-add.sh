@@ -94,6 +94,23 @@ for entry in "${pending[@]}"; do
   added=$((added + 1))
 done
 
+# Pin the archive-input fingerprint alongside the artifact digests. This is what
+# lets a later run detect that a file *inside* the archive changed after the pin
+# was taken (a doc edit, a manifest bump) without rebuilding anything, and it is
+# how the pre-tag gate and the release job prove they are looking at the same
+# tree even though one runs on the release branch and the other on the merge
+# commit.
+inputs_pin="scripts/archive-inputs.txt"
+{
+  echo "# Fingerprint of every file that goes into the release archive."
+  echo "# Regenerate with scripts/checksums-add.sh after scripts/package-release.sh."
+  echo "# Verify with scripts/archive-inputs.sh --check."
+  echo "# Format: <mode>  <sha256>  <path>"
+  echo "#"
+  scripts/archive-inputs.sh --list
+} > "$inputs_pin"
+echo "Wrote $inputs_pin (archive input fingerprint)"
+
 echo ""
 if [[ "$added" -eq 0 ]]; then
   echo "No new entries; $dst already covers everything in $src."
