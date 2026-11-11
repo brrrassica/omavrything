@@ -397,7 +397,10 @@ mod tests {
 
         let from = base.join("moved");
         fs::rename(&from, outside.join("moved")).unwrap();
-        let removed = wait_for(&mut watcher, |e| matches!(e, FsEvent::Removed(p) if p == &from));
+        let removed = wait_for(
+            &mut watcher,
+            |e| matches!(e, FsEvent::Removed(p) if p == &from),
+        );
         assert!(
             removed.is_some(),
             "expected a Removed event for the moved-out directory"
