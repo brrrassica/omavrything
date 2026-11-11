@@ -18,6 +18,7 @@ mod udev;
 mod udisks;
 mod volumes;
 
+use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
@@ -611,6 +612,24 @@ fn login1_idle_hint(rt: &tokio::runtime::Runtime) -> Option<bool> {
     })
 }
 
+/// Watch indexed roots that appeared since the last reconciliation.
+///
+/// Volumes can be mounted and indexed after the watcher starts (D-Bus mount,
+/// remembered volumes, NTFS startup/hotplug). `known` remembers the roots
+/// already handed to the watcher so the periodic reconciliation only watches
+/// newly added roots instead of re-walking every tree.
+fn watch_new_roots(watcher: &mut Watcher, index: &IndexManager, known: &mut HashSet<PathBuf>) {
+    for root in index.roots() {
+        let path = PathBuf::from(&root.path);
+        if !known.insert(path.clone()) {
+            continue;
+        }
+        if let Err(err) = watcher.watch_dir(&path) {
+            warn!(path = %path.display(), error = %err, "watch failed");
+        }
+    }
+}
+
 /// Watch the indexed roots with inotify and apply events to the index.
 fn run_watcher(
     index: Arc<IndexManager>,
@@ -630,16 +649,8 @@ fn run_watcher(
     // (e.g. `~/.cache`) then floods the watcher under the index write lock.
     watcher.set_excludes(GlobSet::new(&config.scan().excludes));
 
-    let roots: Vec<PathBuf> = index
-        .roots()
-        .iter()
-        .map(|r| PathBuf::from(&r.path))
-        .collect();
-    for root in &roots {
-        if let Err(err) = watcher.watch_dir(root) {
-            warn!(path = %root.display(), error = %err, "watch failed");
-        }
-    }
+    let mut known_roots = HashSet::new();
+    watch_new_roots(&mut watcher, &index, &mut known_roots);
     let mut reported_failed = watcher.failed().len();
     if reported_failed > 0 {
         warn!(
@@ -654,6 +665,18 @@ fn run_watcher(
 
     let mut buffer = [0u8; 8192];
     loop {
+        // Roots added after startup (D-Bus mounts, remembered volumes, NTFS
+        // startup/hotplug) must start delivering events too.
+        watch_new_roots(&mut watcher, &index, &mut known_roots);
+        let failed = watcher.failed().len();
+        if failed > reported_failed {
+            warn!(
+                additional = failed - reported_failed,
+                "more directories could not be watched (max_user_watches exhausted?)"
+            );
+            reported_failed = failed;
+            config.set_unwatched(watcher.failed().to_vec());
+        }
         match watcher.read_events(&mut buffer, WATCH_POLL) {
             Ok(batch) => {
                 if batch.is_empty() {
@@ -682,15 +705,6 @@ fn run_watcher(
                             let _ = watcher.watch_dir(path);
                         }
                     }
-                }
-                let failed = watcher.failed().len();
-                if failed > reported_failed {
-                    warn!(
-                        additional = failed - reported_failed,
-                        "more directories could not be watched (max_user_watches exhausted?)"
-                    );
-                    reported_failed = failed;
-                    config.set_unwatched(watcher.failed().to_vec());
                 }
                 let entries = index.len() as u64;
                 let _ = events.send(IndexEvent::Changed { entries });
@@ -1801,5 +1815,58 @@ mod tests {
         // the thread and stop the remaining partitions from being indexed.
         assert_eq!(contain_panic(|| 7), Ok(7));
         assert!(contain_panic(|| panic!("malformed volume")).is_err());
+    }
+
+    #[test]
+    fn watches_roots_added_after_the_watcher_starts() {
+        let base =
+            std::env::temp_dir().join(format!("omavrything-late-root-{}", std::process::id()));
+        let late = std::env::temp_dir().join(format!(
+            "omavrything-late-root-added-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&late);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(late.join("nested")).unwrap();
+
+        let mut initial = Index::new();
+        initial.add_root(&base, omavrything_core::index::FsKind::Other);
+        let index = Arc::new(IndexManager::new(initial, Vec::new(), None));
+
+        let mut watcher = Watcher::new().unwrap();
+        let mut known = HashSet::new();
+        watch_new_roots(&mut watcher, &index, &mut known);
+        assert_eq!(watcher.watch_count(), 1);
+
+        // A volume mounted after the watcher started adds a new root.
+        index.with_index_mut(|idx| idx.add_root(&late, omavrything_core::index::FsKind::Other));
+        watch_new_roots(&mut watcher, &index, &mut known);
+        assert_eq!(
+            watcher.watch_count(),
+            3,
+            "the late root and its nested directory must be watched"
+        );
+
+        let file = late.join("nested").join("late.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let mut buffer = [0u8; 4096];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut created = false;
+        while Instant::now() < deadline && !created {
+            let events = watcher
+                .read_events(&mut buffer, Duration::from_millis(100))
+                .unwrap();
+            created = events
+                .iter()
+                .any(|e| matches!(e, FsEvent::Created(p) if p == &file));
+        }
+        assert!(
+            created,
+            "a file created under the late root must produce a Created event"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&late);
     }
 }

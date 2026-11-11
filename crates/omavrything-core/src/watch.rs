@@ -191,9 +191,23 @@ impl Watcher {
         }
     }
 
-    /// Drop the path mappings for a subtree that left the watched tree.
+    /// Drop the path mappings and kernel watches for a subtree that left the
+    /// watched tree.
+    ///
+    /// Moving a directory does not destroy its inode, so its inotify watches
+    /// stay registered until explicitly removed. Dropping only the mappings
+    /// would leak those watches (and their `max_user_watches` budget) forever.
     fn forget_subtree(&mut self, path: &Path) {
-        self.dirs.retain(|_, dir| !dir.starts_with(path));
+        let stale: Vec<WatchDescriptor> = self
+            .dirs
+            .iter()
+            .filter(|(_, dir)| dir.starts_with(path))
+            .map(|(wd, _)| wd.clone())
+            .collect();
+        for wd in stale {
+            self.dirs.remove(&wd);
+            let _ = self.inotify.watches().remove(wd);
+        }
     }
 
     /// Translate one raw inotify event into zero or more [`FsEvent`]s.
@@ -355,6 +369,47 @@ mod tests {
         fs::rename(&from, outside.join("leaving.txt")).unwrap();
         let removed = wait_for(&mut watcher, |e| matches!(e, FsEvent::Removed(_)));
         assert!(removed.is_some(), "expected a Removed event for a move-out");
+
+        let _ = fs::remove_dir_all(&base);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn move_out_of_tree_drops_subtree_watches() {
+        let base =
+            std::env::temp_dir().join(format!("omavrything-watch-outdir-{}", std::process::id()));
+        let outside = std::env::temp_dir().join(format!(
+            "omavrything-watch-outdir-outside-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let _ = fs::remove_dir_all(&outside);
+        fs::create_dir_all(base.join("moved/nested")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        let mut watcher = Watcher::new().unwrap();
+        watcher.watch_dir(&base).unwrap();
+        assert_eq!(
+            watcher.watch_count(),
+            3,
+            "expected base + moved + nested to be watched"
+        );
+
+        let from = base.join("moved");
+        fs::rename(&from, outside.join("moved")).unwrap();
+        let removed = wait_for(&mut watcher, |e| matches!(e, FsEvent::Removed(p) if p == &from));
+        assert!(
+            removed.is_some(),
+            "expected a Removed event for the moved-out directory"
+        );
+
+        // The moved directory still exists outside the tree, so its inode (and
+        // kernel watches) would otherwise leak. Only the base remains watched.
+        assert_eq!(
+            watcher.watch_count(),
+            1,
+            "moved-out subtree watches must be removed"
+        );
 
         let _ = fs::remove_dir_all(&base);
         let _ = fs::remove_dir_all(&outside);
