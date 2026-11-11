@@ -44,7 +44,14 @@ jobs:
     name: build and publish release (Arch)
     runs-on: [self-hosted, opencode-sam]
     container:
-      image: archlinux:base-devel
+      # PINNED BY DIGEST. `archlinux:base-devel` is a floating tag; Docker Hub
+      # already serves a newer digest for it than the one that produced the
+      # committed 0.2.6 pins. Building the release on a drifted base image would
+      # change the glibc/gcc/binutils inputs and fail the digest verification —
+      # the 0.2.4/0.2.5 failure class this pinning exists to prevent. Rotating
+      # this digest is a deliberate change that requires re-pinning.
+      #   archlinux:base-devel @ sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
+      image: archlinux@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
       volumes:
         - /home/github-runner/ci-cache/pacman-pkg:/var/cache/pacman/pkg
         # NOTE: no `ci-cache/cargo` and no CI target cache here. Untrusted PR

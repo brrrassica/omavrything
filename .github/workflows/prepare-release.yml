@@ -52,7 +52,12 @@ jobs:
     # secrets or write permissions are in scope).
     runs-on: [self-hosted, opencode-sam]
     container:
-      image: archlinux:base-devel
+      # PINNED BY DIGEST, identically to release.yml. The gate must build with
+      # the same base image the release publishes from or a green gate no longer
+      # predicts a green release; and a floating tag re-resolved per run would
+      # re-pull a multi-hundred-MB layer set over the runner's uplink every time.
+      #   archlinux:base-devel @ sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
+      image: archlinux@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
       volumes:
         - /home/github-runner/ci-cache/pacman-pkg:/var/cache/pacman/pkg
         - /home/github-runner/ci-cache/locks:/ci/cache/locks
