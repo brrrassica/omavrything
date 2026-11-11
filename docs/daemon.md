@@ -65,6 +65,7 @@ evict_idle_secs = 0                            # optional idle eviction, seconds
 watch = true                                   # inotify live updates
 dbus = true                                    # D-Bus control interface
 ntfs = true                                    # detect and index NTFS partitions
+# ntfs_remount_readonly = ["0123456789ABCDEF"] # opt-in: remount these writable NTFS UUIDs read-only during discovery
 metadata = true                                # collect per-file size/mtime
 log_level = "error"                            # error | warn | info | debug | trace
 background_opacity = 0.75                      # scratchpad tile opacity (UI setting)
@@ -95,6 +96,15 @@ trigram index at runtime; `background_opacity` is a UI-only value the daemon
 stores and serves but does not otherwise use. The `volumes` key is written by
 the daemon itself when a volume is mounted through the settings UI; it is not a
 `SetConfig` key.
+
+`ntfs_remount_readonly` (a comma-separated list of NTFS volume UUIDs) is both a
+config-file key and a `SetConfig` key. It is **empty by default**: automatic
+NTFS discovery (startup and hotplug) never remounts a pre-existing writable
+mount, because that would take write access away from a mount the daemon does
+not own. Listing a UUID opts that specific volume in to being remounted
+read-only so it can be indexed through the faster MFT path. An explicit
+`MountNtfs`/`MountVolume` request does not need an entry: the user asked for
+that volume to be indexed.
 
 ## Logging
 
@@ -190,9 +200,9 @@ Control and status are exposed on the system bus as
 | `GetStatus` | version, entries, roots, memory breakdown, scan state, errors, uptime; the failed-scan path sample is redacted outside the search group |
 | `Rescan(root)` | rescan all roots (empty `root`) or one configured root; returns entries added |
 | `GetConfig` | the current configuration |
-| `SetConfig(key, value)` | set `excludes`, `scan_interval`, `snapshot_interval`, `evict_idle_secs`, `ntfs`, `log_level`, `background_opacity`, or `candidate_index`; changing `excludes` triggers a rescan |
+| `SetConfig(key, value)` | set `excludes`, `scan_interval`, `snapshot_interval`, `evict_idle_secs`, `ntfs`, `ntfs_remount_readonly`, `log_level`, `background_opacity`, or `candidate_index`; changing `excludes` triggers a rescan |
 | `ListRoots` | the indexed roots |
-| `ListVolumes` | detected block volumes with UUID, label, fstype, mount point, and status |
+| `ListVolumes` | detected block volumes with UUID, label, fstype, mount point, and status. The `blkid` probe is coalesced into one shared, cached (2 s), bounded call: concurrent callers join it, and a burst beyond the waiter bound gets `org.freedesktop.DBus.Error.LimitsExceeded` |
 | `MountNtfs(uuid)` | mount an NTFS partition and index it via the MFT; returns the mount point |
 | `MountVolume(device)` | mount any volume and index it; returns the mount point |
 | `UnmountVolume(device)` | unmount a volume and drop its index entries |
@@ -207,7 +217,7 @@ Signals: `IndexChanged(entries)` and `ScanProgress(phase, entries, errors)`.
 The read-only methods are open to all. `Rescan`, `MountNtfs`, `MountVolume`,
 `UnmountVolume`, and the privileged `SetConfig` keys (`excludes`, `ntfs`,
 `scan_interval`, `snapshot_interval`, `evict_idle_secs`, `log_level`,
-`candidate_index`), are gated by the
+`candidate_index`, `ntfs_remount_readonly`), are gated by the
 `tech.alatcerdas.omavrything.control` polkit action. The cosmetic
 `background_opacity` key uses `tech.alatcerdas.omavrything.set-config`
 (`allow_active=yes`), so the settings panel can save without a prompt. Both

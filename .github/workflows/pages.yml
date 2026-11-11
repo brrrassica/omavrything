@@ -29,9 +29,14 @@ concurrency:
 jobs:
   build:
     name: build the site
-    runs-on: [self-hosted, opencode-sam]
+    # GitHub-hosted, NOT the on-premise runner: this job runs repo code
+    # (`site/build.py`, `pip install`) and must not share a host with the
+    # write-privileged release job, where a merged change to the build script
+    # could persist state (e.g. a Cargo `config.toml`) that a later release
+    # build would consume. See the marketplace review finding.
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       # Build in a virtualenv: the self-hosted runner's system Python is
       # externally managed (PEP 668), so a bare `pip install` is refused.
@@ -52,7 +57,9 @@ jobs:
   deploy:
     name: deploy to GitHub Pages
     needs: build
-    runs-on: [self-hosted, opencode-sam]
+    # Hosted too: the deploy job runs no repo code, but keeping the whole
+    # workflow off the release host removes any shared-state concern.
+    runs-on: ubuntu-latest
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

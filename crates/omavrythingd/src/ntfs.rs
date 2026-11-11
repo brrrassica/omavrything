@@ -57,10 +57,24 @@ pub const WRITABLE_MOUNT_ERR: &str = "refusing to index writable mount";
 /// private `ntfs3` mount. Returns the mount point.
 ///
 /// A device that is already mounted (e.g. by udisks2 at login) reuses its
-/// existing mount point rather than attempting a second mount. A pre-existing
-/// mount that is writable is remounted read-only (B12): the daemon never
-/// indexes a writable mount, so the MFT read cannot set the volume's dirty bit.
-pub fn mount_readonly(device: &Path, uuid: Option<&str>) -> Result<PathBuf, String> {
+/// existing mount point rather than attempting a second mount.
+///
+/// `allow_remount` controls what happens when that mount is **writable**. The
+/// daemon never indexes a writable mount (B12), but changing a mount someone
+/// else created is a host-wide side effect, so it is only done when the caller
+/// opts in:
+///
+/// * `true` — an explicit user request (`MountNtfs`/`MountVolume`): the mount is
+///   remounted read-only and kept that way for the daemon's lifetime.
+/// * `false` — automatic discovery (startup, hotplug): the existing mount and
+///   its options are left untouched and this returns [`WRITABLE_MOUNT_ERR`], so
+///   the caller skips MFT indexing. Startup must never silently take write
+///   access away from a running desktop.
+pub fn mount_readonly(
+    device: &Path,
+    uuid: Option<&str>,
+    allow_remount: bool,
+) -> Result<PathBuf, String> {
     if let Some(mount_point) = existing_mount_point(device) {
         // Diagnostics: a pre-existing mount is *not* daemon-created, and its
         // read-write state is whatever the desktop (udisks2) chose. Log it so
@@ -74,12 +88,19 @@ pub fn mount_readonly(device: &Path, uuid: Option<&str>) -> Result<PathBuf, Stri
             "ntfs: reusing pre-existing mount (not daemon-created)"
         );
         // B12: the daemon only indexes read-only mounts. A pre-existing mount
-        // (e.g. a udisks2 auto-mount at login) is usually writable; remount it
-        // read-only so the MFT read cannot set the volume's dirty bit. The
-        // remount is kept: the daemon's model is read-only mounts, and a
-        // writable mount is never indexed.
-        if mount_is_readonly(&mount_point) == Some(false) {
-            remount_readonly(&mount_point)?;
+        // (e.g. a udisks2 auto-mount at login) is usually writable. Remounting
+        // it changes a mount the daemon does not own, so automatic discovery
+        // refuses instead and leaves the desktop's options alone.
+        match pre_existing_mount_action(mount_is_readonly(&mount_point), allow_remount) {
+            PreexistingMount::Use => {}
+            PreexistingMount::Remount => remount_readonly(&mount_point)?,
+            PreexistingMount::Refuse => {
+                return Err(format!(
+                    "{WRITABLE_MOUNT_ERR} {} (pre-existing writable mount; \
+                     list its UUID in ntfs_remount_readonly to opt in)",
+                    mount_point.display()
+                ));
+            }
         }
         return Ok(mount_point);
     }
@@ -108,6 +129,34 @@ pub fn mount_readonly(device: &Path, uuid: Option<&str>) -> Result<PathBuf, Stri
         return Ok(mount_point);
     }
     mount_via_ntfs3(device, uuid)
+}
+
+/// What to do with a mount that already exists when the daemon wants to index
+/// the volume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreexistingMount {
+    /// Already read-only (or unverifiable): index it as-is.
+    Use,
+    /// Writable and the caller opted in: remount read-only and keep it.
+    Remount,
+    /// Writable and automatic discovery: leave the desktop's mount alone.
+    Refuse,
+}
+
+/// Decide the action for a pre-existing mount from its read-only state and
+/// whether the caller may remount it.
+///
+/// This is the whole safety rule in one place so it is unit-testable without a
+/// real block device: **automatic discovery never remounts** a mount it does not
+/// own, regardless of configuration; only an explicit opt-in (the UUID listed in
+/// `ntfs_remount_readonly`, or an explicit user mount request) allows it.
+fn pre_existing_mount_action(readonly: Option<bool>, allow_remount: bool) -> PreexistingMount {
+    match readonly {
+        // Read-only already, or `/proc/mounts` no longer lists it.
+        Some(true) | None => PreexistingMount::Use,
+        Some(false) if allow_remount => PreexistingMount::Remount,
+        Some(false) => PreexistingMount::Refuse,
+    }
 }
 
 /// Remount `mount_point` read-only (B12). Requires `CAP_SYS_ADMIN`, which the
@@ -756,13 +805,23 @@ pub fn run_hotplug_monitor(
             {
                 continue;
             }
-            match mount_index_and_remember_with_ownership(
-                index.as_ref(),
-                policy.as_ref(),
-                ownership.as_ref(),
-                &part,
-            ) {
-                Ok(mount_point) => {
+            // Hotplug only reaches this point for a partition that is *known*
+            // (the user indexed it before), so remounting its writable mount
+            // read-only is the consequence of that explicit earlier request.
+            // A malformed volume makes the MFT parser (and the run-list decode
+            // behind it) read attacker-controlled on-disk data. Contain a panic
+            // here — as the startup pass does — so a crafted volume backs off
+            // this partition instead of terminating the monitor thread.
+            match crate::contain_panic(|| {
+                mount_index_and_remember_with_ownership(
+                    index.as_ref(),
+                    policy.as_ref(),
+                    ownership.as_ref(),
+                    &part,
+                    true,
+                )
+            }) {
+                Ok(Ok(mount_point)) => {
                     retry_at.remove(&part.device);
                     info!(
                         device = %part.device.display(),
@@ -770,11 +829,18 @@ pub fn run_hotplug_monitor(
                         "ntfs: hotplug mount indexed"
                     );
                 }
-                Err(err) => {
+                Ok(Err(err)) => {
                     warn!(
                         device = %part.device.display(),
                         error = %err,
                         "ntfs: hotplug mount failed; backing off"
+                    );
+                    retry_at.insert(part.device.clone(), Instant::now() + RETRY);
+                }
+                Err(()) => {
+                    warn!(
+                        device = %part.device.display(),
+                        "ntfs: hotplug mount panicked on malformed volume; backing off"
                     );
                     retry_at.insert(part.device.clone(), Instant::now() + RETRY);
                 }
@@ -884,19 +950,28 @@ pub fn mount_index_and_remember(
         policy,
         &Mutex::new(MountOwnership::load(default_ownership_path())),
         partition,
+        // An explicit `MountNtfs`/`MountVolume` request: the user asked for the
+        // volume to be indexed, so remounting a writable mount read-only is the
+        // documented consequence (ADR-018).
+        true,
     )
 }
 
 /// Like [`mount_index_and_remember`], but records the mount's ownership in
 /// `ownership` (M18, B2): a mount the daemon created is marked owned (unmounted
 /// on shutdown); a pre-existing mount is marked not-owned (never unmounted).
+///
+/// `allow_remount` is forwarded to [`mount_readonly`]: `true` for an explicit
+/// user request, `false` for automatic discovery (startup/hotplug), which must
+/// never change a pre-existing mount's options.
 pub fn mount_index_and_remember_with_ownership(
     index: &IndexManager,
     policy: &Mutex<NtfsPolicy>,
     ownership: &Mutex<MountOwnership>,
     partition: &NtfsPartition,
+    allow_remount: bool,
 ) -> Result<PathBuf, String> {
-    let mount_point = mount_readonly(&partition.device, partition.uuid.as_deref())?;
+    let mount_point = mount_readonly(&partition.device, partition.uuid.as_deref(), allow_remount)?;
     // B12: never index through a writable mount. A forced close or power loss
     // on a writable mount can set the volume's dirty bit or lose data, so a
     // mount that is not verifiably read-only is refused.
@@ -1080,6 +1155,46 @@ mod tests {
         assert!(index.find(Path::new("/etc/passwd")).is_none());
         assert!(index.find(Path::new("/etc/shadow")).is_none());
         assert!(index.find(Path::new("/mnt/etc/passwd")).is_none());
+    }
+
+    #[test]
+    fn automatic_discovery_never_remounts_a_preexisting_writable_mount() {
+        // The startup/hotplug finding: a pre-existing writable NTFS mount (a
+        // udisks2 auto-mount at login) must never be remounted read-only by
+        // automatic discovery, because that takes write access away from a
+        // mount the daemon does not own. `allow_remount = false` is what
+        // `run_ntfs_startup` passes for every volume not listed in
+        // `ntfs_remount_readonly`.
+        assert_eq!(
+            pre_existing_mount_action(Some(false), false),
+            PreexistingMount::Refuse,
+            "automatic discovery must leave a writable mount untouched"
+        );
+
+        // An already read-only mount is used as-is.
+        assert_eq!(
+            pre_existing_mount_action(Some(true), false),
+            PreexistingMount::Use
+        );
+        assert_eq!(
+            pre_existing_mount_action(Some(true), true),
+            PreexistingMount::Use
+        );
+
+        // A mount that vanished between the probe and the check is not usable,
+        // but must not trigger a remount either.
+        assert_eq!(
+            pre_existing_mount_action(None, false),
+            PreexistingMount::Use
+        );
+        assert_eq!(pre_existing_mount_action(None, true), PreexistingMount::Use);
+
+        // Only an explicit opt-in (the UUID listed in ntfs_remount_readonly, or
+        // an explicit user mount request) remounts.
+        assert_eq!(
+            pre_existing_mount_action(Some(false), true),
+            PreexistingMount::Remount
+        );
     }
 
     #[test]

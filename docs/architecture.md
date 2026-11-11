@@ -332,10 +332,15 @@ flowchart TD
   the periodic rescan.
 - **Mounting:** the daemon prefers the **udisks2 D-Bus API**, falls back to
   `udisksctl`, and finally to a private read-only `ntfs3` mount at
-  `/run/omavrything/ntfs/<uuid>`. A pre-existing writable mount (a udisks2
-  auto-mount at login) is remounted read-only and kept read-only, so the MFT
-  read cannot set the volume's dirty bit (B12). The generic walker never indexes
-  `/run/media` (ADR-018).
+  `/run/omavrything/ntfs/<uuid>`. The daemon only indexes a **read-only** mount,
+  so the MFT read cannot set the volume's dirty bit (B12). A **pre-existing**
+  writable mount (a udisks2 auto-mount at login) is left exactly as the desktop
+  created it during automatic discovery (startup/hotplug) — the daemon does not
+  remount a mount it does not own. It is only remounted read-only when the
+  volume's UUID is listed in `ntfs_remount_readonly`, or when the user issues an
+  explicit `MountNtfs`/`MountVolume`. A writable mount that is not remounted is
+  refused for MFT indexing and indexed by the generic walker instead. The generic
+  walker never indexes `/run/media` (ADR-018).
 - **Mount ownership:** the daemon records which mounts it created in a
   `mounts.state` file, unmounts only those on shutdown, reconciles the state on
   restart, and drops a mount's index entries when the mount disappears.

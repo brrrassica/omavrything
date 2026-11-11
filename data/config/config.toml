@@ -15,6 +15,14 @@ auto = true
 # state config and mounts/indexes them again on the next start.
 # volumes = ["/dev/sda1"]
 
+# NTFS volume UUIDs whose pre-existing (already mounted) writable volume the
+# daemon may remount read-only during automatic discovery (startup/hotplug), so
+# it can index them via the faster MFT path. EMPTY by default: a pre-existing
+# mount always keeps the options the desktop chose. A writable volume that is
+# not listed here is left untouched and indexed by the generic walker instead.
+# An explicit `omavry mount <uuid>` never needs an entry here.
+# ntfs_remount_readonly = ["0123456789ABCDEF"]
+
 # Exclude globs applied during traversal.
 excludes = ["**/.git/**", "**/node_modules/**", "**/.cache/**"]
 

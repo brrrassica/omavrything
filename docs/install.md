@@ -1,10 +1,9 @@
 # Installation and setup
 
-`omavrything` is at **v0.2.5**, released and used day to day. Install it as an
-Omarchy plugin (§0), or from a release archive or source (§1–2). It targets
-**Omarchy Quattro (4.x)** only — Hyprland, `omarchy-shell` (Quickshell), Arch
-Linux. There is no backwards compatibility with earlier Omarchy releases that
-used waybar.
+`omavrything` is at **v0.2.6**. Install it as an Omarchy plugin (§0), or from a
+release archive or source (§1–2). It targets **Omarchy Quattro (4.x)** only —
+Hyprland, `omarchy-shell` (Quickshell), Arch Linux. There is no backwards
+compatibility with earlier Omarchy releases that used waybar.
 
 ## 0. Install as an Omarchy plugin (recommended)
 

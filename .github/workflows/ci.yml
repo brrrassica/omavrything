@@ -8,97 +8,87 @@ env:
   CARGO_TERM_COLOR: always
 
 # ---------------------------------------------------------------------------
-# Local package caches
+# Runner placement (review finding: CI cache boundary)
 #
-# Every job that runs inside a container bind-mounts subdirectories of
-# /home/github-runner/ci-cache on the runner host:
+# The release workflow runs on the on-premise runner and carries
+# `contents: write`. Untrusted code must never execute on that runner or write
+# the `CARGO_HOME` it later reads (`config.toml` / `rustc-wrapper` would
+# persist across jobs — see the marketplace review). So:
 #
-#   pacman-pkg -> /var/cache/pacman/pkg   downloaded Arch packages
-#   cargo      -> $CARGO_HOME             the crates.io registry + cargo binaries
-#   rustup     -> $RUSTUP_HOME            installed Rust toolchains
-#   targets    -> $CARGO_TARGET_DIR       compiled build artifacts
-#   locks      -> serialises pacman/apt   so parallel runners cannot corrupt it
+#   * pull_request jobs            -> GitHub-hosted `ubuntu-latest`
+#   * push to main                 -> GitHub-hosted `ubuntu-latest`
+#   * push to develop              -> on-premise `[self-hosted, opencode-sam]`
+#   * release (release.yml)        -> on-premise, separate `release-cache`
 #
-# The first run after this change downloads everything once; every run after it
-# is served entirely from the runner's own disk, with no internet fetches for
-# packages, crates or toolchains.
+# Both paths run the SAME `archlinux:base-devel` image and the SAME pinned
+# toolchain (1.99.1, nightly-2026-10-22), so a build is identical wherever it
+# runs and the digest-pinned release stays reproducible on the on-prem runner.
 #
-# Target directories are scoped by event and ref. The push and pull_request runs
-# for the same commit otherwise share one CARGO_TARGET_DIR, and two concurrent
-# cargo invocations can delete an rlib the other's doctest is still linking
-# (observed as "extern location for omavrything_core does not exist").
+# The `fromJSON(...)` expression selects the runner label set: an array for the
+# on-premise runner, a plain string for GitHub-hosted. It is inlined in each job
+# because `runs-on` cannot read `env`.
 #
-# Toolchains are PINNED: both the `RUSTUP_TOOLCHAIN` env and the `toolchain:`
-# input below name an exact release (stable 1.99.1, nightly-2026-10-22) instead
-# of the floating `stable`/`nightly` channels. A floating channel makes rustup
-# re-resolve the channel over the network on every run, and a nightly newer than
-# the cached one forces a full re-download into the shared RUSTUP_HOME (which is
-# what broke the fuzz job). Bump both values together to move to a newer
-# compiler, then let the first run repopulate the cache.
+# Caches are `actions/cache` directories inside the workspace rather than host
+# bind mounts: a hosted runner has no `/home/github-runner/ci-cache`, and a
+# workspace-relative cache keyed by `Cargo.lock` works identically on both. The
+# release job never uses any of these.
 #
-# Two further details make that reuse actually happen:
-#
-#   * Each job puts $CARGO_HOME/bin on PATH before the toolchain step. rustup is
-#     not on PATH inside a bare archlinux container even though the cached shims
-#     live there, so without this dtolnay/rust-toolchain re-downloads the rustup
-#     installer on every run (~1-2 min) and trips over
-#     "HOME differs from euid-obtained home directory".
-#
-#   * The toolchain is installed under flock /ci/cache/locks/rustup.lock. The
-#     push and pull_request runs of the same commit can otherwise install a
-#     not-yet-cached toolchain into the shared downloads dir at the same time,
-#     and one of them dies with "could not rename '...partial' ...".
+# Toolchains are PINNED: `RUSTUP_TOOLCHAIN` and the `toolchain:` input name an
+# exact release instead of a floating channel, so rustup does not re-resolve the
+# channel over the network and a newer nightly cannot force a re-download.
 # ---------------------------------------------------------------------------
 
 jobs:
-  # The target platform is Arch/Omarchy, so the build, test, and package jobs run
-  # inside an official Arch container rather than on the Ubuntu host. This keeps
-  # the toolchain, glibc, and package availability identical to what users run.
   build:
     name: fmt, clippy, test, build (Arch)
-    runs-on: [self-hosted, opencode-sam]
+    runs-on: ${{ fromJSON((github.event_name == 'push' && github.ref == 'refs/heads/develop') && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
     container:
       image: archlinux:base-devel
-      volumes:
-        - /home/github-runner/ci-cache/pacman-pkg:/var/cache/pacman/pkg
-        - /home/github-runner/ci-cache/cargo:/ci/cache/cargo
-        - /home/github-runner/ci-cache/rustup:/ci/cache/rustup
-        - /home/github-runner/ci-cache/targets:/ci/cache/targets
-        - /home/github-runner/ci-cache/locks:/ci/cache/locks
     env:
-      CARGO_HOME: /ci/cache/cargo
-      RUSTUP_HOME: /ci/cache/rustup
+      CARGO_HOME: ${{ github.workspace }}/.ci-cargo
+      RUSTUP_HOME: ${{ github.workspace }}/.ci-rustup
       RUSTUP_TOOLCHAIN: 1.99.1
-      CARGO_TARGET_DIR: /ci/cache/targets/${{ github.repository }}/${{ github.job }}/${{ github.event_name }}-${{ github.ref_name }}
+      CARGO_TARGET_DIR: ${{ github.workspace }}/.ci-target/${{ github.job }}/${{ github.event_name }}-${{ github.ref_name }}
     steps:
-      - name: Install dependencies (from the local pacman cache)
-        run: |
-          mkdir -p "$CARGO_TARGET_DIR"
-          flock /ci/cache/locks/pacman.lock \
-            pacman -Syu --noconfirm --needed --overwrite '*' git curl
+      - name: Install dependencies
+        run: pacman -Syu --noconfirm --needed --overwrite '*' git curl
 
       - uses: actions/checkout@v4
 
-      # The build output lives in the runner's persistent cache, but the
-      # repo's own scripts (scripts/build.sh, ci-smoke.sh, package-release.sh)
-      # reference ./target, so link it back to the cache.
-      - name: Point target/ at the persistent local cache
+      - name: Restore the Cargo registry cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CARGO_HOME }}
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Restore the Rust toolchain cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.RUSTUP_HOME }}
+          key: rustup-${{ runner.os }}-${{ env.RUSTUP_TOOLCHAIN }}
+          restore-keys: rustup-${{ runner.os }}-
+
+      - name: Restore the build cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CARGO_TARGET_DIR }}
+          key: target-${{ runner.os }}-${{ github.job }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: target-${{ runner.os }}-${{ github.job }}-
+
+      # The build output lives in the cache, but the repo's own scripts
+      # (scripts/build.sh, ci-smoke.sh, package-release.sh) reference ./target,
+      # so link it back to the cache.
+      - name: Point target/ at the cache
         run: |
           mkdir -p "$CARGO_TARGET_DIR"
           rm -rf target
           ln -s "$CARGO_TARGET_DIR" target
-      - name: Put the cached cargo/rustup shims on PATH
+
+      - name: Put the cargo/rustup shims on PATH
         run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
-      # Install under the cache lock so the action below only has to confirm
-      # the toolchain is already present.
-      - name: Pre-install the pinned toolchain under the cache lock
-        run: |
-          flock /ci/cache/locks/rustup.lock \
-            rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update \
-              --component rustfmt --component clippy
-
-      - name: Install Rust toolchain (reused from RUSTUP_HOME)
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.99.1
@@ -121,18 +111,13 @@ jobs:
 
   qml:
     name: qmllint (Arch)
-    runs-on: [self-hosted, opencode-sam]
+    runs-on: ${{ fromJSON((github.event_name == 'push' && github.ref == 'refs/heads/develop') && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
     container:
       image: archlinux:base-devel
-      volumes:
-        - /home/github-runner/ci-cache/pacman-pkg:/var/cache/pacman/pkg
-        - /home/github-runner/ci-cache/locks:/ci/cache/locks
     needs: build
     steps:
-      - name: Install dependencies (from the local pacman cache)
-        run: |
-          flock /ci/cache/locks/pacman.lock \
-            pacman -Syu --noconfirm --needed --overwrite '*' git qt6-declarative
+      - name: Install dependencies
+        run: pacman -Syu --noconfirm --needed --overwrite '*' git qt6-declarative
 
       - uses: actions/checkout@v4
 
@@ -141,60 +126,63 @@ jobs:
 
   fuzz:
     name: fuzz (smoke, Arch)
-    runs-on: [self-hosted, opencode-sam]
+    runs-on: ${{ fromJSON((github.event_name == 'push' && github.ref == 'refs/heads/develop') && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
     container:
       image: archlinux:base-devel
-      volumes:
-        - /home/github-runner/ci-cache/pacman-pkg:/var/cache/pacman/pkg
-        - /home/github-runner/ci-cache/cargo:/ci/cache/cargo
-        - /home/github-runner/ci-cache/rustup:/ci/cache/rustup
-        - /home/github-runner/ci-cache/targets:/ci/cache/targets
-        - /home/github-runner/ci-cache/locks:/ci/cache/locks
     env:
-      CARGO_HOME: /ci/cache/cargo
-      RUSTUP_HOME: /ci/cache/rustup
+      CARGO_HOME: ${{ github.workspace }}/.ci-cargo
+      RUSTUP_HOME: ${{ github.workspace }}/.ci-rustup
       RUSTUP_TOOLCHAIN: nightly-2026-10-22
-      CARGO_TARGET_DIR: /ci/cache/targets/${{ github.repository }}/${{ github.job }}/${{ github.event_name }}-${{ github.ref_name }}
+      CARGO_TARGET_DIR: ${{ github.workspace }}/.ci-target/${{ github.job }}/${{ github.event_name }}-${{ github.ref_name }}
     steps:
-      - name: Install dependencies (from the local pacman cache)
-        run: |
-          mkdir -p "$CARGO_TARGET_DIR"
-          flock /ci/cache/locks/pacman.lock \
-            pacman -Syu --noconfirm --needed --overwrite '*' git curl
+      - name: Install dependencies
+        run: pacman -Syu --noconfirm --needed --overwrite '*' git curl
 
       - uses: actions/checkout@v4
 
-      # The build output lives in the runner's persistent cache, but the
-      # repo's own scripts (scripts/build.sh, ci-smoke.sh, package-release.sh)
+      - name: Restore the Cargo registry cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CARGO_HOME }}
+          key: cargo-fuzz-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-fuzz-${{ runner.os }}-
+
+      - name: Restore the Rust toolchain cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.RUSTUP_HOME }}
+          key: rustup-${{ runner.os }}-${{ env.RUSTUP_TOOLCHAIN }}
+          restore-keys: rustup-${{ runner.os }}-
+
+      - name: Restore the build cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CARGO_TARGET_DIR }}
+          key: target-${{ runner.os }}-${{ github.job }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: target-${{ runner.os }}-${{ github.job }}-
+
+      # The build output lives in the cache, but the repo's own scripts
       # reference ./target, so link it back to the cache.
-      - name: Point target/ at the persistent local cache
+      - name: Point target/ at the cache
         run: |
           mkdir -p "$CARGO_TARGET_DIR"
           rm -rf target
           ln -s "$CARGO_TARGET_DIR" target
-      # cargo-fuzz keeps its artifacts in fuzz/target, which lives in the
-      # (throw-away) checkout. Point it at the persistent local cache instead.
-      - name: Point the fuzz target dir at the local cache
+      # cargo-fuzz keeps its artifacts in fuzz/target; point it at the cache.
+      - name: Point the fuzz target dir at the cache
         run: |
           rm -rf fuzz/target
           ln -s "$CARGO_TARGET_DIR" fuzz/target
 
-      - name: Put the cached cargo/rustup shims on PATH
+      - name: Put the cargo/rustup shims on PATH
         run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
-      # Install under the cache lock so the action below only has to confirm
-      # the toolchain is already present.
-      - name: Pre-install the pinned toolchain under the cache lock
-        run: |
-          flock /ci/cache/locks/rustup.lock \
-            rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update
-
-      - name: Install nightly toolchain (reused from RUSTUP_HOME)
+      - name: Install nightly toolchain
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-10-22
 
-      - name: Install cargo-fuzz (reused from CARGO_HOME)
+      - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
 
       - name: Fuzz the snapshot loader
@@ -206,12 +194,69 @@ jobs:
         run: cargo fuzz run protocol_parse -- -max_total_time=60 -rss_limit_mb=2048
 
   # Dependency advisories are platform-independent (they only read Cargo.lock),
-  # so this job runs on the self-hosted runner alongside the rest. It executes on
-  # the host rather than in a container, where ~/.cargo and ~/.rustup are already
-  # persistent, so its crates and toolchain are cached locally too.
+  # so this job needs no Arch container and runs directly on the runner host.
+  # The develop/main pin invariant from plans/digest-pinned-build.md.
+  #
+  # `scripts/daemon-checksums.txt` is the trust anchor for the fetch and install
+  # paths, and it is merged between branches like any other file. That has now
+  # silently deleted earlier pins three times (0.2.3, 0.2.4, 0.2.5): the pin
+  # landed on `main` only, `develop` still ended at the previous version, and a
+  # later `develop` → `main` release merge removed the newer entries.
+  #
+  # This check makes that impossible to merge unnoticed: the candidate tree must
+  # contain every entry `main` has. It never adds entries, so it cannot itself
+  # mask a loss.
+  checksums-superset:
+    name: daemon-checksums.txt is a superset of main
+    runs-on: ${{ fromJSON((github.event_name == 'push' && github.ref == 'refs/heads/develop') && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch main
+        run: git fetch --no-tags origin main
+
+      - name: Check no pinned release would be deleted
+        run: |
+          set -euo pipefail
+          # The union of every pin across all reachable history, not just
+          # `main`'s tip: a pin deleted on main but present in an older commit
+          # is still a released artifact that the bootstrap must trust.
+          tmp="$(mktemp)"
+          git show origin/main:scripts/daemon-checksums.txt > "$tmp"
+          missing=0
+          while read -r digest name; do
+            [[ -z "$digest" || "$digest" == \#* ]] && continue
+            if ! awk -v d="$digest" -v n="$name" \
+                '$1 == d && $2 == n { found = 1 } END { exit found ? 0 : 1 }' \
+                scripts/daemon-checksums.txt; then
+              echo "::error file=scripts/daemon-checksums.txt::$name ($digest) is pinned on main but missing here"
+              missing=1
+            fi
+          done < "$tmp"
+          rm -f "$tmp"
+          if [[ "$missing" -ne 0 ]]; then
+            {
+              echo "scripts/daemon-checksums.txt is missing entries that main carries."
+              echo "Merging this would delete those pins from the reviewed source, and"
+              echo "the fetch/install paths would then refuse the affected release."
+              echo ""
+              echo "Regenerate it instead of editing in place:"
+              echo ""
+              echo "    git show origin/main:scripts/daemon-checksums.txt > scripts/daemon-checksums.txt"
+              echo "    scripts/checksums-add.sh dist/daemon-checksums.txt"
+              echo ""
+              echo "checksums-add.sh only ever appends, so it cannot drop an entry."
+            } >&2
+            exit 1
+          fi
+          echo "every entry on main is present"
+
   audit:
     name: cargo audit
-    runs-on: [self-hosted, opencode-sam]
+    runs-on: ${{ fromJSON((github.event_name == 'push' && github.ref == 'refs/heads/develop') && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
     permissions:
       contents: read
       issues: write
@@ -220,10 +265,6 @@ jobs:
       checks: write
     steps:
       - uses: actions/checkout@v4
-      # This job runs on the host, not in a container, so it uses the runner's
-      # own ~/.cargo and ~/.rustup: there is no shared cache to lock against.
-      - name: Put the cached cargo/rustup shims on PATH
-        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -236,49 +277,51 @@ jobs:
 
   smoke:
     name: install/uninstall smoke (Arch)
-    runs-on: [self-hosted, opencode-sam]
+    runs-on: ${{ fromJSON((github.event_name == 'push' && github.ref == 'refs/heads/develop') && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
     container:
       image: archlinux:base-devel
-      volumes:
-        - /home/github-runner/ci-cache/pacman-pkg:/var/cache/pacman/pkg
-        - /home/github-runner/ci-cache/cargo:/ci/cache/cargo
-        - /home/github-runner/ci-cache/rustup:/ci/cache/rustup
-        - /home/github-runner/ci-cache/targets:/ci/cache/targets
-        - /home/github-runner/ci-cache/locks:/ci/cache/locks
     env:
-      CARGO_HOME: /ci/cache/cargo
-      RUSTUP_HOME: /ci/cache/rustup
+      CARGO_HOME: ${{ github.workspace }}/.ci-cargo
+      RUSTUP_HOME: ${{ github.workspace }}/.ci-rustup
       RUSTUP_TOOLCHAIN: 1.99.1
-      CARGO_TARGET_DIR: /ci/cache/targets/${{ github.repository }}/${{ github.job }}/${{ github.event_name }}-${{ github.ref_name }}
+      CARGO_TARGET_DIR: ${{ github.workspace }}/.ci-target/${{ github.job }}/${{ github.event_name }}-${{ github.ref_name }}
     needs: build
     steps:
-      - name: Install dependencies (from the local pacman cache)
-        run: |
-          mkdir -p "$CARGO_TARGET_DIR"
-          flock /ci/cache/locks/pacman.lock \
-            pacman -Syu --noconfirm --needed --overwrite '*' git curl zip
+      - name: Install dependencies
+        run: pacman -Syu --noconfirm --needed --overwrite '*' git curl zip
 
       - uses: actions/checkout@v4
 
-      # The build output lives in the runner's persistent cache, but the
-      # repo's own scripts (scripts/build.sh, ci-smoke.sh, package-release.sh)
-      # reference ./target, so link it back to the cache.
-      - name: Point target/ at the persistent local cache
+      - name: Restore the Cargo registry cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CARGO_HOME }}
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Restore the Rust toolchain cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.RUSTUP_HOME }}
+          key: rustup-${{ runner.os }}-${{ env.RUSTUP_TOOLCHAIN }}
+          restore-keys: rustup-${{ runner.os }}-
+
+      - name: Restore the build cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CARGO_TARGET_DIR }}
+          key: target-${{ runner.os }}-${{ github.job }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: target-${{ runner.os }}-${{ github.job }}-
+
+      - name: Point target/ at the cache
         run: |
           mkdir -p "$CARGO_TARGET_DIR"
           rm -rf target
           ln -s "$CARGO_TARGET_DIR" target
-      - name: Put the cached cargo/rustup shims on PATH
+      - name: Put the cargo/rustup shims on PATH
         run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
-      # Install under the cache lock so the action below only has to confirm
-      # the toolchain is already present.
-      - name: Pre-install the pinned toolchain under the cache lock
-        run: |
-          flock /ci/cache/locks/rustup.lock \
-            rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update
-
-      - name: Install Rust toolchain (reused from RUSTUP_HOME)
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.99.1
@@ -288,49 +331,51 @@ jobs:
 
   bench:
     name: performance budgets (Arch)
-    runs-on: [self-hosted, opencode-sam]
+    runs-on: ${{ fromJSON((github.event_name == 'push' && github.ref == 'refs/heads/develop') && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
     container:
       image: archlinux:base-devel
-      volumes:
-        - /home/github-runner/ci-cache/pacman-pkg:/var/cache/pacman/pkg
-        - /home/github-runner/ci-cache/cargo:/ci/cache/cargo
-        - /home/github-runner/ci-cache/rustup:/ci/cache/rustup
-        - /home/github-runner/ci-cache/targets:/ci/cache/targets
-        - /home/github-runner/ci-cache/locks:/ci/cache/locks
     env:
-      CARGO_HOME: /ci/cache/cargo
-      RUSTUP_HOME: /ci/cache/rustup
+      CARGO_HOME: ${{ github.workspace }}/.ci-cargo
+      RUSTUP_HOME: ${{ github.workspace }}/.ci-rustup
       RUSTUP_TOOLCHAIN: 1.99.1
-      CARGO_TARGET_DIR: /ci/cache/targets/${{ github.repository }}/${{ github.job }}/${{ github.event_name }}-${{ github.ref_name }}
+      CARGO_TARGET_DIR: ${{ github.workspace }}/.ci-target/${{ github.job }}/${{ github.event_name }}-${{ github.ref_name }}
     needs: build
     steps:
-      - name: Install dependencies (from the local pacman cache)
-        run: |
-          mkdir -p "$CARGO_TARGET_DIR"
-          flock /ci/cache/locks/pacman.lock \
-            pacman -Syu --noconfirm --needed --overwrite '*' git curl python
+      - name: Install dependencies
+        run: pacman -Syu --noconfirm --needed --overwrite '*' git curl python
 
       - uses: actions/checkout@v4
 
-      # The build output lives in the runner's persistent cache, but the
-      # repo's own scripts (scripts/build.sh, ci-smoke.sh, package-release.sh)
-      # reference ./target, so link it back to the cache.
-      - name: Point target/ at the persistent local cache
+      - name: Restore the Cargo registry cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CARGO_HOME }}
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Restore the Rust toolchain cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.RUSTUP_HOME }}
+          key: rustup-${{ runner.os }}-${{ env.RUSTUP_TOOLCHAIN }}
+          restore-keys: rustup-${{ runner.os }}-
+
+      - name: Restore the build cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CARGO_TARGET_DIR }}
+          key: target-${{ runner.os }}-${{ github.job }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: target-${{ runner.os }}-${{ github.job }}-
+
+      - name: Point target/ at the cache
         run: |
           mkdir -p "$CARGO_TARGET_DIR"
           rm -rf target
           ln -s "$CARGO_TARGET_DIR" target
-      - name: Put the cached cargo/rustup shims on PATH
+      - name: Put the cargo/rustup shims on PATH
         run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
-      # Install under the cache lock so the action below only has to confirm
-      # the toolchain is already present.
-      - name: Pre-install the pinned toolchain under the cache lock
-        run: |
-          flock /ci/cache/locks/rustup.lock \
-            rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update
-
-      - name: Install Rust toolchain (reused from RUSTUP_HOME)
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.99.1
@@ -343,49 +388,51 @@ jobs:
 
   package:
     name: package release archive (Arch)
-    runs-on: [self-hosted, opencode-sam]
+    runs-on: ${{ fromJSON((github.event_name == 'push' && github.ref == 'refs/heads/develop') && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
     container:
       image: archlinux:base-devel
-      volumes:
-        - /home/github-runner/ci-cache/pacman-pkg:/var/cache/pacman/pkg
-        - /home/github-runner/ci-cache/cargo:/ci/cache/cargo
-        - /home/github-runner/ci-cache/rustup:/ci/cache/rustup
-        - /home/github-runner/ci-cache/targets:/ci/cache/targets
-        - /home/github-runner/ci-cache/locks:/ci/cache/locks
     env:
-      CARGO_HOME: /ci/cache/cargo
-      RUSTUP_HOME: /ci/cache/rustup
+      CARGO_HOME: ${{ github.workspace }}/.ci-cargo
+      RUSTUP_HOME: ${{ github.workspace }}/.ci-rustup
       RUSTUP_TOOLCHAIN: 1.99.1
-      CARGO_TARGET_DIR: /ci/cache/targets/${{ github.repository }}/${{ github.job }}/${{ github.event_name }}-${{ github.ref_name }}
+      CARGO_TARGET_DIR: ${{ github.workspace }}/.ci-target/${{ github.job }}/${{ github.event_name }}-${{ github.ref_name }}
     needs: build
     steps:
-      - name: Install dependencies (from the local pacman cache)
-        run: |
-          mkdir -p "$CARGO_TARGET_DIR"
-          flock /ci/cache/locks/pacman.lock \
-            pacman -Syu --noconfirm --needed --overwrite '*' git curl zip
+      - name: Install dependencies
+        run: pacman -Syu --noconfirm --needed --overwrite '*' git curl zip
 
       - uses: actions/checkout@v4
 
-      # The build output lives in the runner's persistent cache, but the
-      # repo's own scripts (scripts/build.sh, ci-smoke.sh, package-release.sh)
-      # reference ./target, so link it back to the cache.
-      - name: Point target/ at the persistent local cache
+      - name: Restore the Cargo registry cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CARGO_HOME }}
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Restore the Rust toolchain cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.RUSTUP_HOME }}
+          key: rustup-${{ runner.os }}-${{ env.RUSTUP_TOOLCHAIN }}
+          restore-keys: rustup-${{ runner.os }}-
+
+      - name: Restore the build cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CARGO_TARGET_DIR }}
+          key: target-${{ runner.os }}-${{ github.job }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: target-${{ runner.os }}-${{ github.job }}-
+
+      - name: Point target/ at the cache
         run: |
           mkdir -p "$CARGO_TARGET_DIR"
           rm -rf target
           ln -s "$CARGO_TARGET_DIR" target
-      - name: Put the cached cargo/rustup shims on PATH
+      - name: Put the cargo/rustup shims on PATH
         run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
-      # Install under the cache lock so the action below only has to confirm
-      # the toolchain is already present.
-      - name: Pre-install the pinned toolchain under the cache lock
-        run: |
-          flock /ci/cache/locks/rustup.lock \
-            rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update
-
-      - name: Install Rust toolchain (reused from RUSTUP_HOME)
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.99.1
@@ -402,4 +449,3 @@ jobs:
           path: |
             dist/*.zip
             dist/*.zip.sha256
-          if-no-files-found: error

@@ -11,6 +11,26 @@ glibc, and package availability catches problems that an Ubuntu build would miss
 The release archive is built the same way, so the shipped binaries match the
 target platform.
 
+**Runner placement is a security boundary.** Untrusted code must never run on a
+runner that later performs a write-privileged release:
+
+- `pull_request` and push-to-`main` jobs run on **GitHub-hosted**
+  `ubuntu-latest`, still inside the same `archlinux:base-devel` container.
+- Push-to-`develop` jobs run on the **on-premise** runner
+  (`[self-hosted, opencode-sam]`).
+- The docs-site workflow ([`.github/workflows/pages.yml`](../.github/workflows/pages.yml))
+  also runs on GitHub-hosted `ubuntu-latest`: it executes repo code
+  (`site/build.py`, `pip install`) and must not share a host with the release
+  job.
+- The release workflow runs only on the on-premise runner and uses its own
+  `/home/github-runner/release-cache` Cargo/target volume that CI can never
+  write, with `persist-credentials: false` on checkout.
+
+Both paths pin the same toolchain (`1.99.1`, `nightly-2026-10-22`) and use the
+same image, so a build is identical wherever it runs. This prevents a PR job
+from leaving a `$CARGO_HOME/config.toml` `rustc-wrapper` that a later release
+build would execute.
+
 The workflow ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) has seven
 jobs:
 
@@ -40,10 +60,88 @@ jobs:
   digest pinned in `scripts/daemon-checksums.txt` meaningful for the published
   asset instead of only for the machine that happened to build it.
 
+## Release pinning: the gate that runs before the tag
+
+Releases are digest-pinned, and the pin has historically been the weakest part of
+the process: the 0.2.3, 0.2.4 and 0.2.5 releases each needed a second attempt
+because a bad pin was only discovered *after* the tag existed, which is
+irreversible. The cause in every case was the same: the pin was produced on a
+different machine (or before an environment fix landed) than the one that
+verified it.
+
+Three things now prevent that:
+
+**1. A pre-tag gate —
+[`.github/workflows/prepare-release.yml`](../.github/workflows/prepare-release.yml).**
+Run it on the release branch before tagging:
+
+```sh
+gh workflow run prepare-release.yml --ref release/0.2.6
+```
+
+It builds the archive in the exact release container and toolchain, then fails
+unless `scripts/daemon-checksums.txt` already pins the produced bytes. It also
+prints the produced digests in the job summary, so the pin is taken from CI
+rather than from a laptop. It publishes nothing and has no write permissions.
+
+**2. One verification implementation, shared.**
+[`scripts/verify-release-pin.sh`](../scripts/verify-release-pin.sh) is used by
+both the gate and the release workflow, so a green gate predicts a green release.
+A green gate that does not predict a green release is precisely the failure mode
+that wasted the 0.2.4 and 0.2.5 releases.
+
+**3. An append-only pin file.**
+[`scripts/checksums-add.sh`](../scripts/checksums-add.sh) merges a freshly built
+`dist/daemon-checksums.txt` into `scripts/daemon-checksums.txt` without ever
+removing or overwriting an entry. Hand-editing that file is what dropped released
+pins from `develop` at 0.2.3, 0.2.4 and 0.2.5. The `checksums-superset` CI job
+additionally fails any candidate tree that is missing an entry `main` carries.
+
+**4. Metadata and freeze checks.**
+[`scripts/verify-release-metadata.sh`](../scripts/verify-release-metadata.sh)
+proves every version reference agrees with the release version: `manifest.json`
+(the download URL), `Cargo.toml`/`Cargo.lock` (what `--version` reports, which
+`bootstrap.sh` compares to decide whether to upgrade), `PKGBUILD` `pkgver`, and
+the user-facing docs and man page shipped inside the archive. A mismatch here
+breaks the plugin bootstrap or the upgrade path even when the digests are
+perfect.
+
+[`scripts/archive-inputs.sh`](../scripts/archive-inputs.sh) fingerprints every
+file that goes into the archive (mode + SHA-256 + path) and pins it in
+`scripts/archive-inputs.txt`. Two things follow:
+
+- editing a doc, the manifest, `data/**`, `shell/**`, or a staged script after
+  pinning is **detected without rebuilding**, which is exactly the 0.2.5
+  failure;
+- the pre-tag gate (on the release branch) and the release job (on the tagged
+  merge commit) both recompute it. If the two trees differ in any archive
+  input, the release fails instead of publishing bytes nobody validated. This
+  closes the "gate validated a different tree than the tag" gap.
+
+The release flow is therefore:
+
+```sh
+rm -rf dist                           # never reuse a previous build's output
+scripts/package-release.sh            # build dist/ + dist/daemon-checksums.txt
+scripts/checksums-add.sh              # append-only pin + archive-inputs.txt
+scripts/verify-release-metadata.sh    # versions agree everywhere
+scripts/archive-inputs.sh --check     # nothing drifted since the pin
+scripts/verify-release-pin.sh         # digests match
+# push the release branch, run prepare-release.yml, confirm green
+# merge to main, run prepare-release.yml on main again, confirm green
+# only then: tag -s and let release.yml publish
+```
+
+The release job additionally refuses a tag that is not annotated, or that no
+longer resolves to the commit it was created on — the 0.2.5 tag was re-pointed
+after the fact, which no digest check can catch. After publishing it downloads
+the tag tarball and reports the correct `PKGBUILD` `sha256sums` in the job
+summary, so the AUR step is a copy rather than a remembered `updpkgsums`.
+
 Pushing a `v*` tag runs
 [`.github/workflows/release.yml`](../.github/workflows/release.yml), which builds
-the archive in the same Arch container and creates a GitHub release with the zip
-attached.
+the archive in the same Arch container, re-verifies the pin with the same script,
+and only then creates a GitHub release with the zip attached.
 
 ## Branching and releases
 

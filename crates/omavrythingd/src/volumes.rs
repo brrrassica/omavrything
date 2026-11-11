@@ -9,9 +9,8 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use omavrything_core::mounts;
 
@@ -77,11 +76,23 @@ impl Volume {
     }
 }
 
+/// Total wall-clock budget for one `blkid` probe. The child is killed and
+/// reaped when it is exceeded, so no probe can leak a process or a blocking
+/// pool slot.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a completed probe is served to further callers. `blkid` is a
+/// blocking, device-touching call, so back-to-back settings-UI refreshes are
+/// answered from this snapshot instead of re-probing every block device.
+const PROBE_CACHE_TTL: Duration = Duration::from_secs(2);
+
 /// Enumerate every block filesystem `blkid` can identify.
 ///
-/// Swap and empty signatures are skipped: they are not indexable volumes.
+/// Swap and empty signatures are skipped: they are not indexable volumes. The
+/// probe is bounded by [`PROBE_TIMEOUT`]; a timeout or spawn failure yields an
+/// empty list, matching the previous "no volumes detected" behaviour.
 pub fn list_block_volumes() -> Vec<Volume> {
-    let output = match Command::new("blkid").arg("-o").arg("export").output() {
+    let output = match crate::ntfs::run_command_timeout("blkid", &["-o", "export"], PROBE_TIMEOUT) {
         Ok(output) if output.status.success() => output.stdout,
         _ => return Vec::new(),
     };
@@ -104,6 +115,111 @@ pub fn list_block_volumes() -> Vec<Volume> {
             .then(a.device.cmp(&b.device))
     });
     volumes
+}
+
+/// The outcome of a shared volume probe.
+#[derive(Debug)]
+pub enum VolumesProbe {
+    /// A (possibly cached) volume list.
+    Ready(Vec<Volume>),
+    /// Too many callers were already waiting on the in-flight probe. The
+    /// caller is rejected immediately instead of queueing another blocking
+    /// job, so a local flood cannot exhaust the blocking pool or spawn a
+    /// `blkid` child per request.
+    Busy,
+}
+
+/// Callers allowed to wait on the single in-flight probe. Past this bound a
+/// request is answered `Busy`, which keeps the number of queued blocking tasks
+/// proportional to a small constant rather than to the request rate.
+const MAX_PROBE_WAITERS: usize = 8;
+
+/// State of the single shared volume probe.
+struct ProbeState {
+    in_flight: bool,
+    waiters: usize,
+    /// Completed generation, bumped after each probe finishes so waiters can
+    /// tell a fresh result from the one they saw before waiting.
+    generation: u64,
+    cached: Option<(Instant, Vec<Volume>)>,
+}
+
+static PROBE_STATE: Mutex<ProbeState> = Mutex::new(ProbeState {
+    in_flight: false,
+    waiters: 0,
+    generation: 0,
+    cached: None,
+});
+static PROBE_DONE: Condvar = Condvar::new();
+
+/// Enumerate volumes through a **single** shared, cached, bounded probe.
+///
+/// `ListVolumes` is callable by every local UID without polkit, and each probe
+/// spawns `blkid` and waits for it. Without coalescing, a local burst starts one
+/// blocking job and one child per call. Here:
+///
+/// * a result younger than [`PROBE_CACHE_TTL`] is served directly (no work);
+/// * concurrent callers join the in-flight probe instead of starting another;
+/// * at most [`MAX_PROBE_WAITERS`] callers may wait, others get
+///   [`VolumesProbe::Busy`];
+/// * the probe itself is bounded by [`PROBE_TIMEOUT`], after which the child is
+///   killed and reaped before the slot is released.
+pub fn shared_block_volumes() -> VolumesProbe {
+    shared_probe(list_block_volumes)
+}
+
+/// The coalescing logic of [`shared_block_volumes`], generic over the probe so
+/// it can be tested without touching block devices.
+fn shared_probe(probe: impl FnOnce() -> Vec<Volume>) -> VolumesProbe {
+    let mut state = PROBE_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    // A fresh cache is served without probing, even if another probe is running
+    // (that probe will only replace it with an equivalent, newer list).
+    if let Some((at, cached)) = &state.cached {
+        if at.elapsed() < PROBE_CACHE_TTL {
+            return VolumesProbe::Ready(cached.clone());
+        }
+    }
+    if state.in_flight {
+        if state.waiters >= MAX_PROBE_WAITERS {
+            return VolumesProbe::Busy;
+        }
+        // Wait for the in-flight probe (or the wait deadline) instead of
+        // starting a second one.
+        let seen = state.generation;
+        state.waiters += 1;
+        let (mut state, _) = PROBE_DONE
+            .wait_timeout_while(state, PROBE_TIMEOUT + Duration::from_secs(1), |s| {
+                s.in_flight && s.generation == seen
+            })
+            .unwrap_or_else(|e| e.into_inner());
+        // Saturating, not `-= 1`: the counter is process-global and every waiter
+        // increments it under this same lock, but a waiter can outlive the
+        // generation it joined -- a probe that finished before this caller
+        // re-acquired the lock, or a result reset out from under two waiting
+        // generations. In that window the counter is legitimately already zero,
+        // and a bare decrement panics with "attempt to subtract with overflow"
+        // (this is the intermittent failure CI reported in
+        // `concurrent_probes_coalesce_into_one_child`). Under-counting a freed
+        // slot is the safe direction: the worst case is admitting one extra
+        // waiter, not an underflow panic inside the daemon.
+        state.waiters = state.waiters.saturating_sub(1);
+        return match &state.cached {
+            Some((_, cached)) => VolumesProbe::Ready(cached.clone()),
+            None => VolumesProbe::Busy,
+        };
+    }
+    state.in_flight = true;
+    drop(state);
+
+    let volumes = probe();
+
+    let mut state = PROBE_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    state.in_flight = false;
+    state.generation = state.generation.wrapping_add(1);
+    state.cached = Some((Instant::now(), volumes.clone()));
+    drop(state);
+    PROBE_DONE.notify_all();
+    VolumesProbe::Ready(volumes)
 }
 
 /// Split a device path into its parent and trailing partition number.
@@ -182,14 +298,13 @@ fn flush(
 
 /// Probe a single device's filesystem type with `blkid`.
 pub fn probe_fstype(device: &Path) -> Option<String> {
-    let output = Command::new("blkid")
-        .arg("-o")
-        .arg("value")
-        .arg("-s")
-        .arg("TYPE")
-        .arg(device)
-        .output()
-        .ok()?;
+    let device_str = device.to_string_lossy();
+    let output = crate::ntfs::run_command_timeout(
+        "blkid",
+        &["-o", "value", "-s", "TYPE", &device_str],
+        PROBE_TIMEOUT,
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -331,6 +446,18 @@ pub fn unmount(device: &Path, mount_point: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    /// The probe tests share the process-global `PROBE_STATE`, so without
+    /// serialisation one test's reset can clear the cache between another test's
+    /// two calls and make it look like a cache miss.
+    /// `a_cached_result_is_served_without_probing` was intermittently failing
+    /// for exactly that reason. Each probe test holds this guard for its body.
+    static PROBE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_probe_tests() -> std::sync::MutexGuard<'static, ()> {
+        PROBE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn parses_all_filesystems_and_skips_swap() {
@@ -356,6 +483,152 @@ TYPE=swap
         assert!(volumes[0].is_ntfs());
         assert_eq!(volumes[1].fstype, "ext4");
         assert!(!volumes[1].is_ntfs());
+    }
+
+    fn reset_probe_state() {
+        let mut state = PROBE_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        state.in_flight = false;
+        state.waiters = 0;
+        state.cached = None;
+    }
+
+    #[test]
+    fn concurrent_probes_coalesce_into_one_child() {
+        // The admission finding: many independent callers must not each start a
+        // `blkid` child. One caller runs the probe; the rest join it and receive
+        // the same result.
+        use std::sync::Barrier;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        let _serial = lock_probe_tests();
+        reset_probe_state();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(MAX_PROBE_WAITERS + 1));
+
+        let mut handles = Vec::new();
+        for _ in 0..MAX_PROBE_WAITERS {
+            let runs = Arc::clone(&runs);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                // If this caller wins the race it becomes the probe and blocks
+                // briefly, so the others are forced to join rather than start
+                // their own.
+                match shared_probe(|| {
+                    runs.fetch_add(1, AtomicOrdering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(50));
+                    vec![test_volume("/dev/omavry-probe")]
+                }) {
+                    VolumesProbe::Ready(v) => v,
+                    VolumesProbe::Busy => Vec::new(),
+                }
+            }));
+        }
+        barrier.wait();
+        // Let the racers run to completion.
+        let mut ready = 0;
+        for handle in handles {
+            let out = handle.join().unwrap();
+            if !out.is_empty() {
+                ready += 1;
+                assert_eq!(out[0].device, PathBuf::from("/dev/omavry-probe"));
+            }
+        }
+        // At most one probe ran: the rest were either cached or joined it.
+        assert_eq!(
+            runs.load(AtomicOrdering::SeqCst),
+            1,
+            "concurrent probes must coalesce into a single child"
+        );
+        assert!(ready > 0, "at least one caller must receive the result");
+        reset_probe_state();
+    }
+
+    #[test]
+    fn a_burst_past_the_waiter_bound_is_rejected_as_busy() {
+        let _serial = lock_probe_tests();
+        reset_probe_state();
+        // Simulate an in-flight probe that already has the maximum number of
+        // waiters. The next caller must be rejected immediately instead of
+        // queueing another blocking job, so the admission bound holds.
+        {
+            let mut state = PROBE_STATE.lock().unwrap_or_else(|e| e.into_inner());
+            state.in_flight = true;
+            state.waiters = MAX_PROBE_WAITERS;
+        }
+
+        assert!(
+            matches!(shared_probe(Vec::new), VolumesProbe::Busy),
+            "a caller past the waiter bound must get Busy, not a new probe"
+        );
+        reset_probe_state();
+    }
+
+    /// Regression for the intermittent CI failure in
+    /// `concurrent_probes_coalesce_into_one_child`: "attempt to subtract with
+    /// overflow" at the waiter decrement. Re-runs the real coalescing path many
+    /// times so the interleaving (a waiter whose generation finished before it
+    /// re-acquired the lock) is actually exercised, and asserts the waiter
+    /// counter always returns to zero.
+    #[test]
+    fn repeated_waiter_churn_never_underflows_the_waiter_count() {
+        use std::sync::Barrier;
+
+        let _serial = lock_probe_tests();
+        for _ in 0..25 {
+            reset_probe_state();
+            let barrier = Arc::new(Barrier::new(MAX_PROBE_WAITERS + 1));
+            let mut handles = Vec::new();
+            for _ in 0..MAX_PROBE_WAITERS {
+                let barrier = Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    // An instant probe maximises the chance that the probe
+                    // completes while the other callers are still resuming from
+                    // the condvar, which is the underflow window.
+                    let _ = shared_probe(Vec::new);
+                }));
+            }
+            barrier.wait();
+            for handle in handles {
+                handle
+                    .join()
+                    .expect("a waiter panicked instead of saturating");
+            }
+            let waiters = PROBE_STATE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .waiters;
+            assert_eq!(waiters, 0, "waiter count must return to zero");
+        }
+        reset_probe_state();
+    }
+
+    #[test]
+    fn a_cached_result_is_served_without_probing() {
+        let _serial = lock_probe_tests();
+        reset_probe_state();
+        assert!(matches!(
+            shared_probe(|| vec![test_volume("/dev/omavry-first")]),
+            VolumesProbe::Ready(v) if v[0].device.as_path() == Path::new("/dev/omavry-first")
+        ));
+        // A second call within the TTL is served from the cache: the probe
+        // closure panics if it is ever called.
+        assert!(matches!(
+            shared_probe(|| panic!("the cache must be served without probing")),
+            VolumesProbe::Ready(v) if v[0].device.as_path() == Path::new("/dev/omavry-first")
+        ));
+        reset_probe_state();
+    }
+
+    fn test_volume(device: &str) -> Volume {
+        Volume {
+            device: PathBuf::from(device),
+            uuid: None,
+            label: None,
+            fstype: "ext4".into(),
+            mount_point: None,
+        }
     }
 
     #[test]

@@ -38,6 +38,12 @@ const PARALLEL_THRESHOLD: usize = 50_000;
 /// keeps the hot matching loop cache-friendly.
 const PARALLEL_CHUNK: usize = 4096;
 
+/// Compact the owned index once it holds this many tombstones **and** at least
+/// half of its records are dead. Larger than the delta's threshold because
+/// [`Index::compact`] also rebuilds the candidate index and rehashes the path
+/// map, so it is worth waiting for a bigger batch.
+const COMPACT_MIN_TOMBSTONES: usize = 1024;
+
 /// `flags` bit: the record is a directory.
 pub const FLAG_DIR: u8 = 1 << 0;
 /// `flags` bit: the record is a symlink.
@@ -958,6 +964,35 @@ impl Index {
             candidate_capacity_bytes: self.candidate.capacity_bytes(),
             candidate: self.candidate.memory_breakdown(),
         }
+    }
+
+    /// The number of tombstoned records: dead records still occupying the
+    /// append-only arenas. Derived from `live`, which every mutation keeps
+    /// current, so this is O(1).
+    pub fn tombstones(&self) -> usize {
+        self.records.len().saturating_sub(self.live)
+    }
+
+    /// Compact once tombstones are both numerous and at least half of the
+    /// records.
+    ///
+    /// The arenas are append-only, so a create/remove cycle leaves a dead record
+    /// and its path bytes behind. [`Index::compact`] is otherwise only reached on
+    /// snapshot encode and after NTFS indexing, so with snapshots disabled
+    /// (`snapshot_interval = 0` / `no_snapshot`) a long-running daemon under
+    /// sustained churn would grow without bound — the same retention bug the
+    /// evicted-index delta had. Compacting at the halfway point bounds retained
+    /// records at roughly twice the live set, and the amortized cost is O(1) per
+    /// tombstone. A no-op below the threshold, so it is cheap on the hot path.
+    pub fn compact_if_needed(&mut self) {
+        let tombstones = self.tombstones();
+        if tombstones < COMPACT_MIN_TOMBSTONES {
+            return;
+        }
+        if tombstones * 2 < self.records.len() {
+            return;
+        }
+        self.compact();
     }
 
     /// Rebuild the arenas and record vector, dropping tombstones and reclaiming
@@ -2051,6 +2086,17 @@ pub struct DeltaIndex {
     tombstones: usize,
 }
 
+/// Compact the delta once it holds this many tombstones **and** at least half of
+/// its records are dead.
+///
+/// The arenas are append-only, so a create/remove cycle of an initially absent
+/// path leaves a dead record plus its path bytes behind while the logical
+/// `len()` returns to zero. Without compaction that retention is unbounded in
+/// the number of processed events (only bounded by the fold gate, which consults
+/// the *logical* length and therefore never fires). Compacting at the halfway
+/// point bounds retained records at roughly twice the live set.
+const DELTA_COMPACT_MIN_TOMBSTONES: usize = 32;
+
 impl DeltaIndex {
     pub fn new() -> Self {
         Self::default()
@@ -2120,6 +2166,12 @@ impl DeltaIndex {
                 self.tombstones += 1;
             }
         }
+        // The arenas are append-only, so a create/remove cycle of an initially
+        // absent path leaves a dead record plus its path bytes behind even
+        // though the logical length returns to zero. Compact once tombstones
+        // dominate so retained records/bytes stay proportional to the live set
+        // rather than to the number of processed events.
+        self.compact_if_needed();
     }
 
     /// Drop pending inserts for `path` and every path beneath it. Used when a
@@ -2150,7 +2202,60 @@ impl DeltaIndex {
                 changed = true;
             }
         }
+        self.compact_if_needed();
         changed
+    }
+
+    /// Compact when tombstones are both numerous and at least half the records.
+    fn compact_if_needed(&mut self) {
+        if self.tombstones < DELTA_COMPACT_MIN_TOMBSTONES {
+            return;
+        }
+        if self.tombstones * 2 < self.records.len() {
+            return;
+        }
+        self.compact();
+    }
+
+    /// Rebuild `records`/`paths` keeping only live inserts, and remap the
+    /// `index` entries onto the new record positions. `removes` (base-image
+    /// indices) and the logical length are unaffected.
+    ///
+    /// This releases the retained bytes of tombstoned inserts and their path
+    /// bytes, so a create/remove cycle that nets zero live changes no longer
+    /// grows the delta without bound.
+    pub fn compact(&mut self) {
+        if self.tombstones == 0 {
+            return;
+        }
+        let mut records = Vec::with_capacity(self.records.len() - self.tombstones);
+        let mut paths = Vec::with_capacity(self.paths.len());
+        for rec in &self.records {
+            if rec.is_deleted() {
+                continue;
+            }
+            let start = rec.path_off as usize;
+            let end = start + rec.path_len as usize;
+            let new_off = paths.len() as u32;
+            paths.extend_from_slice(&self.paths[start..end]);
+            records.push(FileRecord {
+                path_off: new_off,
+                ..*rec
+            });
+        }
+        // Rebuild the lookup map from the surviving records' full paths.
+        let mut index = HashMap::with_capacity(records.len());
+        for (i, rec) in records.iter().enumerate() {
+            let start = rec.path_off as usize;
+            let end = start + rec.path_len as usize;
+            if let Ok(path) = std::str::from_utf8(&paths[start..end]) {
+                index.insert(Box::<str>::from(path), i as u32);
+            }
+        }
+        self.records = records;
+        self.paths = paths;
+        self.index = index;
+        self.tombstones = 0;
     }
 
     /// Whether `path` has a pending insert.
@@ -2759,6 +2864,59 @@ mod tests {
     }
 
     #[test]
+    fn repeated_create_remove_cycles_do_not_grow_the_owned_index() {
+        // The owned index has the same append-only retention as the delta: a
+        // create followed by a removal leaves a tombstone and its path bytes.
+        // `compact_if_needed` must bound retained records independently of the
+        // number of cycles, so a daemon with snapshots disabled does not grow
+        // without bound under churn.
+        let mut index = Index::new();
+        index.add_root(Path::new("/"), FsKind::Other);
+        let path = Path::new("/churn/tmp-file-with-a-reasonably-long-name.txt");
+
+        for _ in 0..5000 {
+            index.insert(path, false, 42, 0);
+            index.remove(path);
+            index.compact_if_needed();
+            // The logical state stays empty after every complete cycle.
+            assert_eq!(index.len(), 1, "only the root stays live");
+            // Retained records stay bounded: never more than one batch of
+            // tombstones accumulated between compactions.
+            assert!(
+                index.records().len() <= COMPACT_MIN_TOMBSTONES * 2 + 1,
+                "retained records grew to {} after 5000 create/remove cycles",
+                index.records().len()
+            );
+        }
+        // Tombstones oscillate between 0 and the threshold: compaction fires
+        // once they reach it, so retention never exceeds one batch.
+        assert!(
+            index.tombstones() < COMPACT_MIN_TOMBSTONES,
+            "tombstones must stay below the compaction threshold, got {}",
+            index.tombstones()
+        );
+    }
+
+    #[test]
+    fn compact_if_needed_is_a_noop_below_the_threshold() {
+        let mut index = Index::new();
+        index.add_root(Path::new("/"), FsKind::Other);
+        for i in 0..(COMPACT_MIN_TOMBSTONES / 2) {
+            let p = format!("/gone/{i}.tmp");
+            index.insert(Path::new(&p), false, 0, 0);
+            index.remove(Path::new(&p));
+        }
+        let before = index.records().len();
+        index.compact_if_needed();
+        assert_eq!(
+            index.records().len(),
+            before,
+            "below the threshold nothing is reclaimed"
+        );
+        assert!(index.tombstones() > 0);
+    }
+
+    #[test]
     fn parallel_scan_is_correct_and_bounded() {
         // Above PARALLEL_THRESHOLD so the rayon path is exercised.
         let mut index = Index::new();
@@ -3290,6 +3448,86 @@ mod tests {
         );
         // Live: the root and /keep.txt.
         assert_eq!(index.len(), 2);
+    }
+
+    #[test]
+    fn repeated_create_remove_cycles_do_not_grow_the_delta() {
+        // The retained-memory finding: a create followed by a removal of an
+        // initially absent path nets zero live changes, but the append-only
+        // arenas would otherwise keep one record and its path bytes per cycle
+        // forever. Compaction must bound retained records/bytes independently of
+        // the logical (live) length.
+        let mut delta = DeltaIndex::new();
+        let path = Path::new("/churn/tmp-file-with-a-reasonably-long-name.txt");
+
+        for _ in 0..500 {
+            delta.insert(path, false, false, 42, 0);
+            delta.remove_path(path);
+            // The logical state stays empty after every complete cycle.
+            assert_eq!(delta.len(), 0);
+            assert!(delta.is_empty());
+            // Retained records stay bounded: never more than one batch of
+            // tombstones accumulated between compactions.
+            assert!(
+                delta.records().len() <= DELTA_COMPACT_MIN_TOMBSTONES * 2,
+                "retained records grew to {} after 500 create/remove cycles",
+                delta.records().len()
+            );
+            assert!(
+                delta.paths().len() <= DELTA_COMPACT_MIN_TOMBSTONES * 2 * path.as_os_str().len(),
+                "retained path bytes grew to {} after 500 create/remove cycles",
+                delta.paths().len()
+            );
+        }
+
+        // Memory accounting reflects the bounded retention, not the cycle count.
+        assert!(delta.memory_bytes() < 4096);
+    }
+
+    #[test]
+    fn compaction_keeps_live_inserts_and_their_paths() {
+        // Compaction must not corrupt live inserts: their full paths (used for
+        // search) and metadata survive, and they remain findable.
+        let mut delta = DeltaIndex::new();
+        let live = Path::new("/keep/alive.txt");
+        delta.insert(live, false, false, 7, 123);
+
+        // Generate enough tombstones to trigger compaction.
+        for i in 0..(DELTA_COMPACT_MIN_TOMBSTONES + 4) {
+            let p = format!("/gone/{i}.tmp");
+            delta.insert(Path::new(&p), false, false, 0, 0);
+            delta.remove_path(Path::new(&p));
+        }
+
+        assert!(delta.contains_path(live));
+        assert_eq!(delta.len(), 1);
+        let live_recs = delta.records().iter().filter(|r| !r.is_deleted()).count();
+        assert_eq!(live_recs, 1);
+        // Compaction fired at the halfway point; only the dead records created
+        // after the last compaction may remain, so retention is a bounded batch
+        // rather than every record ever inserted.
+        assert!(
+            delta.records().len() <= DELTA_COMPACT_MIN_TOMBSTONES + 1,
+            "retained records not bounded: {}",
+            delta.records().len()
+        );
+        let live_rec = delta.records().iter().find(|r| !r.is_deleted()).unwrap();
+        let start = live_rec.path_off as usize;
+        let end = start + live_rec.path_len as usize;
+        assert_eq!(
+            &delta.paths()[start..end],
+            live.as_os_str().as_encoded_bytes(),
+            "the live insert must keep its full path"
+        );
+
+        // Re-inserting after compaction still updates the existing live record
+        // in place instead of appending a duplicate.
+        let before = delta.records().len();
+        delta.insert(live, false, false, 99, 456);
+        assert_eq!(delta.records().len(), before, "re-insert must not append");
+        assert_eq!(delta.len(), 1);
+        let live_rec = delta.records().iter().find(|r| !r.is_deleted()).unwrap();
+        assert_eq!(live_rec.size, 99);
     }
 
     #[test]

@@ -227,8 +227,9 @@ impl Manager {
             )));
             let index = Arc::clone(&self.index);
             let policy = Arc::clone(&self.policy);
+            let config = Arc::clone(&self.config);
             crate::spawn_thread("ntfs-startup", crate::CONTROL_STACK, move || {
-                crate::run_ntfs_startup(index, policy, ownership)
+                crate::run_ntfs_startup(index, policy, config, ownership)
             });
             self.index.touch();
         }
@@ -251,13 +252,25 @@ impl Manager {
     /// Every detected block volume with its indexing status.
     ///
     /// NTFS volumes are omitted while NTFS support is disabled, matching the
-    /// detection gate. Read-only: no polkit authorization is required.
-    async fn list_volumes(&self) -> Vec<HashMap<String, String>> {
+    /// detection gate. Read-only and callable by every local UID, so the
+    /// underlying `blkid` probe is coalesced into one shared, cached, bounded
+    /// probe (see [`volumes::shared_block_volumes`]): a local burst joins the
+    /// in-flight probe or is told the daemon is busy, instead of starting one
+    /// blocking job and one child per call.
+    async fn list_volumes(&self) -> zbus::fdo::Result<Vec<HashMap<String, String>>> {
         let ntfs_enabled = self.config.ntfs();
-        let detected = tokio::task::spawn_blocking(volumes::list_block_volumes)
+        let probe = tokio::task::spawn_blocking(volumes::shared_block_volumes)
             .await
-            .unwrap_or_default();
-        detected
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let detected = match probe {
+            volumes::VolumesProbe::Ready(volumes) => volumes,
+            volumes::VolumesProbe::Busy => {
+                return Err(zbus::fdo::Error::LimitsExceeded(
+                    "volume probe already in flight; retry shortly".into(),
+                ));
+            }
+        };
+        let list = detected
             .into_iter()
             .filter(|v| ntfs_enabled || !v.is_ntfs())
             .map(|v| {
@@ -276,7 +289,8 @@ impl Manager {
                 map.insert("status".into(), volumes::status(&v, &self.index).into());
                 map
             })
-            .collect()
+            .collect();
+        Ok(list)
     }
 
     /// Mount a volume by device path and index it. Returns the mount point.
@@ -679,6 +693,7 @@ mod tests {
             snapshot: None,
             watch: true,
             ntfs: true,
+            ntfs_remount_readonly: Vec::new(),
             log_level: crate::logging::LogLevel::Info,
             background_opacity: 0.75,
             candidate_index: true,
