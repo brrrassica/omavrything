@@ -1,7 +1,12 @@
 name: CI
 
 on:
+  # Restrict push to the integration branches. Every other branch is covered by
+  # the pull_request trigger, so a push elsewhere would only duplicate a full
+  # ~8-job run for a tree a PR already checks. main/develop pushes (including
+  # merge commits) must still run CI on their own: there may be no PR for them.
   push:
+    branches: [main, develop]
   pull_request:
 
 env:
@@ -100,21 +105,23 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      # `cargo test` compiles every workspace target (bins included) before
+      # running, so a separate `cargo build` step afterwards would re-derive
+      # nothing new: it is dropped, not the coverage.
       - name: Test
         run: cargo test --all-features
 
       - name: Test (release)
         run: cargo test --release --all-features
 
-      - name: Build
-        run: cargo build --all-features
-
   qml:
     name: qmllint (Arch)
     runs-on: ${{ fromJSON((github.event_name == 'push' && github.ref == 'refs/heads/develop') && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
     container:
       image: archlinux:base-devel
-    needs: build
+    # qmllint consumes no build output (it checks out and lints shell/*.qml),
+    # so it runs in parallel with the Rust jobs instead of behind the heaviest
+    # one.
     steps:
       - name: Install dependencies
         run: pacman -Syu --noconfirm --needed --overwrite '*' git qt6-declarative
@@ -183,7 +190,9 @@ jobs:
           toolchain: nightly-2026-10-22
 
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        # CARGO_HOME is cached above, so a previously installed cargo-fuzz
+        # survives across runs; only compile it when the shim is missing.
+        run: command -v cargo-fuzz >/dev/null 2>&1 || cargo install cargo-fuzz --locked
 
       - name: Fuzz the snapshot loader
         working-directory: fuzz
@@ -275,119 +284,86 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  # The smoke test exercises install -> use -> uninstall against the SAME
+  # release binaries the `package` job built and published as artifacts, instead
+  # of recompiling the workspace a third time. It stays a full E2E check; only
+  # the redundant compilation is removed.
   smoke:
     name: install/uninstall smoke (Arch)
     runs-on: ${{ fromJSON((github.event_name == 'push' && github.ref == 'refs/heads/develop') && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
     container:
       image: archlinux:base-devel
+    needs: package
     env:
-      CARGO_HOME: ${{ github.workspace }}/.ci-cargo
-      RUSTUP_HOME: ${{ github.workspace }}/.ci-rustup
-      RUSTUP_TOOLCHAIN: 1.99.1
-      CARGO_TARGET_DIR: ${{ github.workspace }}/.ci-target/${{ github.job }}/${{ github.event_name }}-${{ github.ref_name }}
-    needs: build
+      # The binaries arrive via the run-scoped artifact above; ci-smoke.sh
+      # skips its own cargo build (and fails closed if they are missing).
+      OMAVR_SMOKE_SKIP_BUILD: 1
     steps:
       - name: Install dependencies
-        run: pacman -Syu --noconfirm --needed --overwrite '*' git curl zip
+        run: pacman -Syu --noconfirm --needed --overwrite '*' git curl zip unzip
 
       - uses: actions/checkout@v4
 
-      - name: Restore the Cargo registry cache
-        uses: actions/cache@v4
+      # The release binaries built once by `package`. Artifacts are scoped to
+      # this workflow run, so no state is shared with any other run or any
+      # privileged context.
+      - name: Download the release binaries
+        uses: actions/download-artifact@v4
         with:
-          path: ${{ env.CARGO_HOME }}
-          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-
+          name: omavrything-release-binaries
+          path: bin
 
-      - name: Restore the Rust toolchain cache
-        uses: actions/cache@v4
+      - name: Make the downloaded binaries executable
+        run: chmod +x bin/omavrythingd bin/omavry
+
+      # The archive produced by `package`, so the smoke test's archive-content
+      # assertions run against the exact bytes that were built instead of
+      # silently skipping.
+      - name: Download the release archive
+        uses: actions/download-artifact@v4
         with:
-          path: ${{ env.RUSTUP_HOME }}
-          key: rustup-${{ runner.os }}-${{ env.RUSTUP_TOOLCHAIN }}
-          restore-keys: rustup-${{ runner.os }}-
-
-      - name: Restore the build cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.CARGO_TARGET_DIR }}
-          key: target-${{ runner.os }}-${{ github.job }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: target-${{ runner.os }}-${{ github.job }}-
-
-      - name: Point target/ at the cache
-        run: |
-          mkdir -p "$CARGO_TARGET_DIR"
-          rm -rf target
-          ln -s "$CARGO_TARGET_DIR" target
-      - name: Put the cargo/rustup shims on PATH
-        run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.99.1
+          name: omavrything-release-archive
+          path: dist
 
       - name: Run the install/uninstall smoke test
         run: scripts/ci-smoke.sh
 
+  # The performance budgets run against the SAME release binaries `package`
+  # built, instead of triggering a third full release compilation. The budget
+  # assertions themselves are unchanged.
   bench:
     name: performance budgets (Arch)
     runs-on: ${{ fromJSON((github.event_name == 'push' && github.ref == 'refs/heads/develop') && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
     container:
       image: archlinux:base-devel
-    env:
-      CARGO_HOME: ${{ github.workspace }}/.ci-cargo
-      RUSTUP_HOME: ${{ github.workspace }}/.ci-rustup
-      RUSTUP_TOOLCHAIN: 1.99.1
-      CARGO_TARGET_DIR: ${{ github.workspace }}/.ci-target/${{ github.job }}/${{ github.event_name }}-${{ github.ref_name }}
-    needs: build
+    needs: package
     steps:
       - name: Install dependencies
         run: pacman -Syu --noconfirm --needed --overwrite '*' git curl python
 
       - uses: actions/checkout@v4
 
-      - name: Restore the Cargo registry cache
-        uses: actions/cache@v4
+      # The release binaries built once by `package`, run-scoped artifacts only.
+      - name: Download the release binaries
+        uses: actions/download-artifact@v4
         with:
-          path: ${{ env.CARGO_HOME }}
-          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-
+          name: omavrything-release-binaries
+          path: bin
 
-      - name: Restore the Rust toolchain cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.RUSTUP_HOME }}
-          key: rustup-${{ runner.os }}-${{ env.RUSTUP_TOOLCHAIN }}
-          restore-keys: rustup-${{ runner.os }}-
-
-      - name: Restore the build cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.CARGO_TARGET_DIR }}
-          key: target-${{ runner.os }}-${{ github.job }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: target-${{ runner.os }}-${{ github.job }}-
-
-      - name: Point target/ at the cache
-        run: |
-          mkdir -p "$CARGO_TARGET_DIR"
-          rm -rf target
-          ln -s "$CARGO_TARGET_DIR" target
-      - name: Put the cargo/rustup shims on PATH
-        run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.99.1
-
-      - name: Build the daemon and CLI (release)
-        run: cargo build --release -p omavrythingd -p omavrything-cli
+      - name: Make the downloaded binaries executable
+        run: chmod +x bin/omavrythingd bin/omavry
 
       - name: Run the performance budgets
         run: scripts/benchmark.sh --quick --hermetic --budgets
 
+  # The SINGLE release build of the CI run. `scripts/package-release.sh` calls
+  # `scripts/build.sh`, which compiles the release workspace and stages bin/.
+  # smoke and bench download the staged binaries instead of recompiling them;
+  # the archive + .sha256 remain this job's outputs. It does not wait for
+  # `build`: fmt/clippy/tests gate nothing here and the two can run in
+  # parallel.
   package:
-    name: package release archive (Arch)
+    name: build + package release archive (Arch)
     runs-on: ${{ fromJSON((github.event_name == 'push' && github.ref == 'refs/heads/develop') && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
     container:
       image: archlinux:base-devel
@@ -396,7 +372,6 @@ jobs:
       RUSTUP_HOME: ${{ github.workspace }}/.ci-rustup
       RUSTUP_TOOLCHAIN: 1.99.1
       CARGO_TARGET_DIR: ${{ github.workspace }}/.ci-target/${{ github.job }}/${{ github.event_name }}-${{ github.ref_name }}
-    needs: build
     steps:
       - name: Install dependencies
         run: pacman -Syu --noconfirm --needed --overwrite '*' git curl zip
@@ -439,6 +414,17 @@ jobs:
 
       - name: Build the release archive
         run: scripts/package-release.sh
+
+      # Run-scoped artifacts: only jobs in THIS run can consume them, so no
+      # state crosses a workflow boundary (unlike the release-cache volumes,
+      # which are deliberately shared with nothing).
+      - name: Upload the release binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: omavrything-release-binaries
+          path: |
+            bin/omavrythingd
+            bin/omavry
 
       - name: Upload the release archive
         uses: actions/upload-artifact@v4
