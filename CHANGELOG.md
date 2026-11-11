@@ -8,6 +8,26 @@ Notable changes to `omavrything`. The format follows
 
 ## [0.2.6] — 2026-11-10
 
+### Changed
+
+- **Release pinning is enforced before the tag instead of checked after it.**
+  Both 0.2.4 and 0.2.5 shipped a wrong pin and needed an out-of-band correction,
+  for the same reason each time: the digest was produced in one environment and
+  verified in another, and verification only ran once the tag had already made
+  the release irreversible. Added:
+  - `.github/workflows/prepare-release.yml`, a pre-tag gate that builds the
+    archive in the exact release container and toolchain and **fails unless
+    `scripts/daemon-checksums.txt` already pins the produced bytes**. It reports
+    the produced digests so the pin is taken from CI, never from a laptop.
+  - `scripts/verify-release-pin.sh`, one verifier used by both the gate and the
+    release workflow, so a green gate predicts a green release.
+  - `scripts/checksums-add.sh`, which merges a freshly built checksum file into
+    the committed pin file **append-only**, so it can no longer drop a released
+    pin (the failure that hit 0.2.3, 0.2.4 and 0.2.5 when the file was edited by
+    hand on one branch).
+  - A `checksums-superset` CI job that fails any tree missing an entry `main`
+    carries.
+
 ### Fixed
 
 - **Automatic NTFS discovery no longer remounts a pre-existing writable mount.**

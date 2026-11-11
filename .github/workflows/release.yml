@@ -144,38 +144,14 @@ jobs:
       # The archive and both binaries must match the digests committed in the
       # tagged tree. If this fails, the release is not the reviewed artifact:
       # fail before creating the GitHub release rather than re-pinning it.
+      #
+      # This uses the same script as the pre-tag gate
+      # (`.github/workflows/prepare-release.yml`), so the check that runs before
+      # a tag and the check that runs after it cannot drift apart. A green gate
+      # therefore predicts a green release: that equivalence is the whole point,
+      # and its absence is why 0.2.4 and 0.2.5 each needed a second attempt.
       - name: Verify the archive against the pinned digests
-        run: |
-          set -euo pipefail
-          version="${{ steps.tag.outputs.version }}"
-          arch="$(uname -m)"
-          name="omavrything-${version}-${arch}"
-          pinned="scripts/daemon-checksums.txt"
-          [[ -f "$pinned" ]] || {
-            echo "error: $pinned is missing from the tagged tree" >&2
-            exit 1
-          }
-          verify() {
-            local file="$1"
-            local expected actual
-            expected="$(awk -v f="$file" '$2 == f { print $1; exit }' "$pinned")"
-            if [[ -z "$expected" ]]; then
-              echo "error: no pinned digest for $file in $pinned" >&2
-              echo "       the version-bump PR must pin the release before tagging" >&2
-              exit 1
-            fi
-            actual="$(sha256sum "dist/$file" | awk '{print $1}')"
-            if [[ "$actual" != "$expected" ]]; then
-              echo "error: reproducible build mismatch for $file" >&2
-              echo "       pinned $expected" >&2
-              echo "       built  $actual" >&2
-              exit 1
-            fi
-            echo "verified $file  $expected"
-          }
-          verify "${name}.zip"
-          verify "${name}/bin/omavrythingd"
-          verify "${name}/bin/omavry"
+        run: scripts/verify-release-pin.sh "${{ steps.tag.outputs.version }}"
 
       - name: Create the GitHub release
         uses: softprops/action-gh-release@v2

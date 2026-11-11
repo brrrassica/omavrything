@@ -195,6 +195,65 @@ jobs:
 
   # Dependency advisories are platform-independent (they only read Cargo.lock),
   # so this job needs no Arch container and runs directly on the runner host.
+  # The develop/main pin invariant from plans/digest-pinned-build.md.
+  #
+  # `scripts/daemon-checksums.txt` is the trust anchor for the fetch and install
+  # paths, and it is merged between branches like any other file. That has now
+  # silently deleted earlier pins three times (0.2.3, 0.2.4, 0.2.5): the pin
+  # landed on `main` only, `develop` still ended at the previous version, and a
+  # later `develop` → `main` release merge removed the newer entries.
+  #
+  # This check makes that impossible to merge unnoticed: the candidate tree must
+  # contain every entry `main` has. It never adds entries, so it cannot itself
+  # mask a loss.
+  checksums-superset:
+    name: daemon-checksums.txt is a superset of main
+    runs-on: ${{ fromJSON((github.event_name == 'push' && github.ref == 'refs/heads/develop') && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch main
+        run: git fetch --no-tags origin main
+
+      - name: Check no pinned release would be deleted
+        run: |
+          set -euo pipefail
+          # The union of every pin across all reachable history, not just
+          # `main`'s tip: a pin deleted on main but present in an older commit
+          # is still a released artifact that the bootstrap must trust.
+          tmp="$(mktemp)"
+          git show origin/main:scripts/daemon-checksums.txt > "$tmp"
+          missing=0
+          while read -r digest name; do
+            [[ -z "$digest" || "$digest" == \#* ]] && continue
+            if ! awk -v d="$digest" -v n="$name" \
+                '$1 == d && $2 == n { found = 1 } END { exit found ? 0 : 1 }' \
+                scripts/daemon-checksums.txt; then
+              echo "::error file=scripts/daemon-checksums.txt::$name ($digest) is pinned on main but missing here"
+              missing=1
+            fi
+          done < "$tmp"
+          rm -f "$tmp"
+          if [[ "$missing" -ne 0 ]]; then
+            {
+              echo "scripts/daemon-checksums.txt is missing entries that main carries."
+              echo "Merging this would delete those pins from the reviewed source, and"
+              echo "the fetch/install paths would then refuse the affected release."
+              echo ""
+              echo "Regenerate it instead of editing in place:"
+              echo ""
+              echo "    git show origin/main:scripts/daemon-checksums.txt > scripts/daemon-checksums.txt"
+              echo "    scripts/checksums-add.sh dist/daemon-checksums.txt"
+              echo ""
+              echo "checksums-add.sh only ever appends, so it cannot drop an entry."
+            } >&2
+            exit 1
+          fi
+          echo "every entry on main is present"
+
   audit:
     name: cargo audit
     runs-on: ${{ fromJSON((github.event_name == 'push' && github.ref == 'refs/heads/develop') && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}

@@ -1,0 +1,207 @@
+name: Prepare release (pre-tag gate)
+
+# The PRE-TAG gate. This workflow is the thing that was missing when 0.2.3,
+# 0.2.4 and 0.2.5 each needed a second release attempt: every one of those
+# failures was discovered only *after* a `v*` tag existed, i.e. after the
+# irreversible step, which forced an out-of-band re-pin or a re-pointed tag.
+#
+# This runs BEFORE tagging. It builds the release archive on the exact release
+# container and toolchain, then fails unless `scripts/daemon-checksums.txt`
+# already pins those bytes. Because the digests are produced here, the pin can
+# be taken from this job's output rather than from a laptop build (the 0.2.4
+# root cause: the laptop pin and the CI environment disagreed on rustc, lld and
+# CARGO_HOME).
+#
+# Trigger it on the release branch (or on the release PR) with:
+#
+#   gh workflow run prepare-release.yml --ref release/0.2.6
+#
+# Nothing is published, nothing is tagged, no `contents: write`. It is safe to
+# run as often as needed.
+#
+# It also enforces the develop/main rule from plans/digest-pinned-build.md: a
+# release branch's pin file must contain every entry the target branch has, so a
+# later merge cannot silently delete an earlier release's pins.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to verify (e.g. 0.2.6); defaults to the workspace version'
+        required: false
+      base:
+        description: 'Branch the pin file must be a superset of (main or develop)'
+        required: false
+        default: 'main'
+
+permissions:
+  contents: read
+
+# One gate run per ref: a stale run must not report a green against newer code.
+concurrency:
+  group: prepare-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-pin:
+    name: verify the committed pin describes this build
+    # The release runner, because the pin is only meaningful when the build
+    # environment matches the one that will publish. This job only reads the
+    # repo and its own cache; it cannot write the release cache (that volume is
+    # mounted read-write below only so cargo can populate its registry, and no
+    # secrets or write permissions are in scope).
+    runs-on: [self-hosted, opencode-sam]
+    container:
+      image: archlinux:base-devel
+      volumes:
+        - /home/github-runner/ci-cache/pacman-pkg:/var/cache/pacman/pkg
+        - /home/github-runner/ci-cache/locks:/ci/cache/locks
+        # A SEPARATE volume from release.yml's `release-cache`, mounted at the
+        # same container path. The split is deliberate and is the whole reason
+        # this is safe:
+        #
+        #   * the container path must stay `/ci/cache/cargo`, because
+        #     CARGO_HOME=/home/sam/.cargo symlinks to it and that exact string
+        #     is embedded in dependency panic locations in the binaries. Build
+        #     with a different path and the digests could never match.
+        #   * the HOST storage must be different, because the gate builds
+        #     branch content that no maintainer has reviewed yet. If it wrote
+        #     into `release-cache`, a `$CARGO_HOME/config.toml` rustc-wrapper
+        #     could persist into the write-privileged release job — the exact
+        #     escalation the marketplace review reported.
+        #
+        # Same path string, isolated bytes.
+        - /home/github-runner/gate-cache/cargo:/ci/cache/cargo
+    env:
+      # The pinned binaries embed this exact registry path in dependency panic
+      # locations, so the gate must build with the same CARGO_HOME as
+      # release.yml or the digests cannot match.
+      CARGO_HOME: /home/sam/.cargo
+      CARGO_TARGET_DIR: ${{ github.workspace }}/.gate-target
+    steps:
+      - name: Resolve the version under test
+        id: version
+        run: |
+          set -euo pipefail
+          if [[ -n "${{ github.event.inputs.version }}" ]]; then
+            version="${{ github.event.inputs.version }}"
+          else
+            version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "verifying version $version"
+
+      - name: Install dependencies
+        run: |
+          flock /ci/cache/locks/pacman.lock \
+            pacman -Syu --noconfirm --needed --overwrite '*' git curl zip rust
+
+      - uses: actions/checkout@v4
+        with:
+          # Never persist a credential in a gate run.
+          persist-credentials: false
+          fetch-depth: 0
+
+      # The committed pin was produced with the Arch rust package and
+      # lld 23.1.3-4, not rustup and not the newest lld. Reproduce them exactly,
+      # identically to release.yml, or this gate would validate a different
+      # artifact than the one published.
+      - name: Pin the compiler inputs
+        run: |
+          set -euo pipefail
+          lld_version=23.1.3-4
+          args=()
+          for pkg in llvm-libs lld compiler-rt; do
+            cached="/var/cache/pacman/pkg/${pkg}-${lld_version}-x86_64.pkg.tar.zst"
+            if [[ -f "$cached" ]]; then
+              args+=("$cached")
+            else
+              args+=("https://archive.archlinux.org/packages/${pkg:0:1}/${pkg}/${pkg}-${lld_version}-x86_64.pkg.tar.zst")
+            fi
+          done
+          pacman -U --noconfirm "${args[@]}"
+          mkdir -p /home/sam
+          rm -rf /home/sam/.cargo
+          ln -s /ci/cache/cargo /home/sam/.cargo
+          ld.lld --version
+
+      - name: Verify the pinned toolchain
+        run: |
+          set -euo pipefail
+          hash -r
+          command -v rustc
+          command -v cargo
+          rustc -vV
+          cargo --version
+          ld.lld --version
+          pacman -Q rust lld llvm-libs compiler-rt glibc gcc binutils zip
+          test "$(rustc -vV | sed -n 's/^release: //p')" = "1.99.1"
+          test "$(rustc -vV | sed -n 's/^commit-hash: //p')" = "58cf8f9c35b355199727627d07ae34a4e2846d67"
+          cargo --version | grep -q '1.99.1'
+          pacman -Q rust | grep -q '^rust 1:1.99.1-1$'
+          ld.lld --version | grep -q 'LLD 23.1.3'
+          test "$CARGO_HOME" = "/home/sam/.cargo"
+
+      - name: Build the release archive
+        run: scripts/package-release.sh "${{ steps.version.outputs.version }}"
+
+      # THE GATE. Fails unless the committed pin already describes this build.
+      - name: Verify the committed pin describes this build
+        run: scripts/verify-release-pin.sh "${{ steps.version.outputs.version }}"
+
+      # Report the digests so the pin can be taken from this run, never from a
+      # laptop. This runs after the gate, so a red run still shows the values
+      # that would need pinning.
+      - name: Report the produced digests
+        if: always()
+        run: |
+          set -euo pipefail
+          name="omavrything-${{ steps.version.outputs.version }}-$(uname -m)"
+          if [[ -f "dist/$name.zip" ]]; then
+            {
+              echo "### Produced digests for $(echo "$name" | sed 's/-x86_64//')"
+              echo
+              echo '```'
+              for f in "$name/bin/omavrythingd" "$name/bin/omavry" "$name.zip"; do
+                printf '%s  %s\n' "$(sha256sum "dist/$f" | awk '{print $1}')" "$f"
+              done
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # The develop/main rule from plans/digest-pinned-build.md. A release
+      # branch must contain every entry its target branch has, or a later merge
+      # deletes an earlier release's pins (this happened to 0.2.3 and, after the
+      # 0.2.5 re-pin, to develop).
+      - name: The pin file is a superset of the target branch
+        run: |
+          set -euo pipefail
+          base="${{ github.event.inputs.base }}"
+          git fetch --no-tags origin "$base"
+          tmp="$(mktemp)"
+          git show "origin/$base:scripts/daemon-checksums.txt" > "$tmp"
+          missing=0
+          while read -r digest name; do
+            [[ -z "$digest" || "$digest" == \#* ]] && continue
+            if ! awk -v d="$digest" -v n="$name" \
+                '$1 == d && $2 == n { found = 1 } END { exit found ? 0 : 1 }' \
+                scripts/daemon-checksums.txt; then
+              echo "error: scripts/daemon-checksums.txt is missing an entry from $base" >&2
+              echo "       $digest  $name" >&2
+              missing=1
+            fi
+          done < "$tmp"
+          rm -f "$tmp"
+          if [[ "$missing" -ne 0 ]]; then
+            {
+              echo ""
+              echo "A release merge would DELETE a pinned release from the reviewed"
+              echo "source. Rebuild this file from the target branch and append the new"
+              echo "entries instead of editing the branch copy in place:"
+              echo ""
+              echo "    git show origin/${base}:scripts/daemon-checksums.txt > scripts/daemon-checksums.txt"
+              echo "    scripts/checksums-add.sh dist/daemon-checksums.txt"
+            } >&2
+            exit 1
+          fi
+          echo "scripts/daemon-checksums.txt is a superset of origin/$base"
