@@ -808,14 +808,20 @@ pub fn run_hotplug_monitor(
             // Hotplug only reaches this point for a partition that is *known*
             // (the user indexed it before), so remounting its writable mount
             // read-only is the consequence of that explicit earlier request.
-            match mount_index_and_remember_with_ownership(
-                index.as_ref(),
-                policy.as_ref(),
-                ownership.as_ref(),
-                &part,
-                true,
-            ) {
-                Ok(mount_point) => {
+            // A malformed volume makes the MFT parser (and the run-list decode
+            // behind it) read attacker-controlled on-disk data. Contain a panic
+            // here — as the startup pass does — so a crafted volume backs off
+            // this partition instead of terminating the monitor thread.
+            match crate::contain_panic(|| {
+                mount_index_and_remember_with_ownership(
+                    index.as_ref(),
+                    policy.as_ref(),
+                    ownership.as_ref(),
+                    &part,
+                    true,
+                )
+            }) {
+                Ok(Ok(mount_point)) => {
                     retry_at.remove(&part.device);
                     info!(
                         device = %part.device.display(),
@@ -823,11 +829,18 @@ pub fn run_hotplug_monitor(
                         "ntfs: hotplug mount indexed"
                     );
                 }
-                Err(err) => {
+                Ok(Err(err)) => {
                     warn!(
                         device = %part.device.display(),
                         error = %err,
                         "ntfs: hotplug mount failed; backing off"
+                    );
+                    retry_at.insert(part.device.clone(), Instant::now() + RETRY);
+                }
+                Err(()) => {
+                    warn!(
+                        device = %part.device.display(),
+                        "ntfs: hotplug mount panicked on malformed volume; backing off"
                     );
                     retry_at.insert(part.device.clone(), Instant::now() + RETRY);
                 }

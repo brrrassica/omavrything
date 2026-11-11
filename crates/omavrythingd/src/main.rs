@@ -814,7 +814,7 @@ fn run_scheduler(
 /// ones, and log newly seen ones as offers.
 /// Run `job`, converting a panic into `Err` so that one bad input cannot stop a
 /// whole startup pass.
-fn contain_panic<T>(job: impl FnOnce() -> T) -> Result<T, ()> {
+pub(crate) fn contain_panic<T>(job: impl FnOnce() -> T) -> Result<T, ()> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).map_err(|_| ())
 }
 
