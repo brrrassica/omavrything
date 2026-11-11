@@ -21,6 +21,9 @@ _site/
 /.ci-cargo
 /.ci-rustup
 /.ci-target
+# prepare-release.yml's CARGO_TARGET_DIR; target/ is symlinked to it, and both
+# must stay out of the tree so the archive-input fingerprint cannot see them.
+/.gate-target
 
 # Fuzzing artifacts
 /fuzz/target

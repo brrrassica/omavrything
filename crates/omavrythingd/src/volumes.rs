@@ -192,7 +192,17 @@ fn shared_probe(probe: impl FnOnce() -> Vec<Volume>) -> VolumesProbe {
                 s.in_flight && s.generation == seen
             })
             .unwrap_or_else(|e| e.into_inner());
-        state.waiters -= 1;
+        // Saturating, not `-= 1`: the counter is process-global and every waiter
+        // increments it under this same lock, but a waiter can outlive the
+        // generation it joined -- a probe that finished before this caller
+        // re-acquired the lock, or a result reset out from under two waiting
+        // generations. In that window the counter is legitimately already zero,
+        // and a bare decrement panics with "attempt to subtract with overflow"
+        // (this is the intermittent failure CI reported in
+        // `concurrent_probes_coalesce_into_one_child`). Under-counting a freed
+        // slot is the safe direction: the worst case is admitting one extra
+        // waiter, not an underflow panic inside the daemon.
+        state.waiters = state.waiters.saturating_sub(1);
         return match &state.cached {
             Some((_, cached)) => VolumesProbe::Ready(cached.clone()),
             None => VolumesProbe::Busy,
@@ -551,6 +561,46 @@ TYPE=swap
             matches!(shared_probe(Vec::new), VolumesProbe::Busy),
             "a caller past the waiter bound must get Busy, not a new probe"
         );
+        reset_probe_state();
+    }
+
+    /// Regression for the intermittent CI failure in
+    /// `concurrent_probes_coalesce_into_one_child`: "attempt to subtract with
+    /// overflow" at the waiter decrement. Re-runs the real coalescing path many
+    /// times so the interleaving (a waiter whose generation finished before it
+    /// re-acquired the lock) is actually exercised, and asserts the waiter
+    /// counter always returns to zero.
+    #[test]
+    fn repeated_waiter_churn_never_underflows_the_waiter_count() {
+        use std::sync::Barrier;
+
+        let _serial = lock_probe_tests();
+        for _ in 0..25 {
+            reset_probe_state();
+            let barrier = Arc::new(Barrier::new(MAX_PROBE_WAITERS + 1));
+            let mut handles = Vec::new();
+            for _ in 0..MAX_PROBE_WAITERS {
+                let barrier = Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    // An instant probe maximises the chance that the probe
+                    // completes while the other callers are still resuming from
+                    // the condvar, which is the underflow window.
+                    let _ = shared_probe(Vec::new);
+                }));
+            }
+            barrier.wait();
+            for handle in handles {
+                handle
+                    .join()
+                    .expect("a waiter panicked instead of saturating");
+            }
+            let waiters = PROBE_STATE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .waiters;
+            assert_eq!(waiters, 0, "waiter count must return to zero");
+        }
         reset_probe_state();
     }
 
