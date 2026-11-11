@@ -101,7 +101,7 @@ jobs:
     runs-on: ubuntu-latest
     container:
       # archlinux:base-devel pinned by digest; see the header comment.
-      image: archlinux/base-devel@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
+      image: archlinux@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
     env:
       CARGO_HOME: ${{ github.workspace }}/.ci-cargo
       RUSTUP_HOME: ${{ github.workspace }}/.ci-rustup
@@ -176,7 +176,7 @@ jobs:
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/develop' }}
     runs-on: [self-hosted, opencode-sam]
     container:
-      image: archlinux/base-devel@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
+      image: archlinux@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
       volumes:
         - /home/github-runner/ci-selfhost-cache/pacman-pkg:/var/cache/pacman/pkg
         - /home/github-runner/ci-selfhost-cache/locks:/ci/selfhost/locks
@@ -265,7 +265,7 @@ jobs:
     runs-on: ${{ fromJSON((github.event_name == 'push' && github.ref == 'refs/heads/develop') && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
     container:
       # archlinux:base-devel pinned by digest; see the header comment.
-      image: archlinux/base-devel@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
+      image: archlinux@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
     # qmllint consumes no build output (it checks out and lints shell/*.qml),
     # so it runs in parallel with the Rust jobs instead of behind the heaviest
     # one. On the develop path this lands on the on-premise runner with no
@@ -291,7 +291,7 @@ jobs:
     if: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/develop') }}
     runs-on: ubuntu-latest
     container:
-      image: archlinux/base-devel@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
+      image: archlinux@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
     env:
       CARGO_HOME: ${{ github.workspace }}/.ci-cargo
       RUSTUP_HOME: ${{ github.workspace }}/.ci-rustup
@@ -363,7 +363,7 @@ jobs:
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/develop' }}
     runs-on: [self-hosted, opencode-sam]
     container:
-      image: archlinux/base-devel@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
+      image: archlinux@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
       volumes:
         - /home/github-runner/ci-selfhost-cache/pacman-pkg:/var/cache/pacman/pkg
         - /home/github-runner/ci-selfhost-cache/locks:/ci/selfhost/locks
@@ -530,7 +530,7 @@ jobs:
     name: install/uninstall smoke (Arch)
     runs-on: ${{ fromJSON((github.event_name == 'push' && github.ref == 'refs/heads/develop') && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
     container:
-      image: archlinux/base-devel@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
+      image: archlinux@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
     needs: [package, package-self-hosted]
     # A `needs` job is skipped by default when ANY required job was skipped.
     # On a PR/main run `package-self-hosted` is skipped, and on a develop run
@@ -580,7 +580,7 @@ jobs:
     name: performance budgets (Arch)
     runs-on: ${{ fromJSON((github.event_name == 'push' && github.ref == 'refs/heads/develop') && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
     container:
-      image: archlinux/base-devel@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
+      image: archlinux@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
     needs: [package, package-self-hosted]
     # Same guard as `smoke`: the package job for the other path is skipped, so a
     # plain `needs` would silently skip the performance budgets on every run.
@@ -618,7 +618,7 @@ jobs:
     if: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/develop') }}
     runs-on: ubuntu-latest
     container:
-      image: archlinux/base-devel@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
+      image: archlinux@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
     env:
       CARGO_HOME: ${{ github.workspace }}/.ci-cargo
       RUSTUP_HOME: ${{ github.workspace }}/.ci-rustup
@@ -693,7 +693,7 @@ jobs:
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/develop' }}
     runs-on: [self-hosted, opencode-sam]
     container:
-      image: archlinux/base-devel@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
+      image: archlinux@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
       volumes:
         - /home/github-runner/ci-selfhost-cache/pacman-pkg:/var/cache/pacman/pkg
         - /home/github-runner/ci-selfhost-cache/locks:/ci/selfhost/locks

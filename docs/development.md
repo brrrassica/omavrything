@@ -67,7 +67,7 @@ mount error. Provision the runner once:
 
 ```sh
 sudo mkdir -p /home/github-runner/ci-selfhost-cache/{pacman-pkg,locks,cargo}
-docker pull archlinux/base-devel@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
+docker pull archlinux@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
 ```
 
 The workflow ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) has seven
