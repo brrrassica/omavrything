@@ -106,6 +106,18 @@ the user-facing docs and man page shipped inside the archive. A mismatch here
 breaks the plugin bootstrap or the upgrade path even when the digests are
 perfect.
 
+**5. Toolchain inputs come from pinned artifacts, never from the mirror.**
+
+`rust` and `lld` are both installed by exact package version from the runner
+cache with an `archive.archlinux.org` fallback, in the same `pacman -U` call, in
+both workflows. Do not add an exact-version assertion for an input that
+`pacman -Syu` installs: the mirror floats the package revision. The first 0.2.6
+gate run failed at "Verify the pinned toolchain" because `rust 1:1.99.1-1` had
+become `1:1.99.1-2` on the mirror while the assertion demanded `-1`; `rustc` was
+still the same `1.99.1 (58cf8f9c3)`, only the pkgrel had moved. `lld` did not
+fail because it was already pinned this way. The Archive filename keeps the
+epoch verbatim: `rust-1:1.99.1-1-x86_64.pkg.tar.zst`.
+
 [`scripts/archive-inputs.sh`](../scripts/archive-inputs.sh) fingerprints every
 file that goes into the archive (mode + SHA-256 + path) and pins it in
 `scripts/archive-inputs.txt`. Two things follow:
