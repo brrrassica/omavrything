@@ -77,9 +77,9 @@ const EVICT_IDLE_SECS: u64 = 0;
 /// The group that may use the system socket.
 pub(crate) const SOCKET_GROUP: &str = "omavrything";
 
-/// Serializes snapshot writes between the periodic writer and the shutdown
-/// handler, which share a fixed temp path.
-static SNAPSHOT_LOCK: Mutex<()> = Mutex::new(());
+/// Serializes snapshot writes between the periodic writer, the shutdown
+/// handler, and eviction, which share a fixed temp path.
+pub(crate) static SNAPSHOT_LOCK: Mutex<()> = Mutex::new(());
 
 /// Spawn a named daemon thread with a bounded stack, logging instead of
 /// panicking on failure.
@@ -994,14 +994,16 @@ fn run_snapshot(index: Arc<IndexManager>, config: Arc<SharedConfig>, path: PathB
         if index.is_evicted() && !index.has_pending_delta() {
             continue;
         }
-        // Compact and encode under the lock, then write outside it so the
-        // inotify writer is not blocked on disk I/O.
+        // Encode and write while holding SNAPSHOT_LOCK, so a concurrent
+        // eviction write cannot interleave with (and overwrite) this write's
+        // bytes (issue 54). `evict()` takes the same lock around its encode and
+        // write, keeping one lock order everywhere.
+        let _guard = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ids = index.identities();
         let bytes = index.with_index_mut(|idx| {
             idx.compact();
             snapshot::encode(idx, &ids)
         });
-        let _guard = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         if let Err(e) = snapshot::write_atomic(&bytes, &path) {
             error!(error = %e, "snapshot save failed");
         }
@@ -1083,8 +1085,11 @@ fn install_shutdown_handler(
             if index.is_loading() {
                 warn!("shutdown during startup; snapshot not written");
             } else {
-                let bytes = index.encode();
+                // Encode and write under SNAPSHOT_LOCK (same order as
+                // `evict()` and `run_snapshot`) so a concurrent eviction
+                // cannot interleave and persist an older image (issue 54).
                 let _guard = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                let bytes = index.encode();
                 match snapshot::write_atomic(&bytes, path) {
                     Ok(()) => info!(path = %path.display(), "snapshot written"),
                     Err(e) => error!(error = %e, "snapshot save failed"),

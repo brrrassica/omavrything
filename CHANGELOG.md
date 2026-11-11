@@ -6,6 +6,35 @@ Notable changes to `omavrything`. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **A non-ASCII query term containing `/` now matches across the parent/basename
+  boundary** (issue #53). `Term::find_boundary` early-returned for every
+  non-ASCII term, so a query like `café/report` silently failed to match a file
+  `report.pdf` under `/home/sam/café`, contradicting the search-syntax docs.
+  The boundary check is now gated on a parse-time `spans_boundary` flag: terms
+  without `/` (the overwhelming majority) cost one branch and skip the
+  separator scan entirely, so the fix adds no per-record work to the hot path
+  and slightly speeds up ASCII matching. Regression test:
+  `unicode_term_spans_the_boundary_case_insensitively`.
+- **Index eviction now serializes its snapshot write with `SNAPSHOT_LOCK`**
+  (issue #54). `evict()` wrote the snapshot through the fixed `.tmp` path
+  without the lock the periodic and shutdown writers hold, so a concurrent
+  save could fail on `O_EXCL` or persist a stale image over a fresher one. All
+  three writers now encode and write under the lock, in one order (snapshot
+  lock before state lock). Regression test:
+  `concurrent_evict_and_save_serialize_on_the_snapshot_lock`.
+- **The evicted index no longer re-hashes the whole snapshot per filesystem
+  event** (issue #55). `apply_event` called `IndexImage::from_bytes` on every
+  event while evicted, forcing an O(snapshot) FNV-1a checksum even for events
+  the delta discards. Eviction now caches the validated `SectionMap` in the
+  evicted state; the per-event path borrows the arenas from the mapping in
+  O(1) with no checksum, and materialization re-parses from the cached layout
+  without re-hashing. No extra memory is held: the arenas still borrow the
+  mmap. Regression tests:
+  `cached_sections_view_matches_the_validated_parse` and
+  `view_rejects_a_short_buffer`.
+
 ## [0.2.6] — 2026-11-10
 
 ### Changed

@@ -16,7 +16,9 @@ use memmap2::Mmap;
 use omavrything_core::index::{DeltaIndex, Index, MemoryBreakdown, PathIndex, Root, SearchOutcome};
 use omavrything_core::live::{self, FsEvent};
 use omavrything_core::scan::ScanConfig;
-use omavrything_core::snapshot::{self, IndexImage, RootIdentity};
+use omavrything_core::snapshot::{self, RootIdentity, SectionMap};
+
+use crate::SNAPSHOT_LOCK;
 
 /// Fold the delta into the owned index once it holds this many changes, so it
 /// stays bounded under heavy filesystem churn.
@@ -29,15 +31,19 @@ enum State {
     Owned(Box<Index>),
     /// The index is evicted: only the mapping and the resident path map remain.
     ///
-    /// `roots` and `len` are cached at eviction time. `GetStatus` and
-    /// `ListRoots` are callable by every local UID without polkit, and
-    /// `IndexImage::from_bytes` verifies an FNV-1a checksum over the whole
-    /// snapshot body, so re-parsing the mapping on every call would let a local
-    /// caller force repeated O(snapshot) hashing. The cached values make those
-    /// methods O(1).
+    /// `sections` caches the section layout from the checksum-validated
+    /// parse at eviction time. `IndexImage::from_bytes` verifies an FNV-1a
+    /// checksum over the whole snapshot body, so re-parsing per call would
+    /// let an event (or an unauthenticated local caller) force repeated
+    /// O(snapshot) hashing; with the layout cached, `apply_event`'s evicted
+    /// branch uses `image_from_sections`, which borrows the arenas from the
+    /// mapping with no copy and no re-hash, and `GetStatus`/`ListRoots`
+    /// read the `roots`/`len` caches and stay O(1). The mmap is never
+    /// mutated in place, so the cached layout cannot go stale.
     Image {
         mmap: Arc<Mmap>,
         by_path: PathIndex,
+        sections: SectionMap,
         roots: Vec<Root>,
         len: usize,
     },
@@ -184,8 +190,16 @@ impl IndexManager {
                 index.compact_if_needed();
                 (changed, false)
             }
-            State::Image { mmap, by_path, .. } => {
-                let Ok(image) = IndexImage::from_bytes(&mmap[..]) else {
+            State::Image {
+                mmap,
+                by_path,
+                sections,
+                ..
+            } => {
+                // Reuse the layout validated at eviction: borrowing the arenas
+                // from the mapping is O(1) and does not re-hash the snapshot per
+                // event (issue 55).
+                let Ok(view) = sections.view(&mmap[..]) else {
                     return false;
                 };
                 let changed = {
@@ -193,8 +207,8 @@ impl IndexManager {
                     live::apply_delta(
                         &mut delta,
                         by_path,
-                        image.records(),
-                        image.paths(),
+                        view.records(),
+                        view.paths(),
                         event,
                         config,
                     )
@@ -234,10 +248,12 @@ impl IndexManager {
 
     /// Build an owned index from the evicted image, folding the delta in.
     fn materialize(&self, state: &State) -> Index {
-        let State::Image { mmap, .. } = state else {
+        let State::Image { mmap, sections, .. } = state else {
             unreachable!("materialize called on an owned index");
         };
-        let image = IndexImage::from_bytes(&mmap[..]).expect("evicted image is valid");
+        // The checksum was verified when `sections` was built at eviction;
+        // re-parse from the cached layout instead of re-hashing (issue 55).
+        let image = sections.image(&mmap[..]).expect("evicted image is valid");
         let mut index = image.to_index();
         let delta = self.delta.read().unwrap_or_else(|e| e.into_inner());
         index.apply_delta(&delta);
@@ -253,6 +269,14 @@ impl IndexManager {
     /// index is now evicted. A no-op returning `false` when already evicted,
     /// when there is no snapshot path, or when the snapshot cannot be written.
     pub fn evict(&self) -> bool {
+        // Acquire SNAPSHOT_LOCK before the state lock and hold it across the
+        // encode, the write, and the mapping: `write_atomic` uses a fixed temp
+        // path and requires concurrent writers to serialize, and ordering the
+        // encode under the same lock prevents a periodic or shutdown save from
+        // overwriting this newer snapshot on disk (issue 54). Every snapshot
+        // writer follows this one lock order (snapshot lock before state lock)
+        // so there is no deadlock cycle.
+        let _snapshot_guard = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
         let State::Owned(index) = &*state else {
             return false;
@@ -277,7 +301,15 @@ impl IndexManager {
         let Ok(mmap) = (unsafe { Mmap::map(&file) }) else {
             return false;
         };
-        let Ok(image) = IndexImage::from_bytes(&mmap[..]) else {
+        // Validate the mapping once: `sections_from_bytes` verifies the header
+        // and the whole-snapshot checksum and returns the section layout;
+        // `image` materializes the arenas and metadata from it without
+        // re-hashing. The layout is cached in the state so per-event reads are
+        // O(1) (issue 55).
+        let Ok(sections) = snapshot::sections_from_bytes(&mmap[..]) else {
+            return false;
+        };
+        let Ok(image) = sections.image(&mmap[..]) else {
             return false;
         };
         let by_path = PathIndex::build(image.records(), image.paths());
@@ -288,6 +320,7 @@ impl IndexManager {
         *state = State::Image {
             mmap: Arc::new(mmap),
             by_path,
+            sections,
             roots,
             len,
         };
@@ -643,6 +676,59 @@ mod tests {
             );
             assert!(bytes < 16 * 1024, "retained delta bytes grew to {bytes}");
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_evict_and_save_serialize_on_the_snapshot_lock() {
+        // Issue 54: eviction's snapshot write and the periodic save share the
+        // fixed `<snapshot>.tmp` path, so concurrent writers must serialize.
+        // Without serialization one of the `write_atomic` calls fails on the
+        // `O_EXCL` in `open_private`. Run evictors and savers together and
+        // require every save to succeed and the final snapshot to decode.
+        let dir = temp_dir("evict-save-race");
+        let snap = dir.join("index.snapshot");
+        let manager = Arc::new(IndexManager::new(sample(), Vec::new(), Some(snap.clone())));
+
+        let mut handles = Vec::new();
+        for i in 0..4 {
+            let m = Arc::clone(&manager);
+            let path = snap.clone();
+            handles.push(std::thread::spawn(move || {
+                if i % 2 == 0 {
+                    // A saver: the `run_snapshot` pattern (lock, encode, write).
+                    let mut failures = 0usize;
+                    for _ in 0..30 {
+                        let _guard = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                        let ids = m.identities();
+                        let bytes = m.with_index_mut(|idx| snapshot::encode(idx, &ids));
+                        if snapshot::write_atomic(&bytes, &path).is_err() {
+                            failures += 1;
+                        }
+                    }
+                    failures
+                } else {
+                    // An evictor: materialize (as a query would), then evict.
+                    for _ in 0..30 {
+                        m.with_index_mut(|_| {});
+                        let _ = m.evict();
+                    }
+                    0
+                }
+            }));
+        }
+        let failures: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(
+            failures, 0,
+            "a serialized snapshot writer must never fail on the shared temp path"
+        );
+
+        // The on-disk snapshot is a complete, valid image either way.
+        assert!(
+            snapshot::load(&snap).is_ok(),
+            "the final snapshot must decode"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
