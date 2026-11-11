@@ -239,21 +239,31 @@ jobs:
       # Report the digests so the pin can be taken from this run, never from a
       # laptop. This runs after the gate, so a red run still shows the values
       # that would need pinning.
+      #
+      # The values MUST also go to stdout, not only to $GITHUB_STEP_SUMMARY.
+      # A step summary is not retrievable via `gh run view --log` or the job
+      # logs API, so when they were written only there the documented
+      # "take the pin from a green gate run" flow was not actually executable
+      # and the digests would have had to come from a laptop build -- the
+      # 0.2.4/0.2.5 failure this machinery exists to prevent. Print plain
+      # `<sha256>  <name>` lines so they can be copied straight into
+      # scripts/daemon-checksums.txt.
       - name: Report the produced digests
         if: always()
         run: |
           set -euo pipefail
           name="omavrything-${{ steps.version.outputs.version }}-$(uname -m)"
           if [[ -f "dist/$name.zip" ]]; then
-            {
-              echo "### Produced digests for $(echo "$name" | sed 's/-x86_64//')"
-              echo
-              echo '```'
-              for f in "$name/bin/omavrythingd" "$name/bin/omavry" "$name.zip"; do
-                printf '%s  %s\n' "$(sha256sum "dist/$f" | awk '{print $1}')" "$f"
-              done
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
+            block="$(printf '### Produced digests for %s\n\n```' "$(echo "$name" | sed 's/-x86_64//')")"
+            block+=$'\n'
+            for f in "$name/bin/omavrythingd" "$name/bin/omavry" "$name.zip"; do
+              block+="$(printf '%s  %s\n' "$(sha256sum "dist/$f" | awk '{print $1}')" "$f")"$'\n'
+            done
+            block+='```'
+            # stdout: retrievable from the job log, the source of the pin.
+            printf '%s\n' "$block"
+            # summary: human view in the Actions UI.
+            printf '%s\n' "$block" >> "$GITHUB_STEP_SUMMARY"
           fi
 
       # The develop/main rule from plans/digest-pinned-build.md. A release
