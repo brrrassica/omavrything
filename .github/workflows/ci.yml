@@ -16,15 +16,34 @@ env:
 # Runner placement (review finding: CI cache boundary)
 #
 # The release workflow runs on the on-premise runner and carries
-# `contents: write`. Untrusted code must never execute on that runner or write
-# the `CARGO_HOME` it later reads (`config.toml` / `rustc-wrapper` would
-# persist across jobs — see the marketplace review). So:
+# `contents: write`. Code that the maintainer did not author must never
+# execute on that runner or write the `CARGO_HOME` a release reads
+# (`config.toml` / `rustc-wrapper` would persist across jobs — see the
+# marketplace review). The trust predicate used throughout this file is:
 #
-#   * pull_request jobs            -> GitHub-hosted `ubuntu-latest`
+#   (github.event_name == 'push' && github.ref == 'refs/heads/develop')
+#     || (github.event_name == 'pull_request'
+#         && github.event.pull_request.user.login == 'brrrassica')
+#
+# — i.e. develop pushes AND pull requests AUTHORED BY THE FIRST-PARTY
+# MAINTAINER (`brrrassica`, GitHub-authenticated via the event payload, so the
+# login cannot be spoofed). Everything else — main pushes, and any PR opened by
+# another account (including fork PRs) — runs on GitHub-hosted runners.
+#
+#   * pull_request by brrrassica   -> on-premise `[self-hosted, opencode-sam]`
+#   * pull_request by anyone else  -> GitHub-hosted `ubuntu-latest`
 #   * push to main                 -> GitHub-hosted `ubuntu-latest`
 #   * push to develop              -> on-premise `[self-hosted, opencode-sam]`
 #   * release (release.yml)        -> on-premise, separate `release-cache`
 #   * prepare-release (the gate)   -> on-premise, separate `gate-cache`
+#
+# Why authoring-your-PRs-on-prem is acceptable while strangers' are not: the
+# CI self-hosted volume (`ci-selfhost-cache/*`) is a SEPARATE host path from
+# both `release-cache/*` and `gate-cache/*`, so nothing any CI job writes can
+# be read by the privileged release build — the marketplace-review escalation
+# stays blocked regardless of who opens the PR. What the author gate controls
+# is only *whose code executes on the maintainer's machine at all*: maintainer
+# code yes, stranger code never.
 #
 # Both paths run the SAME container image and the SAME pinned toolchain
 # (1.99.1, nightly-2026-10-22), so a build is identical wherever it runs and
@@ -97,7 +116,7 @@ jobs:
   # =========================================================================
   build:
     name: fmt, clippy, test, build (hosted, Arch)
-    if: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/develop') }}
+    if: ${{ !((github.event_name == 'push' && github.ref == 'refs/heads/develop') || (github.event_name == 'pull_request' && github.event.pull_request.user.login == 'brrrassica')) }}
     runs-on: ubuntu-latest
     container:
       # archlinux:base-devel pinned by digest; see the header comment.
@@ -173,7 +192,7 @@ jobs:
   # =========================================================================
   build-self-hosted:
     name: fmt, clippy, test, build (self-hosted, Arch)
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/develop' }}
+    if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/develop') || (github.event_name == 'pull_request' && github.event.pull_request.user.login == 'brrrassica') }}
     runs-on: [self-hosted, opencode-sam]
     container:
       image: archlinux@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
@@ -262,7 +281,7 @@ jobs:
 
   qml:
     name: qmllint (Arch)
-    runs-on: ${{ fromJSON((github.event_name == 'push' && github.ref == 'refs/heads/develop') && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
+    runs-on: ${{ fromJSON(((github.event_name == 'push' && github.ref == 'refs/heads/develop') || (github.event_name == 'pull_request' && github.event.pull_request.user.login == 'brrrassica')) && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
     container:
       # archlinux:base-devel pinned by digest; see the header comment.
       image: archlinux@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
@@ -288,7 +307,7 @@ jobs:
   # =========================================================================
   fuzz:
     name: fuzz (smoke, hosted, Arch)
-    if: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/develop') }}
+    if: ${{ !((github.event_name == 'push' && github.ref == 'refs/heads/develop') || (github.event_name == 'pull_request' && github.event.pull_request.user.login == 'brrrassica')) }}
     runs-on: ubuntu-latest
     container:
       image: archlinux@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
@@ -360,7 +379,7 @@ jobs:
 
   fuzz-self-hosted:
     name: fuzz (smoke, self-hosted, Arch)
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/develop' }}
+    if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/develop') || (github.event_name == 'pull_request' && github.event.pull_request.user.login == 'brrrassica') }}
     runs-on: [self-hosted, opencode-sam]
     container:
       image: archlinux@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
@@ -451,7 +470,7 @@ jobs:
   # mask a loss.
   checksums-superset:
     name: daemon-checksums.txt is a superset of main
-    runs-on: ${{ fromJSON((github.event_name == 'push' && github.ref == 'refs/heads/develop') && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
+    runs-on: ${{ fromJSON(((github.event_name == 'push' && github.ref == 'refs/heads/develop') || (github.event_name == 'pull_request' && github.event.pull_request.user.login == 'brrrassica')) && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -499,7 +518,7 @@ jobs:
 
   audit:
     name: cargo audit
-    runs-on: ${{ fromJSON((github.event_name == 'push' && github.ref == 'refs/heads/develop') && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
+    runs-on: ${{ fromJSON(((github.event_name == 'push' && github.ref == 'refs/heads/develop') || (github.event_name == 'pull_request' && github.event.pull_request.user.login == 'brrrassica')) && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
     permissions:
       contents: read
       issues: write
@@ -528,7 +547,7 @@ jobs:
   # as satisfied by default).
   smoke:
     name: install/uninstall smoke (Arch)
-    runs-on: ${{ fromJSON((github.event_name == 'push' && github.ref == 'refs/heads/develop') && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
+    runs-on: ${{ fromJSON(((github.event_name == 'push' && github.ref == 'refs/heads/develop') || (github.event_name == 'pull_request' && github.event.pull_request.user.login == 'brrrassica')) && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
     container:
       image: archlinux@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
     needs: [package, package-self-hosted]
@@ -578,7 +597,7 @@ jobs:
   # assertions themselves are unchanged.
   bench:
     name: performance budgets (Arch)
-    runs-on: ${{ fromJSON((github.event_name == 'push' && github.ref == 'refs/heads/develop') && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
+    runs-on: ${{ fromJSON(((github.event_name == 'push' && github.ref == 'refs/heads/develop') || (github.event_name == 'pull_request' && github.event.pull_request.user.login == 'brrrassica')) && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
     container:
       image: archlinux@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
     needs: [package, package-self-hosted]
@@ -615,7 +634,7 @@ jobs:
   # =========================================================================
   package:
     name: build + package release archive (hosted, Arch)
-    if: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/develop') }}
+    if: ${{ !((github.event_name == 'push' && github.ref == 'refs/heads/develop') || (github.event_name == 'pull_request' && github.event.pull_request.user.login == 'brrrassica')) }}
     runs-on: ubuntu-latest
     container:
       image: archlinux@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
@@ -690,7 +709,7 @@ jobs:
 
   package-self-hosted:
     name: build + package release archive (self-hosted, Arch)
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/develop' }}
+    if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/develop') || (github.event_name == 'pull_request' && github.event.pull_request.user.login == 'brrrassica') }}
     runs-on: [self-hosted, opencode-sam]
     container:
       image: archlinux@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd

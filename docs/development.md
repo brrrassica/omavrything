@@ -11,13 +11,21 @@ glibc, and package availability catches problems that an Ubuntu build would miss
 The release archive is built the same way, so the shipped binaries match the
 target platform.
 
-**Runner placement is a security boundary.** Untrusted code must never run on a
-runner that later performs a write-privileged release:
+**Runner placement is a security boundary.** Code the maintainer did not author
+must never run on the runner that later performs a write-privileged release. The
+trust predicate is: a **push to `develop`**, OR a **pull request authored by the
+first-party maintainer (`brrrassica`)** — GitHub-authenticated via the event
+payload, so the login cannot be spoofed. On-premise CI uses its own
+`ci-selfhost-cache` volume, separate from the release's `release-cache` and the
+gate's `gate-cache`, so no CI job can plant config a release build reads
+regardless of who triggered it.
 
-- `pull_request` and push-to-`main` jobs run on **GitHub-hosted**
-  `ubuntu-latest`, still inside the same `archlinux:base-devel` container.
-- Push-to-`develop` jobs run on the **on-premise** runner
-  (`[self-hosted, opencode-sam]`).
+- `pull_request` **authored by `brrrassica`** and push-to-`develop` run on the
+  **on-premise** runner (`[self-hosted, opencode-sam]`), inside the same
+  digest-pinned `archlinux` container.
+- `pull_request` **authored by anyone else** (including fork PRs) and
+  push-to-`main` run on **GitHub-hosted** `ubuntu-latest`, still inside the
+  same container.
 - The docs-site workflow ([`.github/workflows/pages.yml`](../.github/workflows/pages.yml))
   also runs on GitHub-hosted `ubuntu-latest`: it executes repo code
   (`site/build.py`, `pip install`) and must not share a host with the release
