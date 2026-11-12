@@ -647,7 +647,8 @@ fn run_watcher(
     // Do not watch excluded subtrees. The scanner prunes them, so watching them
     // only delivers events `apply_event` discards; a churning excluded directory
     // (e.g. `~/.cache`) then floods the watcher under the index write lock.
-    watcher.set_excludes(GlobSet::new(&config.scan().excludes));
+    let mut known_excludes = config.scan().excludes;
+    watcher.set_excludes(GlobSet::new(&known_excludes));
 
     let mut known_roots = HashSet::new();
     watch_new_roots(&mut watcher, &index, &mut known_roots);
@@ -665,6 +666,26 @@ fn run_watcher(
 
     let mut buffer = [0u8; 8192];
     loop {
+        // A runtime `SetConfig("excludes")` updates the scan config and rescans,
+        // but the watcher's exclude set is otherwise fixed at startup. Apply
+        // the new set: `set_excludes` drops watches for newly excluded
+        // subtrees, then re-walking the roots watches a subtree that left the
+        // exclude list again (inotify reuses the watches already in place).
+        let excludes = config.scan().excludes;
+        if excludes != known_excludes {
+            watcher.set_excludes(GlobSet::new(&excludes));
+            for root in index.roots() {
+                let path = PathBuf::from(&root.path);
+                if let Err(err) = watcher.watch_dir(&path) {
+                    warn!(
+                        path = %path.display(),
+                        error = %err,
+                        "watch failed after excludes change"
+                    );
+                }
+            }
+            known_excludes = excludes;
+        }
         // Roots added after startup (D-Bus mounts, remembered volumes, NTFS
         // startup/hotplug) must start delivering events too.
         watch_new_roots(&mut watcher, &index, &mut known_roots);
