@@ -107,9 +107,9 @@ pub fn apply_delta(
             }
             delta_created(delta, by_path, records, paths, path, config)
         }
-        FsEvent::Removed(path) => delta_removed(delta, records, paths, path),
+        FsEvent::Removed(path) => delta_removed(delta, by_path, records, paths, path),
         FsEvent::Renamed { from, to } => {
-            let changed = delta_removed(delta, records, paths, from);
+            let changed = delta_removed(delta, by_path, records, paths, from);
             if is_excluded(&excludes, to) {
                 changed
             } else {
@@ -153,33 +153,48 @@ fn delta_created(
 
 fn delta_removed(
     delta: &mut DeltaIndex,
+    by_path: &PathIndex,
     records: &[FileRecord],
     paths: &[u8],
     path: &Path,
 ) -> bool {
     let mut changed = false;
     let key = path.to_string_lossy();
-    // For the filesystem root "/", the subtree prefix is "/" itself; for any
-    // other path it is "<key>/".
-    let prefix = if key.ends_with('/') {
-        key.to_string()
-    } else {
-        format!("{key}/")
-    };
-    let key_bytes = key.as_bytes();
-    let prefix_bytes = prefix.as_bytes();
-    let mut buf: Vec<u8> = Vec::new();
-    // inotify reports a directory removal or rename as one event, without
-    // per-child events, so drop the whole base subtree, not just the exact path.
-    for (i, rec) in records.iter().enumerate() {
-        if rec.is_deleted() {
-            continue;
-        }
-        buf.clear();
-        write_full_path_bytes(rec, records, paths, &mut buf);
-        if buf == key_bytes || buf.starts_with(prefix_bytes) {
-            delta.remove(i as u32);
+    if let Some(idx) = by_path.get(&key, records, paths) {
+        if !records[idx as usize].is_dir() {
+            // A file has no descendants, so the resident path map resolves the
+            // base removal in O(1) instead of scanning every base record.
+            delta.remove(idx);
             changed = true;
+        }
+    }
+    if !changed {
+        // A directory can have descendants, and a path whose own record is
+        // missing may still have indexed children, so retain the subtree scan
+        // for those cases.
+        // For the filesystem root "/", the subtree prefix is "/" itself; for any
+        // other path it is "<key>/".
+        let prefix = if key.ends_with('/') {
+            key.to_string()
+        } else {
+            format!("{key}/")
+        };
+        let key_bytes = key.as_bytes();
+        let prefix_bytes = prefix.as_bytes();
+        let mut buf: Vec<u8> = Vec::new();
+        // inotify reports a directory removal or rename as one event, without
+        // per-child events, so drop the whole base subtree, not just the exact
+        // path.
+        for (i, rec) in records.iter().enumerate() {
+            if rec.is_deleted() {
+                continue;
+            }
+            buf.clear();
+            write_full_path_bytes(rec, records, paths, &mut buf);
+            if buf == key_bytes || buf.starts_with(prefix_bytes) {
+                delta.remove(i as u32);
+                changed = true;
+            }
         }
     }
     // Pending inserts of the old subtree were created while evicted, so they

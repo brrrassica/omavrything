@@ -267,7 +267,8 @@ flowchart TD
   from QML). The result set is bounded, so serialization is not the bottleneck.
   A request line is capped at 64 KiB.
 - **Request:** `{"q":"report","limit":100,"offset":0}`. `method` defaults to
-  `search`; `limit` defaults to 100 and is capped at 1000.
+  `search`; `limit` defaults to 100 and is capped at 1000; `offset` is clamped
+  to the bounded result window (10,000).
 - **Response:** `{"results":[{"path":"/home/sam/report.pdf","name":"report.pdf","size":1234,"mtime":1699999999,"is_dir":false}],"total":42,"took_ms":7}`.
   An `error` field is present on failure; a `state` field is `"loading"` while
   an evicted index is being materialized.
