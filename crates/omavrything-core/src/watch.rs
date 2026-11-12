@@ -62,8 +62,23 @@ impl Watcher {
 
     /// Set the exclude globs. Directories matching one are not watched and are
     /// not descended into, mirroring the scanner's traversal pruning.
+    ///
+    /// Watches for directories that the new set now excludes are dropped, so a
+    /// runtime exclude change (see `run_watcher`) stops delivering events for
+    /// them. The caller re-walks the roots afterwards to pick up subtrees that
+    /// left the set.
     pub fn set_excludes(&mut self, excludes: GlobSet) {
         self.excludes = excludes;
+        let stale: Vec<WatchDescriptor> = self
+            .dirs
+            .iter()
+            .filter(|(_, dir)| self.excludes.matches(dir))
+            .map(|(wd, _)| wd.clone())
+            .collect();
+        for wd in stale {
+            self.dirs.remove(&wd);
+            let _ = self.inotify.watches().remove(wd);
+        }
     }
 
     /// Recursively watch `dir` and all of its subdirectories.
@@ -450,6 +465,82 @@ mod tests {
         assert!(
             !events.iter().any(|e| format!("{e:?}").contains(".cache")),
             "no event from an excluded subtree should be delivered: {events:?}"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn un_excluding_a_subtree_starts_watching_it() {
+        let base =
+            std::env::temp_dir().join(format!("omavrything-watch-unexcl-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join(".cache/sub")).unwrap();
+        fs::create_dir_all(base.join("keep")).unwrap();
+
+        let mut watcher = Watcher::new().unwrap();
+        watcher.set_excludes(GlobSet::new(&["**/.cache/**".to_string()]));
+        watcher.watch_dir(&base).unwrap();
+        assert_eq!(
+            watcher.watch_count(),
+            2,
+            "expected base + keep to be watched, not .cache"
+        );
+
+        // A runtime exclude update removes `.cache` from the set; the watcher
+        // re-walk then installs watches for the subtree it previously skipped.
+        watcher.set_excludes(GlobSet::default());
+        watcher.watch_dir(&base).unwrap();
+        assert_eq!(
+            watcher.watch_count(),
+            4,
+            "expected base + keep + .cache + sub to be watched"
+        );
+
+        // Changes under the re-included subtree must now be delivered.
+        let file = base.join(".cache/sub/f.txt");
+        fs::write(&file, b"x").unwrap();
+        let created = wait_for(
+            &mut watcher,
+            |e| matches!(e, FsEvent::Created(p) if p == &file),
+        );
+        assert!(
+            created.is_some(),
+            "a change in the re-included subtree must produce an event"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn adding_an_exclude_drops_existing_watches() {
+        let base =
+            std::env::temp_dir().join(format!("omavrything-watch-reexcl-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("cache/sub")).unwrap();
+        fs::create_dir_all(base.join("keep")).unwrap();
+
+        let mut watcher = Watcher::new().unwrap();
+        watcher.watch_dir(&base).unwrap();
+        assert_eq!(watcher.watch_count(), 4);
+
+        // Excluding a subtree at runtime must drop its watches, not just stop
+        // new ones from being added.
+        watcher.set_excludes(GlobSet::new(&["**/cache/**".to_string()]));
+        assert_eq!(
+            watcher.watch_count(),
+            2,
+            "expected the newly excluded cache subtree to be unwatched"
+        );
+
+        fs::write(base.join("cache/sub/f.txt"), b"x").unwrap();
+        let mut buffer = [0u8; 4096];
+        let events = watcher
+            .read_events(&mut buffer, Duration::from_millis(300))
+            .unwrap();
+        assert!(
+            !events.iter().any(|e| format!("{e:?}").contains("cache")),
+            "no event from a newly excluded subtree should be delivered: {events:?}"
         );
 
         let _ = fs::remove_dir_all(&base);
