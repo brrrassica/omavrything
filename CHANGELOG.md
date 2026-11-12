@@ -8,6 +8,15 @@ Notable changes to `omavrything`. The format follows
 
 ### Fixed
 
+- **Search requests can no longer force the index to retain every match with an
+  unbounded `offset`** (issue #60). The protocol clamped `limit` to `MAX_LIMIT`
+  but returned the offset raw, and the collector was sized from `offset +
+  limit`, so a huge offset on a broad query kept every match before pagination
+  dropped the skipped prefix. `Request::effective_offset` now clamps to a new
+  `MAX_OFFSET`, and the image/delta search entry points bound their collector
+  window too, so the cost is O(`MAX_OFFSET + limit`) rather than O(matches).
+  Regression tests: `offset_clamps_to_max_offset` and
+  `collector_window_is_bounded_by_the_offset_cap`.
 - **A non-ASCII query term containing `/` now matches across the parent/basename
   boundary** (issue #53). `Term::find_boundary` early-returned for every
   non-ASCII term, so a query like `café/report` silently failed to match a file

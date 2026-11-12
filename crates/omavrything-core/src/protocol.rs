@@ -98,6 +98,14 @@ pub const DEFAULT_LIMIT: usize = 100;
 /// The hard result cap, regardless of what a request asks for.
 pub const MAX_LIMIT: usize = 1000;
 
+/// The hard paging offset cap, regardless of what a request asks for.
+///
+/// A search retains `offset + limit` candidates before dropping the skipped
+/// prefix, so an unbounded offset would let a client make a broad query retain
+/// every match. Paging this deep is not useful in the UI, so bound it like
+/// [`MAX_LIMIT`].
+pub const MAX_OFFSET: usize = 100_000;
+
 /// The maximum length of a single request line, in bytes. A longer line is
 /// rejected before it is parsed, so a client cannot force unbounded buffering.
 pub const MAX_LINE_BYTES: usize = 64 * 1024;
@@ -121,9 +129,9 @@ impl Request {
         self.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT)
     }
 
-    /// The effective offset for this request. Defaults to 0.
+    /// The effective offset for this request, clamped to [`MAX_OFFSET`].
     pub fn effective_offset(&self) -> usize {
-        self.offset.unwrap_or(0)
+        self.offset.unwrap_or(0).min(MAX_OFFSET)
     }
 }
 
@@ -173,6 +181,23 @@ mod tests {
     fn offset_defaults_to_zero() {
         let req: Request = serde_json::from_str(r#"{"q":"x"}"#).unwrap();
         assert_eq!(req.effective_offset(), 0);
+    }
+
+    #[test]
+    fn offset_clamps_to_max_offset() {
+        let req: Request = serde_json::from_str(r#"{"q":"x","offset":99999999}"#).unwrap();
+        assert_eq!(req.effective_offset(), MAX_OFFSET);
+
+        let req = Request {
+            method: Method::Search,
+            q: "x".into(),
+            limit: None,
+            offset: Some(usize::MAX),
+        };
+        assert_eq!(req.effective_offset(), MAX_OFFSET);
+
+        let req: Request = serde_json::from_str(r#"{"q":"x","offset":42}"#).unwrap();
+        assert_eq!(req.effective_offset(), 42);
     }
 
     #[test]

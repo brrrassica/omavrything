@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 use rayon::prelude::*;
 
 use crate::candidate::{CandidateIndex, CandidateMemory};
+use crate::protocol::MAX_OFFSET;
 use crate::query::{Query, Rank};
 
 /// Above this many records, the scan is parallelized with rayon. Below it, the
@@ -37,6 +38,16 @@ const PARALLEL_THRESHOLD: usize = 50_000;
 /// amortizes rayon's per-item scheduling overhead over a contiguous run, which
 /// keeps the hot matching loop cache-friendly.
 const PARALLEL_CHUNK: usize = 4096;
+
+/// The number of candidates a search asks its collector to retain for a page.
+///
+/// The protocol already clamps `offset` at the socket boundary, but the image
+/// and delta search entry points are public and take a raw offset, so bound it
+/// here as well. Otherwise an absurd offset makes a broad query retain every
+/// match before pagination drops the skipped prefix.
+fn collector_want(limit: usize, offset: usize) -> usize {
+    offset.min(MAX_OFFSET).saturating_add(limit)
+}
 
 /// Compact the owned index once it holds this many tombstones **and** at least
 /// half of its records are dead. Larger than the delta's threshold because
@@ -588,7 +599,7 @@ pub(crate) fn search_image(
     if q.is_empty() || limit == 0 {
         return SearchOutcome::default();
     }
-    let want = offset.saturating_add(limit);
+    let want = collector_want(limit, offset);
     let (total, top) = if records.len() >= PARALLEL_THRESHOLD {
         scan_image_parallel(records, paths, &q, want)
     } else {
@@ -701,7 +712,7 @@ pub fn search_image_with_delta(
     if q.is_empty() || limit == 0 {
         return SearchOutcome::default();
     }
-    let want = offset.saturating_add(limit);
+    let want = collector_want(limit, offset);
     let base_len = records.len() as u32;
 
     let (base_total, base_top) = if records.len() >= PARALLEL_THRESHOLD {
@@ -1793,7 +1804,7 @@ impl Index {
             );
         }
 
-        let want = offset.saturating_add(limit);
+        let want = collector_want(limit, offset);
 
         let scan_started = Instant::now();
         // Narrow the scan to a candidate set when the query allows it. The
@@ -2041,7 +2052,7 @@ impl Index {
         if q.is_empty() || limit == 0 {
             return SearchOutcome::default();
         }
-        let want = offset.saturating_add(limit);
+        let want = collector_want(limit, offset);
         let mut top = TopN::new(want);
         let mut total = 0usize;
         for (i, rec) in self.records.iter().enumerate() {
@@ -2538,6 +2549,14 @@ mod tests {
         let past = index.search("report", 2, 99);
         assert!(past.hits.is_empty());
         assert_eq!(past.total, 5);
+    }
+
+    #[test]
+    fn collector_window_is_bounded_by_the_offset_cap() {
+        assert_eq!(collector_want(10, 0), 10);
+        assert_eq!(collector_want(10, 42), 52);
+        // An absurd offset must not size the collector from the raw value.
+        assert_eq!(collector_want(10, usize::MAX), MAX_OFFSET + 10);
     }
 
     #[test]
