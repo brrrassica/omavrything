@@ -25,7 +25,8 @@ pub struct Request {
     /// Maximum number of results to return. Defaults to 100, capped at 1000.
     #[serde(default)]
     pub limit: Option<usize>,
-    /// Number of leading matches to skip, for paging. Defaults to 0.
+    /// Number of leading matches to skip, for paging. Defaults to 0 and is
+    /// clamped to [`MAX_RESULT_WINDOW`].
     #[serde(default)]
     pub offset: Option<usize>,
 }
@@ -98,6 +99,11 @@ pub const DEFAULT_LIMIT: usize = 100;
 /// The hard result cap, regardless of what a request asks for.
 pub const MAX_LIMIT: usize = 1000;
 
+/// The maximum result window a query may collect, i.e. the largest
+/// `offset + limit` the index will rank. A larger offset is clamped to this
+/// bound, so a request cannot force the top-N collector to retain every match.
+pub const MAX_RESULT_WINDOW: usize = 10_000;
+
 /// The maximum length of a single request line, in bytes. A longer line is
 /// rejected before it is parsed, so a client cannot force unbounded buffering.
 pub const MAX_LINE_BYTES: usize = 64 * 1024;
@@ -121,9 +127,11 @@ impl Request {
         self.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT)
     }
 
-    /// The effective offset for this request. Defaults to 0.
+    /// The effective offset for this request. Defaults to 0 and is clamped to
+    /// [`MAX_RESULT_WINDOW`], so paging past the window returns an empty page
+    /// instead of making the collector retain every match.
     pub fn effective_offset(&self) -> usize {
-        self.offset.unwrap_or(0)
+        self.offset.unwrap_or(0).min(MAX_RESULT_WINDOW)
     }
 }
 
@@ -173,6 +181,16 @@ mod tests {
     fn offset_defaults_to_zero() {
         let req: Request = serde_json::from_str(r#"{"q":"x"}"#).unwrap();
         assert_eq!(req.effective_offset(), 0);
+    }
+
+    #[test]
+    fn offset_clamps_to_the_result_window() {
+        let req: Request =
+            serde_json::from_str(r#"{"q":"x","offset":18446744073709551615}"#).unwrap();
+        assert_eq!(req.effective_offset(), MAX_RESULT_WINDOW);
+
+        let req: Request = serde_json::from_str(r#"{"q":"x","offset":999999}"#).unwrap();
+        assert_eq!(req.effective_offset(), MAX_RESULT_WINDOW);
     }
 
     #[test]

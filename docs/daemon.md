@@ -168,7 +168,8 @@ Request:
   over the full path).
 - `limit` — optional; defaults to 100, capped at 1000.
 - `offset` — optional; number of leading matches to skip, for paging. Defaults
-  to 0.
+  to 0 and is clamped to the maximum result window (10,000); a larger offset
+  returns an empty page.
 
 Response:
 

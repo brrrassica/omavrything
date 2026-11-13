@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 use rayon::prelude::*;
 
 use crate::candidate::{CandidateIndex, CandidateMemory};
+use crate::protocol::MAX_RESULT_WINDOW;
 use crate::query::{Query, Rank};
 
 /// Above this many records, the scan is parallelized with rayon. Below it, the
@@ -37,6 +38,13 @@ const PARALLEL_THRESHOLD: usize = 50_000;
 /// amortizes rayon's per-item scheduling overhead over a contiguous run, which
 /// keeps the hot matching loop cache-friendly.
 const PARALLEL_CHUNK: usize = 4096;
+
+/// The bounded number of leading matches a query collects: `offset + limit`,
+/// capped at [`MAX_RESULT_WINDOW`]. Callers may pass an untrusted offset, so the
+/// collector's heap must never be sized directly from it.
+fn result_window(limit: usize, offset: usize) -> usize {
+    offset.saturating_add(limit).min(MAX_RESULT_WINDOW)
+}
 
 /// Compact the owned index once it holds this many tombstones **and** at least
 /// half of its records are dead. Larger than the delta's threshold because
@@ -588,7 +596,7 @@ pub(crate) fn search_image(
     if q.is_empty() || limit == 0 {
         return SearchOutcome::default();
     }
-    let want = offset.saturating_add(limit);
+    let want = result_window(limit, offset);
     let (total, top) = if records.len() >= PARALLEL_THRESHOLD {
         scan_image_parallel(records, paths, &q, want)
     } else {
@@ -701,7 +709,7 @@ pub fn search_image_with_delta(
     if q.is_empty() || limit == 0 {
         return SearchOutcome::default();
     }
-    let want = offset.saturating_add(limit);
+    let want = result_window(limit, offset);
     let base_len = records.len() as u32;
 
     let (base_total, base_top) = if records.len() >= PARALLEL_THRESHOLD {
@@ -1559,7 +1567,29 @@ impl Index {
     /// Records are tombstoned rather than physically removed, so the arenas stay
     /// append-only and record indices remain stable.
     pub fn remove(&mut self, path: &Path) -> bool {
+        self.remove_inner(path).0
+    }
+
+    /// Implementation of [`Index::remove`]. Returns the change flag and the
+    /// number of records visited, so tests can assert that an exact file
+    /// removal does not scan the whole index.
+    fn remove_inner(&mut self, path: &Path) -> (bool, usize) {
         let key = path.to_string_lossy();
+        if let Some(idx) = self.find_str(key.as_ref()) {
+            let rec = &self.records[idx as usize];
+            if !rec.is_deleted() && !rec.is_dir() {
+                // A file has no descendants, so the path map resolves the
+                // entire removal in O(1) instead of scanning every record.
+                self.records[idx as usize].flags |= FLAG_DELETED;
+                self.map_remove(key.as_ref());
+                self.live -= 1;
+                self.invalidate_cache();
+                return (true, 1);
+            }
+        }
+        // A directory can have descendants, and a path whose own record is
+        // missing may still have indexed children (e.g. a test or a partial
+        // scan), so retain the subtree prefix scan for those cases.
         // For the filesystem root "/", the subtree prefix is "/" itself; for any
         // other path it is "<key>/".
         let prefix = if key.ends_with('/') {
@@ -1572,7 +1602,9 @@ impl Index {
 
         let mut to_delete: Vec<u32> = Vec::new();
         let mut buf: Vec<u8> = Vec::new();
+        let mut visited = 0usize;
         for (i, rec) in self.records.iter().enumerate() {
+            visited += 1;
             if rec.is_deleted() {
                 continue;
             }
@@ -1583,7 +1615,7 @@ impl Index {
             }
         }
         if to_delete.is_empty() {
-            return false;
+            return (false, visited);
         }
 
         for &i in &to_delete {
@@ -1599,7 +1631,7 @@ impl Index {
         }
         self.live -= to_delete.len();
         self.invalidate_cache();
-        true
+        (true, visited)
     }
 
     /// Rename or move `old` to `new`, updating the record and its subtree.
@@ -1612,34 +1644,44 @@ impl Index {
         let old_bytes = old_key.as_bytes();
         let old_prefix_bytes = old_prefix.as_bytes();
 
+        // The renamed record itself, if it is indexed (a directory may be
+        // renamed before its own record exists).
+        let exact = self.find_str(old_key.as_ref());
+
         let mut buf: Vec<u8> = Vec::new();
         // Capture each affected record's *old* full path now, before any record is
         // rewritten. Reconstructing it inside the mutation loop would observe the
-        // already-updated ancestor paths and compute the wrong suffix.
-        let affected: Vec<(u32, Vec<u8>)> = self
-            .records
-            .iter()
-            .enumerate()
-            .filter_map(|(i, rec)| {
-                if rec.is_deleted() {
-                    return None;
-                }
-                buf.clear();
-                write_full_path_bytes(rec, &self.records, &self.paths, &mut buf);
-                if buf == old_bytes || buf.starts_with(old_prefix_bytes) {
-                    Some((i as u32, buf.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        // already-updated ancestor paths and compute the wrong suffix. A file
+        // rename resolves through the path map; only a directory (or a missing
+        // exact record) needs the subtree prefix scan.
+        let affected: Vec<(u32, Vec<u8>)> = match exact {
+            Some(i)
+                if !self.records[i as usize].is_deleted() && !self.records[i as usize].is_dir() =>
+            {
+                vec![(i, old_key.as_bytes().to_vec())]
+            }
+            _ => self
+                .records
+                .iter()
+                .enumerate()
+                .filter_map(|(i, rec)| {
+                    if rec.is_deleted() {
+                        return None;
+                    }
+                    buf.clear();
+                    write_full_path_bytes(rec, &self.records, &self.paths, &mut buf);
+                    if buf == old_bytes || buf.starts_with(old_prefix_bytes) {
+                        Some((i as u32, buf.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+        };
         if affected.is_empty() {
             return false;
         }
 
-        // The renamed record itself, if it is indexed (a directory may be
-        // renamed before its own record exists).
-        let exact = self.find_str(old_key.as_ref());
         let new_parent = new
             .parent()
             .and_then(|p| self.find_str(p.to_string_lossy().as_ref()))
@@ -1793,7 +1835,7 @@ impl Index {
             );
         }
 
-        let want = offset.saturating_add(limit);
+        let want = result_window(limit, offset);
 
         let scan_started = Instant::now();
         // Narrow the scan to a candidate set when the query allows it. The
@@ -2041,7 +2083,7 @@ impl Index {
         if q.is_empty() || limit == 0 {
             return SearchOutcome::default();
         }
-        let want = offset.saturating_add(limit);
+        let want = result_window(limit, offset);
         let mut top = TopN::new(want);
         let mut total = 0usize;
         for (i, rec) in self.records.iter().enumerate() {
@@ -2541,6 +2583,20 @@ mod tests {
     }
 
     #[test]
+    fn enormous_offset_returns_an_empty_page_without_unbounding_the_collector() {
+        let mut index = Index::new();
+        for i in 0..20 {
+            index.insert(Path::new(&format!("/home/report-{i}.txt")), false, 1, 0);
+        }
+
+        for offset in [MAX_RESULT_WINDOW, MAX_RESULT_WINDOW + 1, usize::MAX] {
+            let out = index.search("report", 10, offset);
+            assert!(out.hits.is_empty(), "offset {offset} must return no hits");
+            assert_eq!(out.total, 20, "offset must not change the total count");
+        }
+    }
+
+    #[test]
     fn unicode_terms_match_case_insensitively() {
         let mut index = Index::new();
         index.insert(Path::new("/tmp/Ünïcode.txt"), false, 1, 0);
@@ -2573,6 +2629,23 @@ mod tests {
         index.insert(Path::new("/a.txt"), false, 1, 0);
         assert!(!index.remove(Path::new("/nope.txt")));
         assert_eq!(index.len(), 1);
+    }
+
+    #[test]
+    fn removing_one_file_does_not_scan_the_whole_index() {
+        let mut index = Index::new();
+        for i in 0..10_000 {
+            index.insert(Path::new(&format!("/data/file-{i:05}.txt")), false, 1, 0);
+        }
+
+        let (changed, visited) = index.remove_inner(Path::new("/data/file-05000.txt"));
+        assert!(changed);
+        assert_eq!(visited, 1, "an exact file removal must not scan records");
+        assert_eq!(index.len(), 9_999);
+        assert!(index.find(Path::new("/data/file-05000.txt")).is_none());
+
+        let (changed, _) = index.remove_inner(Path::new("/data/not-indexed.txt"));
+        assert!(!changed);
     }
 
     #[test]
