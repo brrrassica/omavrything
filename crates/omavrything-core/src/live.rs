@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use crate::glob::GlobSet;
-use crate::index::{DeltaIndex, FileRecord, Index, PathIndex, write_full_path_bytes};
+use crate::index::{DeltaIndex, FileRecord, Index, PathIndex, SubtreeIndex, write_full_path_bytes};
 use crate::scan::{ScanConfig, scan_subtree, scan_subtree_into_delta};
 
 /// A filesystem change observed by the watcher.
@@ -91,9 +91,27 @@ fn apply_modified(index: &mut Index, path: &Path) -> bool {
 /// `by_path` is the resident path -> base-index map, and `records`/`paths` are
 /// the base image's arenas (used to confirm the map's hash matches). Returns
 /// whether the delta changed.
+///
+/// This builds a [`SubtreeIndex`] from `records` for the call. The manager
+/// caches one alongside the evicted image and calls
+/// [`apply_delta_with_subtree`] so a per-event removal does not rebuild it.
 pub fn apply_delta(
     delta: &mut DeltaIndex,
     by_path: &PathIndex,
+    records: &[FileRecord],
+    paths: &[u8],
+    event: &FsEvent,
+    config: &ScanConfig,
+) -> bool {
+    let subtree = SubtreeIndex::build_image(records);
+    apply_delta_with_subtree(delta, by_path, &subtree, records, paths, event, config)
+}
+
+/// Like [`apply_delta`], but reuses a prebuilt base-image subtree locator.
+pub fn apply_delta_with_subtree(
+    delta: &mut DeltaIndex,
+    by_path: &PathIndex,
+    subtree: &SubtreeIndex,
     records: &[FileRecord],
     paths: &[u8],
     event: &FsEvent,
@@ -107,9 +125,9 @@ pub fn apply_delta(
             }
             delta_created(delta, by_path, records, paths, path, config)
         }
-        FsEvent::Removed(path) => delta_removed(delta, by_path, records, paths, path),
+        FsEvent::Removed(path) => delta_removed(delta, by_path, subtree, records, paths, path),
         FsEvent::Renamed { from, to } => {
-            let changed = delta_removed(delta, by_path, records, paths, from);
+            let changed = delta_removed(delta, by_path, subtree, records, paths, from);
             if is_excluded(&excludes, to) {
                 changed
             } else {
@@ -154,33 +172,55 @@ fn delta_created(
 fn delta_removed(
     delta: &mut DeltaIndex,
     by_path: &PathIndex,
+    subtree: &SubtreeIndex,
     records: &[FileRecord],
     paths: &[u8],
     path: &Path,
 ) -> bool {
     let mut changed = false;
     let key = path.to_string_lossy();
+    // For the filesystem root "/", the subtree prefix is "/" itself; for any
+    // other path it is "<key>/".
+    let prefix = if key.ends_with('/') {
+        key.to_string()
+    } else {
+        format!("{key}/")
+    };
+    let key_bytes = key.as_bytes();
+    let prefix_bytes = prefix.as_bytes();
     if let Some(idx) = by_path.get(&key, records, paths) {
-        if !records[idx as usize].is_dir() {
-            // A file has no descendants, so the resident path map resolves the
-            // base removal in O(1) instead of scanning every base record.
-            delta.remove(idx);
-            changed = true;
+        let rec = &records[idx as usize];
+        if !rec.is_deleted() {
+            if !rec.is_dir() {
+                // A file has no descendants, so the resident path map resolves
+                // the base removal in O(1) instead of scanning every base record.
+                delta.remove(idx);
+                changed = true;
+            } else {
+                // A directory's descendants are reachable through the base
+                // image's child links, so visit only that subtree instead of
+                // every base record.
+                let mut descendants: Vec<u32> = Vec::new();
+                subtree.collect_under_path(
+                    records,
+                    paths,
+                    idx,
+                    key.as_bytes(),
+                    prefix.as_bytes(),
+                    &mut descendants,
+                );
+                for &i in &descendants {
+                    if !records[i as usize].is_deleted() {
+                        delta.remove(i);
+                        changed = true;
+                    }
+                }
+            }
         }
     }
     if !changed {
-        // A directory can have descendants, and a path whose own record is
-        // missing may still have indexed children, so retain the subtree scan
-        // for those cases.
-        // For the filesystem root "/", the subtree prefix is "/" itself; for any
-        // other path it is "<key>/".
-        let prefix = if key.ends_with('/') {
-            key.to_string()
-        } else {
-            format!("{key}/")
-        };
-        let key_bytes = key.as_bytes();
-        let prefix_bytes = prefix.as_bytes();
+        // A path whose own record is missing may still have indexed children,
+        // so retain the subtree prefix scan for that case.
         let mut buf: Vec<u8> = Vec::new();
         // inotify reports a directory removal or rename as one event, without
         // per-child events, so drop the whole base subtree, not just the exact
