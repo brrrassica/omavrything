@@ -1,10 +1,11 @@
 //! The daemon's index manager: an owned index that can be evicted to a
 //! memory-mapped snapshot image and reloaded on demand.
 //!
-//! While evicted, only the mapping and a resident path -> index map remain
-//! resident; queries scan the image (merged with a small delta of live updates)
-//! and the watcher records changes in the delta. The owned index is
-//! materialized again when a mutation needs it, and evicted again when idle.
+//! While evicted, only the mapping, a resident path -> index map, and compact
+//! parent -> child links remain resident; queries scan the image (merged with a
+//! small delta of live updates) and the watcher records changes in the delta.
+//! The owned index is materialized again when a mutation needs it, and evicted
+//! again when idle.
 
 use std::fs::File;
 use std::path::PathBuf;
@@ -13,7 +14,9 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use memmap2::Mmap;
-use omavrything_core::index::{DeltaIndex, Index, MemoryBreakdown, PathIndex, Root, SearchOutcome};
+use omavrything_core::index::{
+    DeltaIndex, Index, MemoryBreakdown, PathIndex, Root, SearchOutcome, SubtreeIndex,
+};
 use omavrything_core::live::{self, FsEvent};
 use omavrything_core::scan::ScanConfig;
 use omavrything_core::snapshot::{self, RootIdentity, SectionMap};
@@ -43,6 +46,9 @@ enum State {
     Image {
         mmap: Arc<Mmap>,
         by_path: PathIndex,
+        /// Base-image parent -> child links, so an evicted directory removal
+        /// resolves its descendants without scanning the whole image.
+        subtree: Box<SubtreeIndex>,
         sections: SectionMap,
         roots: Vec<Root>,
         len: usize,
@@ -193,6 +199,7 @@ impl IndexManager {
             State::Image {
                 mmap,
                 by_path,
+                subtree,
                 sections,
                 ..
             } => {
@@ -204,9 +211,10 @@ impl IndexManager {
                 };
                 let changed = {
                     let mut delta = self.delta.write().unwrap_or_else(|e| e.into_inner());
-                    live::apply_delta(
+                    live::apply_delta_with_subtree(
                         &mut delta,
                         by_path,
+                        subtree,
                         view.records(),
                         view.paths(),
                         event,
@@ -313,6 +321,7 @@ impl IndexManager {
             return false;
         };
         let by_path = PathIndex::build(image.records(), image.paths());
+        let subtree = SubtreeIndex::build_image(image.records());
         // Cache the metadata the unauthenticated status methods need, so they
         // do not re-parse (and re-checksum) the mapping on every call.
         let roots = image.roots().to_vec();
@@ -320,6 +329,7 @@ impl IndexManager {
         *state = State::Image {
             mmap: Arc::new(mmap),
             by_path,
+            subtree: Box::new(subtree),
             sections,
             roots,
             len,
@@ -413,9 +423,17 @@ impl IndexManager {
         let state = self.state.read().unwrap_or_else(|e| e.into_inner());
         match &*state {
             State::Owned(index) => index.memory_bytes(),
-            State::Image { mmap, by_path, .. } => {
+            State::Image {
+                mmap,
+                by_path,
+                subtree,
+                ..
+            } => {
                 let delta = self.delta.read().unwrap_or_else(|e| e.into_inner());
-                mmap.len() as u64 + by_path.memory_bytes() + delta.memory_bytes()
+                mmap.len() as u64
+                    + by_path.memory_bytes()
+                    + subtree.memory_bytes()
+                    + delta.memory_bytes()
             }
         }
     }
@@ -425,7 +443,14 @@ impl IndexManager {
         let state = self.state.read().unwrap_or_else(|e| e.into_inner());
         match &*state {
             State::Owned(index) => index.capacity_bytes(),
-            State::Image { mmap, by_path, .. } => mmap.len() as u64 + by_path.memory_bytes(),
+            State::Image {
+                mmap,
+                by_path,
+                subtree,
+                ..
+            } => {
+                mmap.len() as u64 + by_path.memory_bytes() + subtree.memory_bytes()
+            }
         }
     }
 
