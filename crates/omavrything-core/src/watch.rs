@@ -106,7 +106,12 @@ impl Watcher {
 
             if let Ok(rd) = fs::read_dir(&current) {
                 for entry in rd.flatten() {
-                    if entry.metadata().map(|m| m.is_dir()).unwrap_or(false) {
+                    // Match the scanner: `file_type()` comes from `readdir`'s
+                    // `d_type` and does not follow symlinks. A symlinked
+                    // directory is indexed as one symlink record, so descending
+                    // through it would watch a subtree (and alias a watch
+                    // descriptor) that has no index entries.
+                    if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                         stack.push(entry.path());
                     }
                 }
@@ -427,6 +432,49 @@ mod tests {
             watcher.watch_count(),
             1,
             "moved-out subtree watches must be removed"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn symlinked_directories_are_not_watched() {
+        let base =
+            std::env::temp_dir().join(format!("omavrything-watch-symlink-{}", std::process::id()));
+        let outside = std::env::temp_dir().join(format!(
+            "omavrything-watch-symlink-outside-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let _ = fs::remove_dir_all(&outside);
+        fs::create_dir_all(base.join("real/nested")).unwrap();
+        fs::create_dir_all(outside.join("nested")).unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("outside-link")).unwrap();
+        std::os::unix::fs::symlink(base.join("real"), base.join("inside-link")).unwrap();
+
+        let mut watcher = Watcher::new().unwrap();
+        watcher.watch_dir(&base).unwrap();
+
+        // Only base, real and real/nested are watched. The scanner indexes each
+        // symlink as a single record and never descends through it, so the
+        // watcher must not add watches for either link or the outside target.
+        assert_eq!(
+            watcher.watch_count(),
+            3,
+            "expected base + real + real/nested to be watched, not the symlinks"
+        );
+
+        fs::write(outside.join("nested/secret.txt"), b"x").unwrap();
+        let mut buffer = [0u8; 4096];
+        let events = watcher
+            .read_events(&mut buffer, Duration::from_millis(300))
+            .unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|e| format!("{e:?}").contains("outside-link")),
+            "a change through the symlink target must not be delivered: {events:?}"
         );
 
         let _ = fs::remove_dir_all(&base);
