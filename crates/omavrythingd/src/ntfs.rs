@@ -11,7 +11,7 @@
 //! (re-indexing when it returns).
 
 use std::collections::{HashMap, HashSet};
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -302,21 +302,45 @@ pub(crate) fn run_command_timeout(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    // Drain both pipes concurrently with the wait loop. A child that writes
+    // more than the pipe capacity (about 64 KiB) blocks in `write` until a
+    // reader consumes it, so polling `try_wait` alone would never see it exit
+    // and would report a spurious timeout.
+    let stdout = child.stdout.take().map(spawn_reader);
+    let stderr = child.stderr.take().map(spawn_reader);
     let deadline = Instant::now() + timeout;
-    loop {
-        if child.try_wait()?.is_some() {
-            return child.wait_with_output();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
+            // The readers are deliberately not joined: a descendant that
+            // inherited the pipe could hold it open past the deadline.
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!("{prog} timed out after {timeout:?}"),
             ));
         }
         std::thread::sleep(Duration::from_millis(25));
-    }
+    };
+    let stdout = stdout.and_then(|h| h.join().ok()).unwrap_or_default();
+    let stderr = stderr.and_then(|h| h.join().ok()).unwrap_or_default();
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// Read `pipe` to EOF on its own thread so a blocked child can still be reaped.
+fn spawn_reader<R: Read + Send + 'static>(mut pipe: R) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = pipe.read_to_end(&mut buf);
+        buf
+    })
 }
 
 /// Decode the octal escapes used by `/proc/mounts` (`\040` space, `\011` tab,
@@ -1515,6 +1539,25 @@ mod tests {
         let err = run_command_timeout("sleep", &["5"], Duration::from_millis(100)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn command_timeout_drains_output_larger_than_a_pipe_buffer() {
+        // A child that writes more than the ~64 KiB pipe buffer blocks in
+        // `write` until the reader drains it. The wait loop must not mistake
+        // that for a hang.
+        let output = run_command_timeout(
+            "sh",
+            &[
+                "-c",
+                "head -c 200000 /dev/zero; head -c 200000 /dev/zero >&2",
+            ],
+            Duration::from_secs(5),
+        )
+        .expect("a fast command with large output must not time out");
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 200_000);
+        assert_eq!(output.stderr.len(), 200_000);
     }
 
     #[test]

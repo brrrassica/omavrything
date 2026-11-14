@@ -165,27 +165,44 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Build the release binaries into bin/ via scripts/build.sh, the single build
-# step. install.sh reads the binaries from bin/, so building with a bare
-# `cargo build` (which only populates target/release) would leave the installer
-# with nothing to install. Under sudo, build as the invoking user so target/
-# and bin/ are not left with root-owned artifacts (and cargo does not create a
-# separate root-owned cache); in a root-only CI container this is a no-op
-# branch and the build runs as root.
-if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
-  runuser -u "$SUDO_USER" -- "$here/scripts/build.sh"
+# The release binaries come from bin/. On a developer machine, build them with
+# scripts/build.sh (the single build step); install.sh reads the binaries from
+# bin/, so building with a bare `cargo build` (which only populates
+# target/release) would leave the installer with nothing to install. Under
+# sudo, build as the invoking user so target/ and bin/ are not left with
+# root-owned artifacts (and cargo does not create a separate root-owned
+# cache); in a root-only CI container this is a no-op branch and the build
+# runs as root.
+#
+# In CI the binaries were built once by the workflow's `package` job and
+# downloaded into bin/ as run-scoped artifacts (OMAVR_SMOKE_SKIP_BUILD=1), so
+# this script recompiles nothing: the smoke test still installs, exercises and
+# uninstalls exactly those release bytes. The check below refuses to continue
+# when neither path produced binaries, so the test can never silently pass
+# against an empty bin/.
+if [[ "${OMAVR_SMOKE_SKIP_BUILD:-0}" == 1 ]]; then
+  if [[ ! -x bin/omavrythingd || ! -x bin/omavry ]]; then
+    fail "smoke binaries present in bin/ (skipping the build)"
+    printf '%s\n' "       bin/omavrythingd and bin/omavry must exist when OMAVR_SMOKE_SKIP_BUILD=1" >&2
+    exit 1
+  fi
+  ok "smoke binaries present in bin/ (skipping the build)"
 else
-  "$here/scripts/build.sh"
-fi
-
-# Guard against the sudo-build poisoning seen before: when the build ran as
-# $SUDO_USER, no file under target/ or bin/ may be owned by root.
-if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
-  root_owned="$(find target bin -user root 2>/dev/null | wc -l)"
-  if [[ "$root_owned" -eq 0 ]]; then
-    ok "no root-owned files in target/ or bin/ after the sudo build"
+  if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+    runuser -u "$SUDO_USER" -- "$here/scripts/build.sh"
   else
-    fail "no root-owned files in target/ or bin/ after the sudo build ($root_owned found)"
+    "$here/scripts/build.sh"
+  fi
+
+  # Guard against the sudo-build poisoning seen before: when the build ran as
+  # $SUDO_USER, no file under target/ or bin/ may be owned by root.
+  if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+    root_owned="$(find target bin -user root 2>/dev/null | wc -l)"
+    if [[ "$root_owned" -eq 0 ]]; then
+      ok "no root-owned files in target/ or bin/ after the sudo build"
+    else
+      fail "no root-owned files in target/ or bin/ after the sudo build ($root_owned found)"
+    fi
   fi
 fi
 

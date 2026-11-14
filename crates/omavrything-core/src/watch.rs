@@ -62,8 +62,23 @@ impl Watcher {
 
     /// Set the exclude globs. Directories matching one are not watched and are
     /// not descended into, mirroring the scanner's traversal pruning.
+    ///
+    /// Watches for directories that the new set now excludes are dropped, so a
+    /// runtime exclude change (see `run_watcher`) stops delivering events for
+    /// them. The caller re-walks the roots afterwards to pick up subtrees that
+    /// left the set.
     pub fn set_excludes(&mut self, excludes: GlobSet) {
         self.excludes = excludes;
+        let stale: Vec<WatchDescriptor> = self
+            .dirs
+            .iter()
+            .filter(|(_, dir)| self.excludes.matches(dir))
+            .map(|(wd, _)| wd.clone())
+            .collect();
+        for wd in stale {
+            self.dirs.remove(&wd);
+            let _ = self.inotify.watches().remove(wd);
+        }
     }
 
     /// Recursively watch `dir` and all of its subdirectories.
@@ -91,7 +106,12 @@ impl Watcher {
 
             if let Ok(rd) = fs::read_dir(&current) {
                 for entry in rd.flatten() {
-                    if entry.metadata().map(|m| m.is_dir()).unwrap_or(false) {
+                    // Match the scanner: `file_type()` comes from `readdir`'s
+                    // `d_type` and does not follow symlinks. A symlinked
+                    // directory is indexed as one symlink record, so descending
+                    // through it would watch a subtree (and alias a watch
+                    // descriptor) that has no index entries.
+                    if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                         stack.push(entry.path());
                     }
                 }
@@ -191,9 +211,23 @@ impl Watcher {
         }
     }
 
-    /// Drop the path mappings for a subtree that left the watched tree.
+    /// Drop the path mappings and kernel watches for a subtree that left the
+    /// watched tree.
+    ///
+    /// Moving a directory does not destroy its inode, so its inotify watches
+    /// stay registered until explicitly removed. Dropping only the mappings
+    /// would leak those watches (and their `max_user_watches` budget) forever.
     fn forget_subtree(&mut self, path: &Path) {
-        self.dirs.retain(|_, dir| !dir.starts_with(path));
+        let stale: Vec<WatchDescriptor> = self
+            .dirs
+            .iter()
+            .filter(|(_, dir)| dir.starts_with(path))
+            .map(|(wd, _)| wd.clone())
+            .collect();
+        for wd in stale {
+            self.dirs.remove(&wd);
+            let _ = self.inotify.watches().remove(wd);
+        }
     }
 
     /// Translate one raw inotify event into zero or more [`FsEvent`]s.
@@ -361,6 +395,93 @@ mod tests {
     }
 
     #[test]
+    fn move_out_of_tree_drops_subtree_watches() {
+        let base =
+            std::env::temp_dir().join(format!("omavrything-watch-outdir-{}", std::process::id()));
+        let outside = std::env::temp_dir().join(format!(
+            "omavrything-watch-outdir-outside-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let _ = fs::remove_dir_all(&outside);
+        fs::create_dir_all(base.join("moved/nested")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        let mut watcher = Watcher::new().unwrap();
+        watcher.watch_dir(&base).unwrap();
+        assert_eq!(
+            watcher.watch_count(),
+            3,
+            "expected base + moved + nested to be watched"
+        );
+
+        let from = base.join("moved");
+        fs::rename(&from, outside.join("moved")).unwrap();
+        let removed = wait_for(
+            &mut watcher,
+            |e| matches!(e, FsEvent::Removed(p) if p == &from),
+        );
+        assert!(
+            removed.is_some(),
+            "expected a Removed event for the moved-out directory"
+        );
+
+        // The moved directory still exists outside the tree, so its inode (and
+        // kernel watches) would otherwise leak. Only the base remains watched.
+        assert_eq!(
+            watcher.watch_count(),
+            1,
+            "moved-out subtree watches must be removed"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn symlinked_directories_are_not_watched() {
+        let base =
+            std::env::temp_dir().join(format!("omavrything-watch-symlink-{}", std::process::id()));
+        let outside = std::env::temp_dir().join(format!(
+            "omavrything-watch-symlink-outside-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let _ = fs::remove_dir_all(&outside);
+        fs::create_dir_all(base.join("real/nested")).unwrap();
+        fs::create_dir_all(outside.join("nested")).unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("outside-link")).unwrap();
+        std::os::unix::fs::symlink(base.join("real"), base.join("inside-link")).unwrap();
+
+        let mut watcher = Watcher::new().unwrap();
+        watcher.watch_dir(&base).unwrap();
+
+        // Only base, real and real/nested are watched. The scanner indexes each
+        // symlink as a single record and never descends through it, so the
+        // watcher must not add watches for either link or the outside target.
+        assert_eq!(
+            watcher.watch_count(),
+            3,
+            "expected base + real + real/nested to be watched, not the symlinks"
+        );
+
+        fs::write(outside.join("nested/secret.txt"), b"x").unwrap();
+        let mut buffer = [0u8; 4096];
+        let events = watcher
+            .read_events(&mut buffer, Duration::from_millis(300))
+            .unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|e| format!("{e:?}").contains("outside-link")),
+            "a change through the symlink target must not be delivered: {events:?}"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
     fn excluded_subtrees_are_not_watched() {
         let base =
             std::env::temp_dir().join(format!("omavrything-watch-excl-{}", std::process::id()));
@@ -392,6 +513,82 @@ mod tests {
         assert!(
             !events.iter().any(|e| format!("{e:?}").contains(".cache")),
             "no event from an excluded subtree should be delivered: {events:?}"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn un_excluding_a_subtree_starts_watching_it() {
+        let base =
+            std::env::temp_dir().join(format!("omavrything-watch-unexcl-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join(".cache/sub")).unwrap();
+        fs::create_dir_all(base.join("keep")).unwrap();
+
+        let mut watcher = Watcher::new().unwrap();
+        watcher.set_excludes(GlobSet::new(&["**/.cache/**".to_string()]));
+        watcher.watch_dir(&base).unwrap();
+        assert_eq!(
+            watcher.watch_count(),
+            2,
+            "expected base + keep to be watched, not .cache"
+        );
+
+        // A runtime exclude update removes `.cache` from the set; the watcher
+        // re-walk then installs watches for the subtree it previously skipped.
+        watcher.set_excludes(GlobSet::default());
+        watcher.watch_dir(&base).unwrap();
+        assert_eq!(
+            watcher.watch_count(),
+            4,
+            "expected base + keep + .cache + sub to be watched"
+        );
+
+        // Changes under the re-included subtree must now be delivered.
+        let file = base.join(".cache/sub/f.txt");
+        fs::write(&file, b"x").unwrap();
+        let created = wait_for(
+            &mut watcher,
+            |e| matches!(e, FsEvent::Created(p) if p == &file),
+        );
+        assert!(
+            created.is_some(),
+            "a change in the re-included subtree must produce an event"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn adding_an_exclude_drops_existing_watches() {
+        let base =
+            std::env::temp_dir().join(format!("omavrything-watch-reexcl-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("cache/sub")).unwrap();
+        fs::create_dir_all(base.join("keep")).unwrap();
+
+        let mut watcher = Watcher::new().unwrap();
+        watcher.watch_dir(&base).unwrap();
+        assert_eq!(watcher.watch_count(), 4);
+
+        // Excluding a subtree at runtime must drop its watches, not just stop
+        // new ones from being added.
+        watcher.set_excludes(GlobSet::new(&["**/cache/**".to_string()]));
+        assert_eq!(
+            watcher.watch_count(),
+            2,
+            "expected the newly excluded cache subtree to be unwatched"
+        );
+
+        fs::write(base.join("cache/sub/f.txt"), b"x").unwrap();
+        let mut buffer = [0u8; 4096];
+        let events = watcher
+            .read_events(&mut buffer, Duration::from_millis(300))
+            .unwrap();
+        assert!(
+            !events.iter().any(|e| format!("{e:?}").contains("cache")),
+            "no event from a newly excluded subtree should be delivered: {events:?}"
         );
 
         let _ = fs::remove_dir_all(&base);

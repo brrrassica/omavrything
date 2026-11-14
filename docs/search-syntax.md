@@ -75,9 +75,10 @@ query restores the daemon's ranking.
 ## Paging
 
 The protocol returns a bounded page. The request carries `limit` (default 100,
-capped at 1000) and `offset` (the number of leading matches to skip), and the
-response reports `total`, the number of **all** matching entries, so a client can
-show "showing X of Y" and page through the rest.
+capped at 1000) and `offset` (the number of leading matches to skip, clamped to
+the maximum result window of 10,000), and the response reports `total`, the
+number of **all** matching entries, so a client can show "showing X of Y" and
+page through the rest.
 
 ## From the CLI
 

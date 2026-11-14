@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use crate::glob::GlobSet;
-use crate::index::{DeltaIndex, FileRecord, Index, PathIndex, write_full_path_bytes};
+use crate::index::{DeltaIndex, FileRecord, Index, PathIndex, SubtreeIndex};
 use crate::scan::{ScanConfig, scan_subtree, scan_subtree_into_delta};
 
 /// A filesystem change observed by the watcher.
@@ -91,9 +91,27 @@ fn apply_modified(index: &mut Index, path: &Path) -> bool {
 /// `by_path` is the resident path -> base-index map, and `records`/`paths` are
 /// the base image's arenas (used to confirm the map's hash matches). Returns
 /// whether the delta changed.
+///
+/// This builds a [`SubtreeIndex`] from `records` for the call. The manager
+/// caches one alongside the evicted image and calls
+/// [`apply_delta_with_subtree`] so a per-event removal does not rebuild it.
 pub fn apply_delta(
     delta: &mut DeltaIndex,
     by_path: &PathIndex,
+    records: &[FileRecord],
+    paths: &[u8],
+    event: &FsEvent,
+    config: &ScanConfig,
+) -> bool {
+    let subtree = SubtreeIndex::build_image(records);
+    apply_delta_with_subtree(delta, by_path, &subtree, records, paths, event, config)
+}
+
+/// Like [`apply_delta`], but reuses a prebuilt base-image subtree locator.
+pub fn apply_delta_with_subtree(
+    delta: &mut DeltaIndex,
+    by_path: &PathIndex,
+    subtree: &SubtreeIndex,
     records: &[FileRecord],
     paths: &[u8],
     event: &FsEvent,
@@ -107,9 +125,9 @@ pub fn apply_delta(
             }
             delta_created(delta, by_path, records, paths, path, config)
         }
-        FsEvent::Removed(path) => delta_removed(delta, records, paths, path),
+        FsEvent::Removed(path) => delta_removed(delta, by_path, subtree, records, paths, path),
         FsEvent::Renamed { from, to } => {
-            let changed = delta_removed(delta, records, paths, from);
+            let changed = delta_removed(delta, by_path, subtree, records, paths, from);
             if is_excluded(&excludes, to) {
                 changed
             } else {
@@ -153,6 +171,8 @@ fn delta_created(
 
 fn delta_removed(
     delta: &mut DeltaIndex,
+    by_path: &PathIndex,
+    subtree: &SubtreeIndex,
     records: &[FileRecord],
     paths: &[u8],
     path: &Path,
@@ -168,18 +188,58 @@ fn delta_removed(
     };
     let key_bytes = key.as_bytes();
     let prefix_bytes = prefix.as_bytes();
-    let mut buf: Vec<u8> = Vec::new();
-    // inotify reports a directory removal or rename as one event, without
-    // per-child events, so drop the whole base subtree, not just the exact path.
-    for (i, rec) in records.iter().enumerate() {
-        if rec.is_deleted() {
-            continue;
+    let exact = by_path.get(&key, records, paths);
+    if let Some(idx) = exact {
+        let rec = &records[idx as usize];
+        if !rec.is_deleted() {
+            if !rec.is_dir() {
+                // A file has no descendants, so the resident path map resolves
+                // the base removal in O(1) instead of scanning every base record.
+                delta.remove(idx);
+                changed = true;
+            } else {
+                // A directory's descendants are reachable through the base
+                // image's child links, so visit only that subtree instead of
+                // every base record.
+                let mut descendants: Vec<u32> = Vec::new();
+                subtree.collect_under_path(
+                    records,
+                    paths,
+                    Some(idx),
+                    key.as_bytes(),
+                    prefix.as_bytes(),
+                    &mut descendants,
+                );
+                for &i in &descendants {
+                    if !records[i as usize].is_deleted() {
+                        delta.remove(i);
+                        changed = true;
+                    }
+                }
+            }
         }
-        buf.clear();
-        write_full_path_bytes(rec, records, paths, &mut buf);
-        if buf == key_bytes || buf.starts_with(prefix_bytes) {
-            delta.remove(i as u32);
-            changed = true;
+    }
+    if !changed {
+        // A path whose own record is missing (or already tombstoned) may still
+        // have indexed children, so resolve them from the stored base subtree
+        // or the parentless roots instead of scanning every base record.
+        // inotify reports a directory removal or rename as one event, without
+        // per-child events, so drop the whole base subtree, not just the exact
+        // path.
+        let mut descendants: Vec<u32> = Vec::new();
+        subtree.collect_under_path(
+            records,
+            paths,
+            exact,
+            key_bytes,
+            prefix_bytes,
+            &mut descendants,
+        );
+        for &i in &descendants {
+            if !records[i as usize].is_deleted() {
+                delta.remove(i);
+                changed = true;
+            }
         }
     }
     // Pending inserts of the old subtree were created while evicted, so they
@@ -393,6 +453,28 @@ mod tests {
         assert_eq!(hits[0].path, new_child.to_string_lossy());
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn delta_removal_of_a_missing_directory_drops_orphaned_descendants() {
+        // Regression: the directory record is absent from the base image, so the
+        // removal must resolve its children through the parentless roots rather
+        // than walking every base record.
+        let mut index = Index::new();
+        index.insert(Path::new("/home/sam/a.txt"), false, 1, 0);
+        let by_path = PathIndex::build(index.records(), index.paths());
+        let config = ScanConfig::default();
+        let mut delta = DeltaIndex::new();
+        assert!(apply_delta(
+            &mut delta,
+            &by_path,
+            index.records(),
+            index.paths(),
+            &FsEvent::Removed(PathBuf::from("/home/sam")),
+            &config
+        ));
+        index.apply_delta(&delta);
+        assert!(index.find(Path::new("/home/sam/a.txt")).is_none());
     }
 
     #[test]

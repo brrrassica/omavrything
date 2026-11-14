@@ -18,6 +18,7 @@ mod udev;
 mod udisks;
 mod volumes;
 
+use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
@@ -77,9 +78,9 @@ const EVICT_IDLE_SECS: u64 = 0;
 /// The group that may use the system socket.
 pub(crate) const SOCKET_GROUP: &str = "omavrything";
 
-/// Serializes snapshot writes between the periodic writer and the shutdown
-/// handler, which share a fixed temp path.
-static SNAPSHOT_LOCK: Mutex<()> = Mutex::new(());
+/// Serializes snapshot writes between the periodic writer, the shutdown
+/// handler, and eviction, which share a fixed temp path.
+pub(crate) static SNAPSHOT_LOCK: Mutex<()> = Mutex::new(());
 
 /// Spawn a named daemon thread with a bounded stack, logging instead of
 /// panicking on failure.
@@ -611,6 +612,39 @@ fn login1_idle_hint(rt: &tokio::runtime::Runtime) -> Option<bool> {
     })
 }
 
+/// Watch indexed roots that appeared since the last reconciliation.
+///
+/// Volumes can be mounted and indexed after the watcher starts (D-Bus mount,
+/// remembered volumes, NTFS startup/hotplug). `known` remembers the roots
+/// already handed to the watcher so the periodic reconciliation only watches
+/// newly added roots instead of re-walking every tree.
+fn watch_new_roots(watcher: &mut Watcher, index: &IndexManager, known: &mut HashSet<PathBuf>) {
+    for root in index.roots() {
+        let path = PathBuf::from(&root.path);
+        if !known.insert(path.clone()) {
+            continue;
+        }
+        if let Err(err) = watcher.watch_dir(&path) {
+            warn!(path = %path.display(), error = %err, "watch failed");
+        }
+    }
+}
+
+/// Watch a directory created under an already-watched root.
+///
+/// `symlink_metadata` (unlike `Path::is_dir`, which follows links) mirrors the
+/// scanner and `apply_event`: a symlink to a directory is indexed as a single
+/// symlink record, so watching its target would deliver events for paths the
+/// scanner never indexes.
+fn watch_created_dir(watcher: &mut Watcher, path: &Path) {
+    let is_dir = std::fs::symlink_metadata(path)
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
+    if is_dir {
+        let _ = watcher.watch_dir(path);
+    }
+}
+
 /// Watch the indexed roots with inotify and apply events to the index.
 fn run_watcher(
     index: Arc<IndexManager>,
@@ -628,18 +662,11 @@ fn run_watcher(
     // Do not watch excluded subtrees. The scanner prunes them, so watching them
     // only delivers events `apply_event` discards; a churning excluded directory
     // (e.g. `~/.cache`) then floods the watcher under the index write lock.
-    watcher.set_excludes(GlobSet::new(&config.scan().excludes));
+    let mut known_excludes = config.scan().excludes;
+    watcher.set_excludes(GlobSet::new(&known_excludes));
 
-    let roots: Vec<PathBuf> = index
-        .roots()
-        .iter()
-        .map(|r| PathBuf::from(&r.path))
-        .collect();
-    for root in &roots {
-        if let Err(err) = watcher.watch_dir(root) {
-            warn!(path = %root.display(), error = %err, "watch failed");
-        }
-    }
+    let mut known_roots = HashSet::new();
+    watch_new_roots(&mut watcher, &index, &mut known_roots);
     let mut reported_failed = watcher.failed().len();
     if reported_failed > 0 {
         warn!(
@@ -654,6 +681,38 @@ fn run_watcher(
 
     let mut buffer = [0u8; 8192];
     loop {
+        // A runtime `SetConfig("excludes")` updates the scan config and rescans,
+        // but the watcher's exclude set is otherwise fixed at startup. Apply
+        // the new set: `set_excludes` drops watches for newly excluded
+        // subtrees, then re-walking the roots watches a subtree that left the
+        // exclude list again (inotify reuses the watches already in place).
+        let excludes = config.scan().excludes;
+        if excludes != known_excludes {
+            watcher.set_excludes(GlobSet::new(&excludes));
+            for root in index.roots() {
+                let path = PathBuf::from(&root.path);
+                if let Err(err) = watcher.watch_dir(&path) {
+                    warn!(
+                        path = %path.display(),
+                        error = %err,
+                        "watch failed after excludes change"
+                    );
+                }
+            }
+            known_excludes = excludes;
+        }
+        // Roots added after startup (D-Bus mounts, remembered volumes, NTFS
+        // startup/hotplug) must start delivering events too.
+        watch_new_roots(&mut watcher, &index, &mut known_roots);
+        let failed = watcher.failed().len();
+        if failed > reported_failed {
+            warn!(
+                additional = failed - reported_failed,
+                "more directories could not be watched (max_user_watches exhausted?)"
+            );
+            reported_failed = failed;
+            config.set_unwatched(watcher.failed().to_vec());
+        }
         match watcher.read_events(&mut buffer, WATCH_POLL) {
             Ok(batch) => {
                 if batch.is_empty() {
@@ -678,19 +737,8 @@ fn run_watcher(
                 // Watch newly created directories.
                 for event in &batch {
                     if let FsEvent::Created(path) = event {
-                        if path.is_dir() {
-                            let _ = watcher.watch_dir(path);
-                        }
+                        watch_created_dir(&mut watcher, path);
                     }
-                }
-                let failed = watcher.failed().len();
-                if failed > reported_failed {
-                    warn!(
-                        additional = failed - reported_failed,
-                        "more directories could not be watched (max_user_watches exhausted?)"
-                    );
-                    reported_failed = failed;
-                    config.set_unwatched(watcher.failed().to_vec());
                 }
                 let entries = index.len() as u64;
                 let _ = events.send(IndexEvent::Changed { entries });
@@ -994,14 +1042,16 @@ fn run_snapshot(index: Arc<IndexManager>, config: Arc<SharedConfig>, path: PathB
         if index.is_evicted() && !index.has_pending_delta() {
             continue;
         }
-        // Compact and encode under the lock, then write outside it so the
-        // inotify writer is not blocked on disk I/O.
+        // Encode and write while holding SNAPSHOT_LOCK, so a concurrent
+        // eviction write cannot interleave with (and overwrite) this write's
+        // bytes (issue 54). `evict()` takes the same lock around its encode and
+        // write, keeping one lock order everywhere.
+        let _guard = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ids = index.identities();
         let bytes = index.with_index_mut(|idx| {
             idx.compact();
             snapshot::encode(idx, &ids)
         });
-        let _guard = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         if let Err(e) = snapshot::write_atomic(&bytes, &path) {
             error!(error = %e, "snapshot save failed");
         }
@@ -1083,8 +1133,11 @@ fn install_shutdown_handler(
             if index.is_loading() {
                 warn!("shutdown during startup; snapshot not written");
             } else {
-                let bytes = index.encode();
+                // Encode and write under SNAPSHOT_LOCK (same order as
+                // `evict()` and `run_snapshot`) so a concurrent eviction
+                // cannot interleave and persist an older image (issue 54).
                 let _guard = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                let bytes = index.encode();
                 match snapshot::write_atomic(&bytes, path) {
                     Ok(()) => info!(path = %path.display(), "snapshot written"),
                     Err(e) => error!(error = %e, "snapshot save failed"),
@@ -1796,5 +1849,91 @@ mod tests {
         // the thread and stop the remaining partitions from being indexed.
         assert_eq!(contain_panic(|| 7), Ok(7));
         assert!(contain_panic(|| panic!("malformed volume")).is_err());
+    }
+
+    #[test]
+    fn watches_roots_added_after_the_watcher_starts() {
+        let base =
+            std::env::temp_dir().join(format!("omavrything-late-root-{}", std::process::id()));
+        let late = std::env::temp_dir().join(format!(
+            "omavrything-late-root-added-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&late);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(late.join("nested")).unwrap();
+
+        let mut initial = Index::new();
+        initial.add_root(&base, omavrything_core::index::FsKind::Other);
+        let index = Arc::new(IndexManager::new(initial, Vec::new(), None));
+
+        let mut watcher = Watcher::new().unwrap();
+        let mut known = HashSet::new();
+        watch_new_roots(&mut watcher, &index, &mut known);
+        assert_eq!(watcher.watch_count(), 1);
+
+        // A volume mounted after the watcher started adds a new root.
+        index.with_index_mut(|idx| idx.add_root(&late, omavrything_core::index::FsKind::Other));
+        watch_new_roots(&mut watcher, &index, &mut known);
+        assert_eq!(
+            watcher.watch_count(),
+            3,
+            "the late root and its nested directory must be watched"
+        );
+
+        let file = late.join("nested").join("late.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let mut buffer = [0u8; 4096];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut created = false;
+        while Instant::now() < deadline && !created {
+            let events = watcher
+                .read_events(&mut buffer, Duration::from_millis(100))
+                .unwrap();
+            created = events
+                .iter()
+                .any(|e| matches!(e, FsEvent::Created(p) if p == &file));
+        }
+        assert!(
+            created,
+            "a file created under the late root must produce a Created event"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&late);
+    }
+
+    #[test]
+    fn created_symlinked_directory_is_not_watched() {
+        let base =
+            std::env::temp_dir().join(format!("omavrything-created-link-{}", std::process::id()));
+        let target = std::env::temp_dir().join(format!(
+            "omavrything-created-link-target-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&target);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(target.join("nested")).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let mut watcher = Watcher::new().unwrap();
+        watch_created_dir(&mut watcher, &link);
+        assert_eq!(
+            watcher.watch_count(),
+            0,
+            "a created symlink to a directory must not be watched"
+        );
+
+        // A real directory is still watched, and its subtree with it.
+        let real = base.join("real");
+        std::fs::create_dir_all(real.join("nested")).unwrap();
+        watch_created_dir(&mut watcher, &real);
+        assert_eq!(watcher.watch_count(), 2);
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&target);
     }
 }

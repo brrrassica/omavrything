@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 use rayon::prelude::*;
 
 use crate::candidate::{CandidateIndex, CandidateMemory};
+use crate::protocol::MAX_RESULT_WINDOW;
 use crate::query::{Query, Rank};
 
 /// Above this many records, the scan is parallelized with rayon. Below it, the
@@ -37,6 +38,13 @@ const PARALLEL_THRESHOLD: usize = 50_000;
 /// amortizes rayon's per-item scheduling overhead over a contiguous run, which
 /// keeps the hot matching loop cache-friendly.
 const PARALLEL_CHUNK: usize = 4096;
+
+/// The bounded number of leading matches a query collects: `offset + limit`,
+/// capped at [`MAX_RESULT_WINDOW`]. Callers may pass an untrusted offset, so the
+/// collector's heap must never be sized directly from it.
+fn result_window(limit: usize, offset: usize) -> usize {
+    offset.saturating_add(limit).min(MAX_RESULT_WINDOW)
+}
 
 /// Compact the owned index once it holds this many tombstones **and** at least
 /// half of its records are dead. Larger than the delta's threshold because
@@ -337,6 +345,216 @@ impl PathIndex {
     }
 }
 
+/// A parent -> child adjacency map for the record tree.
+///
+/// Removal and rename need the descendants of a directory without scanning
+/// every record. Record indices are stable and insertions are append-only, so
+/// the map uses flat child-link arrays: each record's first child plus its next
+/// (and, for mutable indexes, previous) sibling. A separate list holds records
+/// with no indexed parent (scan roots and orphans), which a path-prefix check
+/// covers during a subtree operation.
+#[derive(Debug, Default, Clone)]
+pub struct SubtreeIndex {
+    first_child: Vec<u32>,
+    next_sibling: Vec<u32>,
+    prev_sibling: Vec<u32>,
+    /// Records with no indexed parent: scan roots and orphans whose immediate
+    /// parent was not in the index. Their own descendants are still linked.
+    parentless: Vec<u32>,
+}
+
+impl SubtreeIndex {
+    /// Build the map from an immutable record array (a snapshot image).
+    pub fn build(records: &[FileRecord]) -> Self {
+        Self::build_inner(records, true)
+    }
+
+    /// Build the map for a read-only image, omitting the previous-sibling links
+    /// that only renames need. Saves one `u32` per record while evicted.
+    pub fn build_image(records: &[FileRecord]) -> Self {
+        Self::build_inner(records, false)
+    }
+
+    fn build_inner(records: &[FileRecord], track_prev: bool) -> Self {
+        let mut index = Self {
+            first_child: vec![u32::MAX; records.len()],
+            next_sibling: vec![u32::MAX; records.len()],
+            prev_sibling: if track_prev {
+                vec![u32::MAX; records.len()]
+            } else {
+                Vec::new()
+            },
+            parentless: Vec::new(),
+        };
+        for (i, rec) in records.iter().enumerate() {
+            let idx = i as u32;
+            let parent = rec.parent;
+            if parent == u32::MAX {
+                index.parentless.push(idx);
+            } else if (parent as usize) < records.len() {
+                let p = parent as usize;
+                let head = index.first_child[p];
+                index.next_sibling[i] = head;
+                if track_prev && head != u32::MAX {
+                    index.prev_sibling[head as usize] = idx;
+                }
+                index.first_child[p] = idx;
+            }
+        }
+        index
+    }
+
+    fn reserve(&mut self, n: usize) {
+        self.first_child.reserve(n);
+        self.next_sibling.reserve(n);
+        self.prev_sibling.reserve(n);
+    }
+
+    /// Append a record, linking it into its parent's child list.
+    fn push(&mut self, idx: u32, parent: u32) {
+        self.first_child.push(u32::MAX);
+        self.next_sibling.push(u32::MAX);
+        self.prev_sibling.push(u32::MAX);
+        if parent == u32::MAX {
+            self.parentless.push(idx);
+        } else {
+            self.attach(idx, parent);
+        }
+    }
+
+    /// Prepend `idx` to `parent`'s child list.
+    fn attach(&mut self, idx: u32, parent: u32) {
+        let i = idx as usize;
+        if parent == u32::MAX {
+            self.next_sibling[i] = u32::MAX;
+            self.prev_sibling[i] = u32::MAX;
+            self.parentless.push(idx);
+            return;
+        }
+        let p = parent as usize;
+        let head = self.first_child[p];
+        self.next_sibling[i] = head;
+        self.prev_sibling[i] = u32::MAX;
+        if head != u32::MAX {
+            self.prev_sibling[head as usize] = idx;
+        }
+        self.first_child[p] = idx;
+    }
+
+    /// Unlink `idx` from `parent`'s child list.
+    fn detach(&mut self, idx: u32, parent: u32) {
+        let i = idx as usize;
+        if parent == u32::MAX {
+            if let Some(pos) = self.parentless.iter().position(|&i| i == idx) {
+                self.parentless.swap_remove(pos);
+            }
+            self.next_sibling[i] = u32::MAX;
+            self.prev_sibling[i] = u32::MAX;
+            return;
+        }
+        let prev = self.prev_sibling[i];
+        let next = self.next_sibling[i];
+        if prev != u32::MAX {
+            self.next_sibling[prev as usize] = next;
+        } else if parent != u32::MAX && self.first_child[parent as usize] == idx {
+            self.first_child[parent as usize] = next;
+        }
+        if next != u32::MAX {
+            self.prev_sibling[next as usize] = prev;
+        }
+        self.next_sibling[i] = u32::MAX;
+        self.prev_sibling[i] = u32::MAX;
+    }
+
+    /// Append `root` and its live descendants to `out`.
+    ///
+    /// Traversal is iterative so a deeply nested tree cannot overflow the
+    /// stack. A child whose `parent` no longer points at the directory is a
+    /// stale link left by a rename and is skipped, along with its subtree.
+    pub(crate) fn collect_subtree(&self, records: &[FileRecord], root: u32, out: &mut Vec<u32>) {
+        out.push(root);
+        let mut cursor = 0usize;
+        while cursor < out.len() {
+            let dir = out[cursor];
+            cursor += 1;
+            let mut child = self
+                .first_child
+                .get(dir as usize)
+                .copied()
+                .unwrap_or(u32::MAX);
+            while child != u32::MAX {
+                if records[child as usize].parent == dir {
+                    out.push(child);
+                }
+                child = self
+                    .next_sibling
+                    .get(child as usize)
+                    .copied()
+                    .unwrap_or(u32::MAX);
+            }
+        }
+    }
+
+    /// Append the records under `(key, prefix)` starting from `root`.
+    ///
+    /// Besides the linked subtree, this covers parentless records whose path
+    /// falls under the key: an orphan's immediate parent may be absent from the
+    /// index (or the key is `/`, whose descendants include every rootless
+    /// record), so it has no link from the directory record. `root` is `None`
+    /// when the path has no indexed record of its own; the parentless scan then
+    /// finds every matching subtree without walking the whole index.
+    pub(crate) fn collect_under_path(
+        &self,
+        records: &[FileRecord],
+        paths: &[u8],
+        root: Option<u32>,
+        key: &[u8],
+        prefix: &[u8],
+        out: &mut Vec<u32>,
+    ) {
+        if let Some(root) = root {
+            self.collect_subtree(records, root, out);
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        for &i in &self.parentless {
+            if Some(i) == root {
+                continue;
+            }
+            let rec = &records[i as usize];
+            if rec.is_deleted() {
+                continue;
+            }
+            buf.clear();
+            write_full_path_bytes(rec, records, paths, &mut buf);
+            if buf == key || buf.starts_with(prefix) {
+                self.collect_subtree(records, i, out);
+            }
+        }
+    }
+
+    /// Estimated resident bytes of the child-link arrays.
+    pub fn memory_bytes(&self) -> u64 {
+        ((self.first_child.len() + self.next_sibling.len() + self.prev_sibling.len())
+            * std::mem::size_of::<u32>()
+            + self.parentless.len() * std::mem::size_of::<u32>()) as u64
+    }
+
+    fn capacity_bytes(&self) -> u64 {
+        ((self.first_child.capacity()
+            + self.next_sibling.capacity()
+            + self.prev_sibling.capacity())
+            * std::mem::size_of::<u32>()
+            + self.parentless.capacity() * std::mem::size_of::<u32>()) as u64
+    }
+
+    fn shrink_to_fit(&mut self) {
+        self.first_child.shrink_to_fit();
+        self.next_sibling.shrink_to_fit();
+        self.prev_sibling.shrink_to_fit();
+        self.parentless.shrink_to_fit();
+    }
+}
+
 /// FNV-1a 32-bit hash, used to key the path index without storing the path.
 ///
 /// A 32-bit hash halves the map's per-entry cost. Collisions (two distinct paths
@@ -588,7 +806,7 @@ pub(crate) fn search_image(
     if q.is_empty() || limit == 0 {
         return SearchOutcome::default();
     }
-    let want = offset.saturating_add(limit);
+    let want = result_window(limit, offset);
     let (total, top) = if records.len() >= PARALLEL_THRESHOLD {
         scan_image_parallel(records, paths, &q, want)
     } else {
@@ -701,7 +919,7 @@ pub fn search_image_with_delta(
     if q.is_empty() || limit == 0 {
         return SearchOutcome::default();
     }
-    let want = offset.saturating_add(limit);
+    let want = result_window(limit, offset);
     let base_len = records.len() as u32;
 
     let (base_total, base_top) = if records.len() >= PARALLEL_THRESHOLD {
@@ -780,6 +998,9 @@ pub struct Index {
     paths: Vec<u8>,
     roots: Vec<Root>,
     by_path: PathIndex,
+    /// Parent -> child links, so a directory subtree can be removed or renamed
+    /// without walking every record. Kept in sync with the record vector.
+    subtree: SubtreeIndex,
     live: usize,
     /// Derived candidate-narrowing index (trigram postings, lowercased path
     /// arena, and token table). Rebuilt on compaction and snapshot load; kept
@@ -808,6 +1029,7 @@ impl Default for Index {
             paths: Vec::new(),
             roots: Vec::new(),
             by_path: PathIndex::default(),
+            subtree: SubtreeIndex::default(),
             live: 0,
             candidate: CandidateIndex::new(),
             candidate_enabled: true,
@@ -827,6 +1049,7 @@ impl Clone for Index {
             paths: self.paths.clone(),
             roots: self.roots.clone(),
             by_path: self.by_path.clone(),
+            subtree: self.subtree.clone(),
             live: self.live,
             candidate: self.candidate.clone(),
             candidate_enabled: self.candidate_enabled,
@@ -937,7 +1160,9 @@ impl Index {
         let arenas = self.paths.len();
         let map =
             self.by_path.len() * (std::mem::size_of::<u32>() + std::mem::size_of::<u32>() + 1);
-        (records + arenas + map) as u64 + self.candidate.memory_bytes()
+        (records + arenas + map) as u64
+            + self.candidate.memory_bytes()
+            + self.subtree.memory_bytes()
     }
 
     /// An estimate of the **resident** (capacity) heap memory held by the index,
@@ -948,7 +1173,9 @@ impl Index {
         let records = self.records.capacity() * std::mem::size_of::<FileRecord>();
         let arenas = self.paths.capacity();
         let map = self.by_path.capacity_bytes();
-        (records + arenas + map) as u64 + self.candidate.capacity_bytes()
+        (records + arenas + map) as u64
+            + self.candidate.capacity_bytes()
+            + self.subtree.capacity_bytes()
     }
 
     /// A per-component breakdown of the index's memory, for diagnostics.
@@ -1060,6 +1287,7 @@ impl Index {
 
         self.records = records;
         self.paths = paths;
+        self.subtree = SubtreeIndex::build(&self.records);
         self.by_path.clear();
         let mut buf: Vec<u8> = Vec::new();
         for (i, rec) in self.records.iter().enumerate() {
@@ -1077,6 +1305,7 @@ impl Index {
         self.records.shrink_to_fit();
         self.paths.shrink_to_fit();
         self.by_path.shrink_to_fit();
+        self.subtree.shrink_to_fit();
     }
 
     /// Rebuild the candidate index from the current records, dropping stale
@@ -1112,6 +1341,7 @@ impl Index {
         self.records.shrink_to_fit();
         self.paths.shrink_to_fit();
         self.by_path.shrink_to_fit();
+        self.subtree.shrink_to_fit();
         // Merge any pending tokens before releasing capacity, so the token table
         // is fully sorted and the pending buffer does not hold a second copy.
         self.candidate.finish_bulk();
@@ -1191,11 +1421,13 @@ impl Index {
         }
         candidate.finish_bulk();
         candidate.set_subtree_end(subtree_ends(&records));
+        let subtree = SubtreeIndex::build(&records);
         Self {
             records,
             paths,
             roots,
             by_path,
+            subtree,
             live,
             candidate,
             candidate_enabled: true,
@@ -1212,6 +1444,7 @@ impl Index {
         self.records.reserve(records);
         self.paths.reserve(path_bytes);
         self.by_path.reserve(records);
+        self.subtree.reserve(records);
         if self.candidate_enabled {
             self.candidate.reserve(records, path_bytes);
         }
@@ -1274,6 +1507,7 @@ impl Index {
                 depth,
                 flags,
             });
+            self.subtree.push(idx, parent);
             self.by_path
                 .insert_bytes(e.path, idx, &self.records, &self.paths);
 
@@ -1466,6 +1700,7 @@ impl Index {
             depth,
             flags,
         });
+        self.subtree.push(idx, parent);
         self.map_insert(path_str.as_ref(), idx);
         // Index the full path (not the stored basename) so a term can match the
         // parent components too. The candidate index stores it ASCII-lowercased.
@@ -1559,6 +1794,13 @@ impl Index {
     /// Records are tombstoned rather than physically removed, so the arenas stay
     /// append-only and record indices remain stable.
     pub fn remove(&mut self, path: &Path) -> bool {
+        self.remove_inner(path).0
+    }
+
+    /// Implementation of [`Index::remove`]. Returns the change flag and the
+    /// number of records visited, so tests can assert that an exact file
+    /// removal does not scan the whole index.
+    fn remove_inner(&mut self, path: &Path) -> (bool, usize) {
         let key = path.to_string_lossy();
         // For the filesystem root "/", the subtree prefix is "/" itself; for any
         // other path it is "<key>/".
@@ -1570,20 +1812,103 @@ impl Index {
         let key_bytes = key.as_bytes();
         let prefix_bytes = prefix.as_bytes();
 
+        let exact = self.find_str(key.as_ref());
+        if let Some(idx) = exact {
+            let rec = &self.records[idx as usize];
+            if !rec.is_deleted() && !rec.is_dir() {
+                // A file has no descendants, so the path map resolves the
+                // entire removal in O(1) instead of scanning every record.
+                self.records[idx as usize].flags |= FLAG_DELETED;
+                self.map_remove(key.as_ref());
+                self.live -= 1;
+                self.invalidate_cache();
+                return (true, 1);
+            }
+            if !rec.is_deleted() && rec.is_dir() {
+                // A directory's descendants are reachable through the
+                // parent -> child links, so only that subtree is visited
+                // instead of every record in the index.
+                let mut candidates: Vec<u32> = Vec::new();
+                self.subtree.collect_under_path(
+                    &self.records,
+                    &self.paths,
+                    Some(idx),
+                    key_bytes,
+                    prefix_bytes,
+                    &mut candidates,
+                );
+                let mut to_delete: Vec<u32> = Vec::new();
+                let mut buf: Vec<u8> = Vec::new();
+                let mut visited = 0usize;
+                for &i in &candidates {
+                    visited += 1;
+                    if self.records[i as usize].is_deleted() {
+                        continue;
+                    }
+                    buf.clear();
+                    write_full_path_bytes(
+                        &self.records[i as usize],
+                        &self.records,
+                        &self.paths,
+                        &mut buf,
+                    );
+                    if buf == key_bytes || buf.starts_with(prefix_bytes) {
+                        to_delete.push(i);
+                    }
+                }
+                if !to_delete.is_empty() {
+                    for &i in &to_delete {
+                        self.records[i as usize].flags |= FLAG_DELETED;
+                        buf.clear();
+                        write_full_path_bytes(
+                            &self.records[i as usize],
+                            &self.records,
+                            &self.paths,
+                            &mut buf,
+                        );
+                        self.map_remove(String::from_utf8_lossy(&buf).as_ref());
+                    }
+                    self.live -= to_delete.len();
+                    self.invalidate_cache();
+                    return (true, visited);
+                }
+            }
+        }
+        // A directory whose record was already tombstoned, or a path whose own
+        // record is missing (e.g. a test or a partial scan), may still have
+        // indexed children. Resolve them from the directory's stored subtree
+        // when the record exists, otherwise from the parentless roots and
+        // orphans, instead of scanning every record in the index.
+        let mut candidates: Vec<u32> = Vec::new();
+        self.subtree.collect_under_path(
+            &self.records,
+            &self.paths,
+            exact,
+            key_bytes,
+            prefix_bytes,
+            &mut candidates,
+        );
         let mut to_delete: Vec<u32> = Vec::new();
         let mut buf: Vec<u8> = Vec::new();
-        for (i, rec) in self.records.iter().enumerate() {
-            if rec.is_deleted() {
+        let mut visited = 0usize;
+        for &i in &candidates {
+            visited += 1;
+            if self.records[i as usize].is_deleted() {
                 continue;
             }
             buf.clear();
-            write_full_path_bytes(rec, &self.records, &self.paths, &mut buf);
+            write_full_path_bytes(
+                &self.records[i as usize],
+                &self.records,
+                &self.paths,
+                &mut buf,
+            );
             if buf == key_bytes || buf.starts_with(prefix_bytes) {
-                to_delete.push(i as u32);
+                to_delete.push(i);
             }
         }
         if to_delete.is_empty() {
-            return false;
+            return (false, visited);
         }
 
         for &i in &to_delete {
@@ -1599,7 +1924,7 @@ impl Index {
         }
         self.live -= to_delete.len();
         self.invalidate_cache();
-        true
+        (true, visited)
     }
 
     /// Rename or move `old` to `new`, updating the record and its subtree.
@@ -1612,34 +1937,89 @@ impl Index {
         let old_bytes = old_key.as_bytes();
         let old_prefix_bytes = old_prefix.as_bytes();
 
+        // The renamed record itself, if it is indexed (a directory may be
+        // renamed before its own record exists).
+        let exact = self.find_str(old_key.as_ref());
+
         let mut buf: Vec<u8> = Vec::new();
         // Capture each affected record's *old* full path now, before any record is
         // rewritten. Reconstructing it inside the mutation loop would observe the
-        // already-updated ancestor paths and compute the wrong suffix.
-        let affected: Vec<(u32, Vec<u8>)> = self
-            .records
-            .iter()
-            .enumerate()
-            .filter_map(|(i, rec)| {
-                if rec.is_deleted() {
-                    return None;
+        // already-updated ancestor paths and compute the wrong suffix. A file
+        // rename resolves through the path map; a directory (or a missing exact
+        // record) resolves through its stored subtree or the parentless roots.
+        let affected: Vec<(u32, Vec<u8>)> = match exact {
+            Some(i)
+                if !self.records[i as usize].is_deleted() && !self.records[i as usize].is_dir() =>
+            {
+                vec![(i, old_key.as_bytes().to_vec())]
+            }
+            Some(i) if !self.records[i as usize].is_deleted() => {
+                // A directory's descendants are reachable through the
+                // parent -> child links, so only that subtree is visited.
+                let mut candidates: Vec<u32> = Vec::new();
+                self.subtree.collect_under_path(
+                    &self.records,
+                    &self.paths,
+                    Some(i),
+                    old_bytes,
+                    old_prefix_bytes,
+                    &mut candidates,
+                );
+                let mut affected = Vec::new();
+                for &j in &candidates {
+                    if self.records[j as usize].is_deleted() {
+                        continue;
+                    }
+                    buf.clear();
+                    write_full_path_bytes(
+                        &self.records[j as usize],
+                        &self.records,
+                        &self.paths,
+                        &mut buf,
+                    );
+                    if buf == old_bytes || buf.starts_with(old_prefix_bytes) {
+                        affected.push((j, buf.clone()));
+                    }
                 }
-                buf.clear();
-                write_full_path_bytes(rec, &self.records, &self.paths, &mut buf);
-                if buf == old_bytes || buf.starts_with(old_prefix_bytes) {
-                    Some((i as u32, buf.clone()))
-                } else {
-                    None
+                affected
+            }
+            _ => {
+                // No usable exact record: descendants can still be parentless
+                // orphans (or linked under an already-tombstoned directory), so
+                // resolve them from the stored subtree or the parentless roots
+                // instead of scanning every record.
+                let mut candidates: Vec<u32> = Vec::new();
+                self.subtree.collect_under_path(
+                    &self.records,
+                    &self.paths,
+                    exact,
+                    old_bytes,
+                    old_prefix_bytes,
+                    &mut candidates,
+                );
+                let mut affected = Vec::new();
+                for &j in &candidates {
+                    if self.records[j as usize].is_deleted() {
+                        continue;
+                    }
+                    buf.clear();
+                    write_full_path_bytes(
+                        &self.records[j as usize],
+                        &self.records,
+                        &self.paths,
+                        &mut buf,
+                    );
+                    if buf == old_bytes || buf.starts_with(old_prefix_bytes) {
+                        affected.push((j, buf.clone()));
+                    }
                 }
-            })
-            .collect();
+                affected
+            }
+        };
         if affected.is_empty() {
             return false;
         }
 
-        // The renamed record itself, if it is indexed (a directory may be
-        // renamed before its own record exists).
-        let exact = self.find_str(old_key.as_ref());
         let new_parent = new
             .parent()
             .and_then(|p| self.find_str(p.to_string_lossy().as_ref()))
@@ -1704,6 +2084,12 @@ impl Index {
             self.records[i as usize].depth = depth;
             if is_exact {
                 self.records[i as usize].parent = new_parent;
+                if rec.parent != new_parent {
+                    // Keep the child list in sync. The old parent's link is
+                    // removed before the record is linked under the new parent.
+                    self.subtree.detach(i, rec.parent);
+                    self.subtree.attach(i, new_parent);
+                }
             }
             // Insert the new key only after the record's bytes, parent, and depth
             // are consistent, so the path map never observes a half-applied rename.
@@ -1793,7 +2179,7 @@ impl Index {
             );
         }
 
-        let want = offset.saturating_add(limit);
+        let want = result_window(limit, offset);
 
         let scan_started = Instant::now();
         // Narrow the scan to a candidate set when the query allows it. The
@@ -2041,7 +2427,7 @@ impl Index {
         if q.is_empty() || limit == 0 {
             return SearchOutcome::default();
         }
-        let want = offset.saturating_add(limit);
+        let want = result_window(limit, offset);
         let mut top = TopN::new(want);
         let mut total = 0usize;
         for (i, rec) in self.records.iter().enumerate() {
@@ -2541,6 +2927,20 @@ mod tests {
     }
 
     #[test]
+    fn enormous_offset_returns_an_empty_page_without_unbounding_the_collector() {
+        let mut index = Index::new();
+        for i in 0..20 {
+            index.insert(Path::new(&format!("/home/report-{i}.txt")), false, 1, 0);
+        }
+
+        for offset in [MAX_RESULT_WINDOW, MAX_RESULT_WINDOW + 1, usize::MAX] {
+            let out = index.search("report", 10, offset);
+            assert!(out.hits.is_empty(), "offset {offset} must return no hits");
+            assert_eq!(out.total, 20, "offset must not change the total count");
+        }
+    }
+
+    #[test]
     fn unicode_terms_match_case_insensitively() {
         let mut index = Index::new();
         index.insert(Path::new("/tmp/Ünïcode.txt"), false, 1, 0);
@@ -2573,6 +2973,106 @@ mod tests {
         index.insert(Path::new("/a.txt"), false, 1, 0);
         assert!(!index.remove(Path::new("/nope.txt")));
         assert_eq!(index.len(), 1);
+    }
+
+    #[test]
+    fn removing_one_file_does_not_scan_the_whole_index() {
+        let mut index = Index::new();
+        for i in 0..10_000 {
+            index.insert(Path::new(&format!("/data/file-{i:05}.txt")), false, 1, 0);
+        }
+
+        let (changed, visited) = index.remove_inner(Path::new("/data/file-05000.txt"));
+        assert!(changed);
+        assert_eq!(visited, 1, "an exact file removal must not scan records");
+        assert_eq!(index.len(), 9_999);
+        assert!(index.find(Path::new("/data/file-05000.txt")).is_none());
+
+        let (changed, _) = index.remove_inner(Path::new("/data/not-indexed.txt"));
+        assert!(!changed);
+    }
+
+    #[test]
+    fn removing_a_missing_path_visits_only_parentless_roots() {
+        let mut index = Index::new();
+        index.insert(Path::new("/data"), true, 0, 0);
+        for i in 0..10_000 {
+            index.insert(Path::new(&format!("/data/file-{i:05}.txt")), false, 1, 0);
+        }
+
+        let (changed, visited) = index.remove_inner(Path::new("/data/not-indexed.txt"));
+        assert!(!changed);
+        assert!(
+            visited <= 1,
+            "a missing-path removal visited {visited} records"
+        );
+    }
+
+    #[test]
+    fn removing_a_directory_visits_only_its_subtree() {
+        let mut index = Index::new();
+        index.insert(Path::new("/data"), true, 0, 0);
+        index.insert(Path::new("/other"), true, 0, 0);
+        for i in 0..10_000 {
+            index.insert(Path::new(&format!("/other/file-{i:05}.txt")), false, 1, 0);
+        }
+        // Interleave inserts under /data with unrelated records so a directory
+        // subtree cannot be found with a contiguous index range.
+        index.insert(Path::new("/data/a.txt"), false, 1, 0);
+        index.insert(Path::new("/data/sub"), true, 0, 0);
+        index.insert(Path::new("/other/late.txt"), false, 1, 0);
+        index.insert(Path::new("/data/sub/b.txt"), false, 1, 0);
+
+        let (changed, visited) = index.remove_inner(Path::new("/data"));
+        assert!(changed);
+        assert!(
+            visited <= 4,
+            "a directory removal visited {visited} records"
+        );
+        assert!(index.find(Path::new("/data/sub/b.txt")).is_none());
+        assert!(index.find(Path::new("/other/file-05000.txt")).is_some());
+        assert!(index.find(Path::new("/other/late.txt")).is_some());
+    }
+
+    #[test]
+    fn removing_a_directory_includes_orphaned_descendants() {
+        let mut index = Index::new();
+        index.insert(Path::new("/home"), true, 0, 0);
+        // The intermediate directory is not indexed, so the file has no parent
+        // link; the path prefix still places it under /home.
+        index.insert(Path::new("/home/sam/a.txt"), false, 1, 0);
+        assert!(index.remove(Path::new("/home")));
+        assert_eq!(index.len(), 0);
+        assert!(index.find(Path::new("/home/sam/a.txt")).is_none());
+    }
+
+    #[test]
+    fn renaming_a_directory_does_not_affect_interleaved_siblings() {
+        let mut index = Index::new();
+        index.insert(Path::new("/a"), true, 0, 0);
+        index.insert(Path::new("/b"), true, 0, 0);
+        index.insert(Path::new("/a/one.txt"), false, 1, 0);
+        index.insert(Path::new("/b/two.txt"), false, 1, 0);
+        index.insert(Path::new("/a/sub"), true, 0, 0);
+        index.insert(Path::new("/b/late.txt"), false, 1, 0);
+        index.insert(Path::new("/a/sub/three.txt"), false, 1, 0);
+
+        assert!(index.rename(Path::new("/a"), Path::new("/c")));
+        assert!(index.find(Path::new("/c/one.txt")).is_some());
+        assert!(index.find(Path::new("/c/sub/three.txt")).is_some());
+        assert!(index.find(Path::new("/a/one.txt")).is_none());
+        assert!(index.find(Path::new("/b/two.txt")).is_some());
+        assert!(index.find(Path::new("/b/late.txt")).is_some());
+
+        // Move a child out and back, then remove the remaining subtree: the
+        // moved child must survive even though it was linked under /b.
+        assert!(index.rename(Path::new("/c/one.txt"), Path::new("/b/one.txt")));
+        assert!(index.rename(Path::new("/b/one.txt"), Path::new("/c/one.txt")));
+        assert!(index.rename(Path::new("/c/one.txt"), Path::new("/b/one.txt")));
+        assert!(index.remove(Path::new("/c")));
+        assert!(index.find(Path::new("/b/one.txt")).is_some());
+        assert!(index.find(Path::new("/b/two.txt")).is_some());
+        assert!(index.find(Path::new("/c/sub/three.txt")).is_none());
     }
 
     #[test]

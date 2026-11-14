@@ -1,7 +1,12 @@
 name: CI
 
 on:
+  # Restrict push to the integration branches. Every other branch is covered by
+  # the pull_request trigger, so a push elsewhere would only duplicate a full
+  # ~8-job run for a tree a PR already checks. main/develop pushes (including
+  # merge commits) must still run CI on their own: there may be no PR for them.
   push:
+    branches: [main, develop]
   pull_request:
 
 env:
@@ -11,39 +16,111 @@ env:
 # Runner placement (review finding: CI cache boundary)
 #
 # The release workflow runs on the on-premise runner and carries
-# `contents: write`. Untrusted code must never execute on that runner or write
-# the `CARGO_HOME` it later reads (`config.toml` / `rustc-wrapper` would
-# persist across jobs — see the marketplace review). So:
+# `contents: write`. Code that the maintainer did not author must never
+# execute on that runner or write the `CARGO_HOME` a release reads
+# (`config.toml` / `rustc-wrapper` would persist across jobs — see the
+# marketplace review). The trust predicate used throughout this file is:
 #
-#   * pull_request jobs            -> GitHub-hosted `ubuntu-latest`
+#   (github.event_name == 'push' && github.ref == 'refs/heads/develop')
+#     || (github.event_name == 'pull_request'
+#         && github.event.pull_request.user.login == 'brrrassica')
+#
+# — i.e. develop pushes AND pull requests AUTHORED BY THE FIRST-PARTY
+# MAINTAINER (`brrrassica`, GitHub-authenticated via the event payload, so the
+# login cannot be spoofed). Everything else — main pushes, and any PR opened by
+# another account (including fork PRs) — runs on GitHub-hosted runners.
+#
+#   * pull_request by brrrassica   -> on-premise `[self-hosted, opencode-sam]`
+#   * pull_request by anyone else  -> GitHub-hosted `ubuntu-latest`
 #   * push to main                 -> GitHub-hosted `ubuntu-latest`
 #   * push to develop              -> on-premise `[self-hosted, opencode-sam]`
 #   * release (release.yml)        -> on-premise, separate `release-cache`
+#   * prepare-release (the gate)   -> on-premise, separate `gate-cache`
 #
-# Both paths run the SAME `archlinux:base-devel` image and the SAME pinned
-# toolchain (1.99.1, nightly-2026-10-22), so a build is identical wherever it
-# runs and the digest-pinned release stays reproducible on the on-prem runner.
+# Why authoring-your-PRs-on-prem is acceptable while strangers' are not: the
+# CI self-hosted volume (`ci-selfhost-cache/*`) is a SEPARATE host path from
+# both `release-cache/*` and `gate-cache/*`, so nothing any CI job writes can
+# be read by the privileged release build — the marketplace-review escalation
+# stays blocked regardless of who opens the PR. What the author gate controls
+# is only *whose code executes on the maintainer's machine at all*: maintainer
+# code yes, stranger code never.
 #
-# The `fromJSON(...)` expression selects the runner label set: an array for the
-# on-premise runner, a plain string for GitHub-hosted. It is inlined in each job
-# because `runs-on` cannot read `env`.
+# Both paths run the SAME container image and the SAME pinned toolchain
+# (1.99.1, nightly-2026-10-22), so a build is identical wherever it runs and
+# the digest-pinned release stays reproducible on the on-prem runner.
 #
-# Caches are `actions/cache` directories inside the workspace rather than host
-# bind mounts: a hosted runner has no `/home/github-runner/ci-cache`, and a
-# workspace-relative cache keyed by `Cargo.lock` works identically on both. The
-# release job never uses any of these.
+# The container image is PINNED BY DIGEST. `image: archlinux:base-devel` is a
+# floating tag; Docker re-resolves it every job, so a host that is not current
+# re-pulls a multi-hundred-MB layer set over the public uplink (bandwidth +
+# disk wear). The digest below is the image (`sha256:996c3a1d6b0d...`, built
+# 2026-10-05) the committed release digests were produced in. Rotating it is a
+# deliberate change, not a per-run re-resolution: when you bump the tag you
+# must rebuild + re-pin the release digests too, because a newer base image can
+# change the compiler inputs (the exact class of breakage the 0.2.4/0.2.5
+# release failures came from). The runner should pre-pull this digest so even a
+# cold container start reads from local disk (see docs/development.md).
+#   archlinux:base-devel @ sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
 #
-# Toolchains are PINNED: `RUSTUP_TOOLCHAIN` and the `toolchain:` input name an
-# exact release instead of a floating channel, so rustup does not re-resolve the
-# channel over the network and a newer nightly cannot force a re-download.
+# CACHE STRATEGY, by runner. The two paths are implemented as SEPARATE jobs,
+# selected by `if`, because `container.volumes:` is a list-valued key and
+# GitHub does not support `${{ fromJSON(...) }}` substitution into a list (it
+# stringifies and the value fails the schema check). So rather than one job
+# with a conditional volumes list, the self-hosted and hosted variants of the
+# three cargo-compiling jobs are split: each has a static, literal volumes/env
+# block. This is the only construct that cannot silently break every develop
+# run.
+#
+#   * GitHub-hosted (PR, main push): `actions/cache` keyed by Cargo.lock, with
+#     the cache directories inside the workspace (`$GITHUB_WORKSPACE/.ci-*`).
+#     The transfer rides Azure's internal network, so it costs the repo zero
+#     uplink bandwidth. The hosted runner has no host bind-mounts available,
+#     which is exactly why actions/cache exists for this path.
+#
+#   * Self-hosted (develop push): a dedicated HOST BIND-MOUNT cache volume at
+#     `/ci/selfhost/cargo` (host path `/home/github-runner/ci-selfhost-cache/
+#     cargo`). On a self-hosted runner `actions/cache` downloads AND re-uploads
+#     gigabyte-scale rustup + target caches over the public uplink, measured at
+#     full line rate — confirmed on develop run 42980816385: "Restore the Rust
+#     toolchain cache" ~3 min, "Restore the build cache" ~3.5 min. The bind-
+#     mount keeps those bytes on local disk, so a warm run crosses the network
+#     ZERO times (no restore step at all), and a cold run pulls only the pinned
+#     toolchain from static.rust-lang.org once. This mirrors what release.yml
+#     already does for its own caches.
+#
+# The three on-prem caches live on deliberately SEPARATE host paths so no
+# workflow can read or write another's cache — the persistence escalation the
+# marketplace review flagged. CI's `ci-selfhost-cache/*` is neither
+# `release-cache/*` nor `gate-cache/*`; nothing a develop CI job leaves in its
+# cargo config can be seen by the write-privileged release build. A PR job can
+# only run on GitHub-hosted and can never mount a host volume at all.
+#
+#   release.yml           -> /home/github-runner/release-cache
+#   prepare-release.yml   -> /home/github-runner/gate-cache
+#   ci.yml (this file)    -> /home/github-runner/ci-selfhost-cache
+#
+# `qml`, `smoke`, `bench`, `checksums-superset`, `audit` do not recompile the
+# workspace, so they have no gigabyte cache to round-trip: their `pacman`
+# payload is a few MB. They stay single jobs that run on both paths unchanged.
+#
+# Toolchains stay PINNED (rustup, not the floating Arch `rust` package):
+# `RUSTUP_TOOLCHAIN` and the `toolchain:` input name an exact release, so
+# rustup never re-resolves the channel over the network and a newer nightly
+# cannot force a re-download. Keeping rustup (rather than the Arch `rust`
+# package) also avoids the "mirror floats the package revision" failure the
+# gate comments warn about.
 # ---------------------------------------------------------------------------
 
 jobs:
+  # =========================================================================
+  # GitHub-hosted variants (PR + push to main) — unchanged actions/cache flow.
+  # =========================================================================
   build:
-    name: fmt, clippy, test, build (Arch)
-    runs-on: ${{ fromJSON((github.event_name == 'push' && github.ref == 'refs/heads/develop') && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
+    name: fmt, clippy, test, build (hosted, Arch)
+    if: ${{ !((github.event_name == 'push' && github.ref == 'refs/heads/develop') || (github.event_name == 'pull_request' && github.event.pull_request.user.login == 'brrrassica')) }}
+    runs-on: ubuntu-latest
     container:
-      image: archlinux:base-devel
+      # archlinux:base-devel pinned by digest; see the header comment.
+      image: archlinux@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
     env:
       CARGO_HOME: ${{ github.workspace }}/.ci-cargo
       RUSTUP_HOME: ${{ github.workspace }}/.ci-rustup
@@ -100,21 +177,119 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      # `cargo test` compiles every workspace target (bins included) before
+      # running, so a separate `cargo build` step afterwards would re-derive
+      # nothing new: it is dropped, not the coverage.
       - name: Test
         run: cargo test --all-features
 
       - name: Test (release)
         run: cargo test --release --all-features
 
-      - name: Build
-        run: cargo build --all-features
+  # =========================================================================
+  # Self-hosted variant (push to develop) — bind-mount caches, no uplink
+  # round-trip. Same steps as `build`; no actions/cache restore steps.
+  # =========================================================================
+  build-self-hosted:
+    name: fmt, clippy, test, build (self-hosted, Arch)
+    if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/develop') || (github.event_name == 'pull_request' && github.event.pull_request.user.login == 'brrrassica') }}
+    runs-on: [self-hosted, opencode-sam]
+    container:
+      image: archlinux@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
+      volumes:
+        - /home/github-runner/ci-selfhost-cache/pacman-pkg:/var/cache/pacman/pkg
+        - /home/github-runner/ci-selfhost-cache/locks:/ci/selfhost/locks
+        # One shared cargo+rustup+target volume for all CI develop jobs. It is
+        # NOT release-cache and NOT gate-cache: nothing it holds can reach the
+        # privileged release build. cargo still serializes any two jobs that
+        # touch the same build dir; these develop jobs already ran serially via
+        # needs, and the win here is local bytes instead of an uplink download.
+        - /home/github-runner/ci-selfhost-cache/cargo:/ci/selfhost/cargo
+    env:
+      CARGO_HOME: /ci/selfhost/cargo/.ci-cargo
+      RUSTUP_HOME: /ci/selfhost/cargo/.ci-rustup
+      RUSTUP_TOOLCHAIN: 1.99.1
+      CARGO_TARGET_DIR: /ci/selfhost/cargo/.ci-target/${{ github.job }}/${{ github.event_name }}-${{ github.ref_name }}
+    steps:
+      - name: Check the runner prerequisites
+        # The three host paths must already exist on the runner (created once by
+        # the maintainer; see docs/development.md). If a mount is missing Docker
+        # silently creates it root-owned or fails, and the failure surfaces as an
+        # obscure mount or cargo error halfway through. Fail fast with the exact
+        # `mkdir -p` commands instead.
+        run: |
+          set -euo pipefail
+          missing=0
+          for dir in /var/cache/pacman/pkg /ci/selfhost/locks /ci/selfhost/cargo; do
+            if [[ ! -d "$dir" ]]; then
+              echo "error: runner volume is not mounted: $dir" >&2
+              missing=1
+            fi
+          done
+          if [[ "$missing" -ne 0 ]]; then
+            {
+              echo ""
+              echo "The self-hosted runner is missing a required CI cache volume. Create:"
+              echo ""
+              echo "    sudo mkdir -p /home/github-runner/ci-selfhost-cache/{pacman-pkg,locks,cargo}"
+              echo ""
+              echo "These are separate from release-cache/ and gate-cache/ on purpose:"
+              echo "no CI job may write a cache the privileged release build later reads."
+            } >&2
+            exit 1
+          fi
+          echo "runner CI cache volumes present"
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          flock /ci/selfhost/locks/pacman.lock \
+            pacman -Syu --noconfirm --needed --overwrite '*' git curl
+
+      - uses: actions/checkout@v4
+
+      # No actions/cache steps: the cargo/rustup/target caches are the
+      # bind-mounted /ci/selfhost/cargo volume and survive on local disk across
+      # runs. The first run ever populates them; every later run reads/writes
+      # them locally, crossing the uplink zero bytes.
+      - name: Point target/ at the cache
+        run: |
+          mkdir -p "$CARGO_TARGET_DIR"
+          rm -rf target
+          ln -s "$CARGO_TARGET_DIR" target
+
+      - name: Put the cargo/rustup shims on PATH
+        run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+          components: rustfmt, clippy
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --all-features
+
+      - name: Test (release)
+        run: cargo test --release --all-features
 
   qml:
     name: qmllint (Arch)
-    runs-on: ${{ fromJSON((github.event_name == 'push' && github.ref == 'refs/heads/develop') && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
+    runs-on: ${{ fromJSON(((github.event_name == 'push' && github.ref == 'refs/heads/develop') || (github.event_name == 'pull_request' && github.event.pull_request.user.login == 'brrrassica')) && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
     container:
-      image: archlinux:base-devel
-    needs: build
+      # archlinux:base-devel pinned by digest; see the header comment.
+      image: archlinux@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
+    # qmllint consumes no build output (it checks out and lints shell/*.qml),
+    # so it runs in parallel with the Rust jobs instead of behind the heaviest
+    # one. On the develop path this lands on the on-premise runner with no
+    # bind-mount: its only network cost is the few-MB qt6-declarative payload,
+    # not a gigabyte cache. Kept as a single job on purpose (see the header).
     steps:
       - name: Install dependencies
         run: pacman -Syu --noconfirm --needed --overwrite '*' git qt6-declarative
@@ -124,11 +299,18 @@ jobs:
       - name: Lint the shell plugin QML
         run: scripts/lint-qml.sh
 
+  # =========================================================================
+  # fuzz — hosted variant (actions/cache) and self-hosted variant (bind-mount).
+  # Nightly cannot come from the Arch `rust` package, so both keep rustup; the
+  # self-hosted run pulls the pinned nightly from static.rust-lang.org once and
+  # caches it on the local volume.
+  # =========================================================================
   fuzz:
-    name: fuzz (smoke, Arch)
-    runs-on: ${{ fromJSON((github.event_name == 'push' && github.ref == 'refs/heads/develop') && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
+    name: fuzz (smoke, hosted, Arch)
+    if: ${{ !((github.event_name == 'push' && github.ref == 'refs/heads/develop') || (github.event_name == 'pull_request' && github.event.pull_request.user.login == 'brrrassica')) }}
+    runs-on: ubuntu-latest
     container:
-      image: archlinux:base-devel
+      image: archlinux@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
     env:
       CARGO_HOME: ${{ github.workspace }}/.ci-cargo
       RUSTUP_HOME: ${{ github.workspace }}/.ci-rustup
@@ -183,7 +365,87 @@ jobs:
           toolchain: nightly-2026-10-22
 
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        # CARGO_HOME is cached above, so a previously installed cargo-fuzz
+        # survives across runs; only compile it when the shim is missing.
+        run: command -v cargo-fuzz >/dev/null 2>&1 || cargo install cargo-fuzz --locked
+
+      - name: Fuzz the snapshot loader
+        working-directory: fuzz
+        run: cargo fuzz run snapshot_decode -- -max_total_time=60 -rss_limit_mb=2048
+
+      - name: Fuzz the protocol parser
+        working-directory: fuzz
+        run: cargo fuzz run protocol_parse -- -max_total_time=60 -rss_limit_mb=2048
+
+  fuzz-self-hosted:
+    name: fuzz (smoke, self-hosted, Arch)
+    if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/develop') || (github.event_name == 'pull_request' && github.event.pull_request.user.login == 'brrrassica') }}
+    runs-on: [self-hosted, opencode-sam]
+    container:
+      image: archlinux@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
+      volumes:
+        - /home/github-runner/ci-selfhost-cache/pacman-pkg:/var/cache/pacman/pkg
+        - /home/github-runner/ci-selfhost-cache/locks:/ci/selfhost/locks
+        - /home/github-runner/ci-selfhost-cache/cargo:/ci/selfhost/cargo
+    env:
+      CARGO_HOME: /ci/selfhost/cargo/.ci-cargo
+      RUSTUP_HOME: /ci/selfhost/cargo/.ci-rustup
+      RUSTUP_TOOLCHAIN: nightly-2026-10-22
+      CARGO_TARGET_DIR: /ci/selfhost/cargo/.ci-target/${{ github.job }}/${{ github.event_name }}-${{ github.ref_name }}
+    steps:
+      - name: Check the runner prerequisites
+        run: |
+          set -euo pipefail
+          missing=0
+          for dir in /var/cache/pacman/pkg /ci/selfhost/locks /ci/selfhost/cargo; do
+            if [[ ! -d "$dir" ]]; then
+              echo "error: runner volume is not mounted: $dir" >&2
+              missing=1
+            fi
+          done
+          if [[ "$missing" -ne 0 ]]; then
+            {
+              echo ""
+              echo "The self-hosted runner is missing a required CI cache volume. Create:"
+              echo ""
+              echo "    sudo mkdir -p /home/github-runner/ci-selfhost-cache/{pacman-pkg,locks,cargo}"
+              echo ""
+              echo "Separate from release-cache/ and gate-cache/ on purpose."
+            } >&2
+            exit 1
+          fi
+          echo "runner CI cache volumes present"
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          flock /ci/selfhost/locks/pacman.lock \
+            pacman -Syu --noconfirm --needed --overwrite '*' git curl
+
+      - uses: actions/checkout@v4
+
+      - name: Point target/ at the cache
+        run: |
+          mkdir -p "$CARGO_TARGET_DIR"
+          rm -rf target
+          ln -s "$CARGO_TARGET_DIR" target
+      - name: Point the fuzz target dir at the cache
+        run: |
+          rm -rf fuzz/target
+          ln -s "$CARGO_TARGET_DIR" fuzz/target
+
+      - name: Put the cargo/rustup shims on PATH
+        run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-22
+
+      - name: Install cargo-fuzz
+        # CARGO_HOME is the bind-mounted local cache, so a previously installed
+        # cargo-fuzz survives across runs; only compile it when missing.
+        run: command -v cargo-fuzz >/dev/null 2>&1 || cargo install cargo-fuzz --locked
 
       - name: Fuzz the snapshot loader
         working-directory: fuzz
@@ -208,7 +470,7 @@ jobs:
   # mask a loss.
   checksums-superset:
     name: daemon-checksums.txt is a superset of main
-    runs-on: ${{ fromJSON((github.event_name == 'push' && github.ref == 'refs/heads/develop') && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
+    runs-on: ${{ fromJSON(((github.event_name == 'push' && github.ref == 'refs/heads/develop') || (github.event_name == 'pull_request' && github.event.pull_request.user.login == 'brrrassica')) && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -256,7 +518,7 @@ jobs:
 
   audit:
     name: cargo audit
-    runs-on: ${{ fromJSON((github.event_name == 'push' && github.ref == 'refs/heads/develop') && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
+    runs-on: ${{ fromJSON(((github.event_name == 'push' && github.ref == 'refs/heads/develop') || (github.event_name == 'pull_request' && github.event.pull_request.user.login == 'brrrassica')) && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
     permissions:
       contents: read
       issues: write
@@ -275,128 +537,112 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  # The smoke test exercises install -> use -> uninstall against the SAME
+  # release binaries the `package` job built and published as artifacts, instead
+  # of recompiling the workspace a third time. It stays a full E2E check; only
+  # the redundant compilation is removed. `needs` references the job that
+  # produces the artifacts on the matching path (package-hosted or
+  # package-self-hosted); each is skipped on the other path, so a skipped
+  # `needs` parent does not block this job (GitHub treats a skipped dependency
+  # as satisfied by default).
   smoke:
     name: install/uninstall smoke (Arch)
-    runs-on: ${{ fromJSON((github.event_name == 'push' && github.ref == 'refs/heads/develop') && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
+    runs-on: ${{ fromJSON(((github.event_name == 'push' && github.ref == 'refs/heads/develop') || (github.event_name == 'pull_request' && github.event.pull_request.user.login == 'brrrassica')) && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
     container:
-      image: archlinux:base-devel
+      image: archlinux@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
+    needs: [package, package-self-hosted]
+    # A `needs` job is skipped by default when ANY required job was skipped.
+    # On a PR/main run `package-self-hosted` is skipped, and on a develop run
+    # `package` is skipped, so without this guard the smoke test would itself be
+    # skipped on every run — a silent loss of the E2E install/uninstall check.
+    # Run whenever the package job for THIS path succeeded; if that job failed
+    # this does not run, and if it produced no artifacts the download step fails.
+    if: ${{ always() && (needs.package.result == 'success' || needs.package-self-hosted.result == 'success') }}
     env:
-      CARGO_HOME: ${{ github.workspace }}/.ci-cargo
-      RUSTUP_HOME: ${{ github.workspace }}/.ci-rustup
-      RUSTUP_TOOLCHAIN: 1.99.1
-      CARGO_TARGET_DIR: ${{ github.workspace }}/.ci-target/${{ github.job }}/${{ github.event_name }}-${{ github.ref_name }}
-    needs: build
+      # The binaries arrive via the run-scoped artifact above; ci-smoke.sh
+      # skips its own cargo build (and fails closed if they are missing).
+      OMAVR_SMOKE_SKIP_BUILD: 1
     steps:
       - name: Install dependencies
-        run: pacman -Syu --noconfirm --needed --overwrite '*' git curl zip
+        run: pacman -Syu --noconfirm --needed --overwrite '*' git curl zip unzip
 
       - uses: actions/checkout@v4
 
-      - name: Restore the Cargo registry cache
-        uses: actions/cache@v4
+      # The release binaries built once by `package`. Artifacts are scoped to
+      # this workflow run, so no state is shared with any other run or any
+      # privileged context.
+      - name: Download the release binaries
+        uses: actions/download-artifact@v4
         with:
-          path: ${{ env.CARGO_HOME }}
-          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-
+          name: omavrything-release-binaries
+          path: bin
 
-      - name: Restore the Rust toolchain cache
-        uses: actions/cache@v4
+      - name: Make the downloaded binaries executable
+        run: chmod +x bin/omavrythingd bin/omavry
+
+      # The archive produced by `package`, so the smoke test's archive-content
+      # assertions run against the exact bytes that were built instead of
+      # silently skipping.
+      - name: Download the release archive
+        uses: actions/download-artifact@v4
         with:
-          path: ${{ env.RUSTUP_HOME }}
-          key: rustup-${{ runner.os }}-${{ env.RUSTUP_TOOLCHAIN }}
-          restore-keys: rustup-${{ runner.os }}-
-
-      - name: Restore the build cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.CARGO_TARGET_DIR }}
-          key: target-${{ runner.os }}-${{ github.job }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: target-${{ runner.os }}-${{ github.job }}-
-
-      - name: Point target/ at the cache
-        run: |
-          mkdir -p "$CARGO_TARGET_DIR"
-          rm -rf target
-          ln -s "$CARGO_TARGET_DIR" target
-      - name: Put the cargo/rustup shims on PATH
-        run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.99.1
+          name: omavrything-release-archive
+          path: dist
 
       - name: Run the install/uninstall smoke test
         run: scripts/ci-smoke.sh
 
+  # The performance budgets run against the SAME release binaries `package`
+  # built, instead of triggering a third full release compilation. The budget
+  # assertions themselves are unchanged.
   bench:
     name: performance budgets (Arch)
-    runs-on: ${{ fromJSON((github.event_name == 'push' && github.ref == 'refs/heads/develop') && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
+    runs-on: ${{ fromJSON(((github.event_name == 'push' && github.ref == 'refs/heads/develop') || (github.event_name == 'pull_request' && github.event.pull_request.user.login == 'brrrassica')) && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
     container:
-      image: archlinux:base-devel
-    env:
-      CARGO_HOME: ${{ github.workspace }}/.ci-cargo
-      RUSTUP_HOME: ${{ github.workspace }}/.ci-rustup
-      RUSTUP_TOOLCHAIN: 1.99.1
-      CARGO_TARGET_DIR: ${{ github.workspace }}/.ci-target/${{ github.job }}/${{ github.event_name }}-${{ github.ref_name }}
-    needs: build
+      image: archlinux@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
+    needs: [package, package-self-hosted]
+    # Same guard as `smoke`: the package job for the other path is skipped, so a
+    # plain `needs` would silently skip the performance budgets on every run.
+    if: ${{ always() && (needs.package.result == 'success' || needs.package-self-hosted.result == 'success') }}
     steps:
       - name: Install dependencies
         run: pacman -Syu --noconfirm --needed --overwrite '*' git curl python
 
       - uses: actions/checkout@v4
 
-      - name: Restore the Cargo registry cache
-        uses: actions/cache@v4
+      # The release binaries built once by `package`, run-scoped artifacts only.
+      - name: Download the release binaries
+        uses: actions/download-artifact@v4
         with:
-          path: ${{ env.CARGO_HOME }}
-          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-
+          name: omavrything-release-binaries
+          path: bin
 
-      - name: Restore the Rust toolchain cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.RUSTUP_HOME }}
-          key: rustup-${{ runner.os }}-${{ env.RUSTUP_TOOLCHAIN }}
-          restore-keys: rustup-${{ runner.os }}-
-
-      - name: Restore the build cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.CARGO_TARGET_DIR }}
-          key: target-${{ runner.os }}-${{ github.job }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: target-${{ runner.os }}-${{ github.job }}-
-
-      - name: Point target/ at the cache
-        run: |
-          mkdir -p "$CARGO_TARGET_DIR"
-          rm -rf target
-          ln -s "$CARGO_TARGET_DIR" target
-      - name: Put the cargo/rustup shims on PATH
-        run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.99.1
-
-      - name: Build the daemon and CLI (release)
-        run: cargo build --release -p omavrythingd -p omavrything-cli
+      - name: Make the downloaded binaries executable
+        run: chmod +x bin/omavrythingd bin/omavry
 
       - name: Run the performance budgets
         run: scripts/benchmark.sh --quick --hermetic --budgets
 
+  # =========================================================================
+  # package — the SINGLE release build of the run. `scripts/package-release.sh`
+  # calls `scripts/build.sh`, which compiles the release workspace and stages
+  # bin/. smoke and bench download the staged binaries instead of recompiling
+  # them; the archive + .sha256 remain this job's outputs. It does not wait for
+  # `build`: fmt/clippy/tests gate nothing here and the two run in parallel.
+  # Split into hosted + self-hosted variants so the self-hosted run caches on a
+  # local bind-mount volume instead of the uplink.
+  # =========================================================================
   package:
-    name: package release archive (Arch)
-    runs-on: ${{ fromJSON((github.event_name == 'push' && github.ref == 'refs/heads/develop') && '["self-hosted","opencode-sam"]' || '"ubuntu-latest"') }}
+    name: build + package release archive (hosted, Arch)
+    if: ${{ !((github.event_name == 'push' && github.ref == 'refs/heads/develop') || (github.event_name == 'pull_request' && github.event.pull_request.user.login == 'brrrassica')) }}
+    runs-on: ubuntu-latest
     container:
-      image: archlinux:base-devel
+      image: archlinux@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
     env:
       CARGO_HOME: ${{ github.workspace }}/.ci-cargo
       RUSTUP_HOME: ${{ github.workspace }}/.ci-rustup
       RUSTUP_TOOLCHAIN: 1.99.1
       CARGO_TARGET_DIR: ${{ github.workspace }}/.ci-target/${{ github.job }}/${{ github.event_name }}-${{ github.ref_name }}
-    needs: build
     steps:
       - name: Install dependencies
         run: pacman -Syu --noconfirm --needed --overwrite '*' git curl zip
@@ -440,12 +686,102 @@ jobs:
       - name: Build the release archive
         run: scripts/package-release.sh
 
+      # Run-scoped artifacts: only jobs in THIS run can consume them, so no
+      # state crosses a workflow boundary (unlike the release-cache volumes,
+      # which are deliberately shared with nothing).
+      - name: Upload the release binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: omavrything-release-binaries
+          path: |
+            bin/omavrythingd
+            bin/omavry
+
       - name: Upload the release archive
         uses: actions/upload-artifact@v4
         with:
           name: omavrything-release-archive
           # Include the .sha256 asset: scripts/fetch-daemon.sh verifies the
           # archive against it before installing the binaries as root.
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
+
+  package-self-hosted:
+    name: build + package release archive (self-hosted, Arch)
+    if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/develop') || (github.event_name == 'pull_request' && github.event.pull_request.user.login == 'brrrassica') }}
+    runs-on: [self-hosted, opencode-sam]
+    container:
+      image: archlinux@sha256:996c3a1d6b0d87b01242f6fcd8cfa3ad3eece1a67ab5c8f108e20af1d7b97bdd
+      volumes:
+        - /home/github-runner/ci-selfhost-cache/pacman-pkg:/var/cache/pacman/pkg
+        - /home/github-runner/ci-selfhost-cache/locks:/ci/selfhost/locks
+        - /home/github-runner/ci-selfhost-cache/cargo:/ci/selfhost/cargo
+    env:
+      CARGO_HOME: /ci/selfhost/cargo/.ci-cargo
+      RUSTUP_HOME: /ci/selfhost/cargo/.ci-rustup
+      RUSTUP_TOOLCHAIN: 1.99.1
+      CARGO_TARGET_DIR: /ci/selfhost/cargo/.ci-target/${{ github.job }}/${{ github.event_name }}-${{ github.ref_name }}
+    steps:
+      - name: Check the runner prerequisites
+        run: |
+          set -euo pipefail
+          missing=0
+          for dir in /var/cache/pacman/pkg /ci/selfhost/locks /ci/selfhost/cargo; do
+            if [[ ! -d "$dir" ]]; then
+              echo "error: runner volume is not mounted: $dir" >&2
+              missing=1
+            fi
+          done
+          if [[ "$missing" -ne 0 ]]; then
+            {
+              echo ""
+              echo "The self-hosted runner is missing a required CI cache volume. Create:"
+              echo ""
+              echo "    sudo mkdir -p /home/github-runner/ci-selfhost-cache/{pacman-pkg,locks,cargo}"
+              echo ""
+              echo "Separate from release-cache/ and gate-cache/ on purpose."
+            } >&2
+            exit 1
+          fi
+          echo "runner CI cache volumes present"
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          flock /ci/selfhost/locks/pacman.lock \
+            pacman -Syu --noconfirm --needed --overwrite '*' git curl zip
+
+      - uses: actions/checkout@v4
+
+      - name: Point target/ at the cache
+        run: |
+          mkdir -p "$CARGO_TARGET_DIR"
+          rm -rf target
+          ln -s "$CARGO_TARGET_DIR" target
+      - name: Put the cargo/rustup shims on PATH
+        run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+
+      - name: Build the release archive
+        run: scripts/package-release.sh
+
+      - name: Upload the release binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: omavrything-release-binaries
+          path: |
+            bin/omavrythingd
+            bin/omavry
+
+      - name: Upload the release archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: omavrything-release-archive
           path: |
             dist/*.zip
             dist/*.zip.sha256

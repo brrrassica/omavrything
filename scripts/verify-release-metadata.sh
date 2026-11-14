@@ -21,7 +21,7 @@
 #   scripts/verify-release-metadata.sh [version]
 #
 # `version` defaults to the workspace version in Cargo.toml. Pass the tag's
-# version (e.g. 0.2.6) in CI.
+# version (e.g. 0.2.7) in CI.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

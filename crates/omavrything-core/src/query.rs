@@ -36,19 +36,28 @@ impl Query {
 pub struct Term {
     ascii: Option<Vec<u8>>,
     unicode: Option<String>,
+    /// Whether the raw term contains `/`, and so can span the boundary between
+    /// a parent directory's path and a file's basename. Computed once at parse
+    /// time so the per-record boundary check is a single branch.
+    spans_boundary: bool,
 }
 
 impl Term {
     fn new(raw: &str) -> Self {
+        // Lowercasing preserves `/` (ASCII), so the flag is the same for the
+        // lowered needle and the raw term.
+        let spans_boundary = raw.contains('/');
         if raw.is_ascii() {
             Self {
                 ascii: Some(raw.to_ascii_lowercase().into_bytes()),
                 unicode: None,
+                spans_boundary,
             }
         } else {
             Self {
                 ascii: None,
                 unicode: Some(raw.to_lowercase()),
+                spans_boundary,
             }
         }
     }
@@ -140,27 +149,53 @@ impl Term {
     /// The position where this term spans the `parent`/`name` separator, if any.
     ///
     /// `sep` is `/` for a normal parent, or empty for the filesystem root `/`
-    /// (which already ends with a separator). Only ASCII terms are checked.
+    /// (which already ends with a separator).
+    ///
+    /// The check is gated on the parse-time `spans_boundary` flag: terms
+    /// without `/` -- the overwhelming majority -- cost a single branch and
+    /// never reach the separator scan, so the fix for matching non-ASCII terms
+    /// across the boundary adds no per-record work for them. A non-ASCII term
+    /// containing `/` takes a cold fallback that lowercases the two slices and
+    /// searches their concatenation; its per-record allocation matches the
+    /// existing non-ASCII `find`/`find_lower` path and only runs while such a
+    /// term is queried.
     fn find_boundary(&self, parent: &[u8], name: &[u8], sep: &[u8]) -> Option<usize> {
-        let needle = self.ascii.as_ref()?;
-        for i in 0..=needle.len() {
-            if i + sep.len() > needle.len() {
-                break;
-            }
-            if &needle[i..i + sep.len()] != sep {
-                continue;
-            }
-            let left = &needle[..i];
-            let right = &needle[i + sep.len()..];
-            if parent.len() >= left.len()
-                && parent[parent.len() - left.len()..].eq_ignore_ascii_case(left)
-                && name.len() >= right.len()
-                && name[..right.len()].eq_ignore_ascii_case(right)
-            {
-                return Some(parent.len() - left.len());
-            }
+        if !self.spans_boundary {
+            return None;
         }
-        None
+        if let Some(needle) = &self.ascii {
+            for i in 0..=needle.len() {
+                if i + sep.len() > needle.len() {
+                    break;
+                }
+                if &needle[i..i + sep.len()] != sep {
+                    continue;
+                }
+                let left = &needle[..i];
+                let right = &needle[i + sep.len()..];
+                if parent.len() >= left.len()
+                    && parent[parent.len() - left.len()..].eq_ignore_ascii_case(left)
+                    && name.len() >= right.len()
+                    && name[..right.len()].eq_ignore_ascii_case(right)
+                {
+                    return Some(parent.len() - left.len());
+                }
+            }
+            None
+        } else if let Some(needle) = &self.unicode {
+            // The needle is already lowercase. Lowercasing the slices makes the
+            // comparison Unicode-aware. The returned byte position is the one
+            // in the lowercased concatenation, which can differ from the
+            // original path's when case folding changes a byte length (e.g.
+            // `İ`); the position only feeds ranking, and this is the cold path.
+            let parent_lower = String::from_utf8_lossy(parent).to_lowercase();
+            let name_lower = String::from_utf8_lossy(name).to_lowercase();
+            let sep_str = std::str::from_utf8(sep).unwrap_or("");
+            let full = format!("{parent_lower}{sep_str}{name_lower}");
+            full.find(needle.as_str())
+        } else {
+            None
+        }
     }
 }
 
@@ -321,6 +356,37 @@ mod tests {
     fn unicode_term_matches_case_insensitively() {
         let t = Term::new("ÜNÏCODE");
         assert_eq!(t.find("/tmp/ünïcode.txt".as_bytes()), Some(5));
+    }
+
+    #[test]
+    fn unicode_term_spans_the_boundary_case_insensitively() {
+        // A non-ASCII term containing `/` must match across the parent/name
+        // boundary, in both `find_in_file_path` (raw scan) and
+        // `find_in_file_path_lower` (the candidate index's lowercased arena).
+        let parent = "/home/sam/café";
+        let name = "report.pdf";
+        let pos = parent.len() - "café".len();
+
+        assert_eq!(
+            Term::new("café/report").find_in_file_path(parent.as_bytes(), name.as_bytes(), b"/"),
+            Some(pos)
+        );
+        // Case-insensitive in both halves of the term.
+        assert_eq!(
+            Term::new("CAFÉ/Report").find_in_file_path(parent.as_bytes(), name.as_bytes(), b"/"),
+            Some(pos)
+        );
+        assert_eq!(
+            Term::new("café/report")
+                .find_in_file_path_lower(parent.as_bytes(), name.as_bytes(), b"/")
+                .map(|(p, _)| p),
+            Some(pos)
+        );
+        // No match when the right half does not fit the basename.
+        assert_eq!(
+            Term::new("café/notes").find_in_file_path(parent.as_bytes(), name.as_bytes(), b"/"),
+            None
+        );
     }
 
     #[test]

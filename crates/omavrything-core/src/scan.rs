@@ -315,6 +315,7 @@ pub fn scan_into_index(index: &mut Index, config: &ScanConfig) -> ScanReport {
                 errors: &errors,
                 cancel: None,
                 deadline: root_deadline(&mount_table, root),
+                coverage: None,
             };
             walk(root, &ctx)
         })
@@ -373,6 +374,7 @@ pub fn scan_subtree(index: &mut Index, root: &Path, config: &ScanConfig) {
         errors: &errors,
         cancel: None,
         deadline: root_deadline(&mount_table, root),
+        coverage: None,
     };
     let mut buffer = walk(root, &ctx);
 
@@ -412,6 +414,7 @@ pub fn scan_subtree_into_delta(delta: &mut DeltaIndex, root: &Path, config: &Sca
         errors: &errors,
         cancel: None,
         deadline: root_deadline(&mount_table, root),
+        coverage: None,
     };
     let mut buffer = walk(root, &ctx);
     buffer.sort();
@@ -421,8 +424,66 @@ pub fn scan_subtree_into_delta(delta: &mut DeltaIndex, root: &Path, config: &Sca
     }
 }
 
+/// What one root's walk actually covered, so reconciliation can distinguish a
+/// record that is absent from one the walk never looked for (issue #71).
+struct RootCoverage {
+    root: PathBuf,
+    /// True when every directory under `root` was visited, i.e. the walk ended
+    /// without cancellation, a deadline, or a read failure.
+    complete: bool,
+    /// Subtrees the walk deliberately did not descend into: removable media,
+    /// nested mount boundaries, and traversal cycles.
+    pruned: Vec<PathBuf>,
+}
+
+impl RootCoverage {
+    /// Whether this walk established that `path` does not exist: the path is
+    /// inside this root, the root was fully traversed, and the path is not in a
+    /// subtree the walk deliberately skipped.
+    fn established_absent(&self, path: &Path) -> bool {
+        self.complete
+            && path.starts_with(&self.root)
+            && !self.pruned.iter().any(|p| path.starts_with(p))
+    }
+}
+
+/// Interior-mutable coverage accumulator shared by the recursive `walk` calls
+/// of one root. Finalized into a [`RootCoverage`] when the walk returns.
+struct WalkCoverage {
+    incomplete: AtomicBool,
+    pruned: Mutex<Vec<PathBuf>>,
+}
+
+impl WalkCoverage {
+    fn new() -> Self {
+        Self {
+            incomplete: AtomicBool::new(false),
+            pruned: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn mark_incomplete(&self) {
+        self.incomplete.store(true, Ordering::Relaxed);
+    }
+
+    fn prune(&self, path: &Path) {
+        if let Ok(mut pruned) = self.pruned.lock() {
+            pruned.push(path.to_path_buf());
+        }
+    }
+
+    fn finish(self, root: &Path) -> RootCoverage {
+        RootCoverage {
+            root: root.to_path_buf(),
+            complete: !self.incomplete.load(Ordering::Relaxed),
+            pruned: self.pruned.into_inner().unwrap_or_else(|e| e.into_inner()),
+        }
+    }
+}
+
 /// A prepared rescan: the entries discovered by walking the roots, the roots
-/// themselves, and the traversal error count.
+/// themselves, the traversal error count, and how much of each root the walk
+/// actually visited.
 ///
 /// Produced by [`plan_rescan`], which performs the (I/O-bound) filesystem
 /// traversal, and consumed by [`apply_rescan`], which reconciles the index. The
@@ -432,6 +493,7 @@ pub fn scan_subtree_into_delta(delta: &mut DeltaIndex, root: &Path, config: &Sca
 pub struct RescanPlan {
     entries: WalkBuffer,
     roots: Vec<(PathBuf, FsKind)>,
+    coverage: Vec<RootCoverage>,
     errors: usize,
     /// A bounded sample of the failing paths (A2).
     pub error_paths: Vec<String>,
@@ -451,11 +513,12 @@ pub fn plan_rescan_cancellable(config: &ScanConfig, cancel: Option<&ScanCancel>)
     let errors = ScanErrors::new();
     let boundaries = mount_boundaries();
     let mount_table = mounts::read_mounts().unwrap_or_default();
-    let mut entries = roots
+    let (mut entries, coverage) = roots
         .par_iter()
         .map(|(root, _)| {
             let root_dev = fs::metadata(root).map(|m| m.dev()).ok();
             let visited = Mutex::new(HashSet::new());
+            let coverage = WalkCoverage::new();
             let ctx = WalkCtx {
                 root,
                 root_dev,
@@ -467,18 +530,32 @@ pub fn plan_rescan_cancellable(config: &ScanConfig, cancel: Option<&ScanCancel>)
                 errors: &errors,
                 cancel,
                 deadline: root_deadline(&mount_table, root),
+                coverage: Some(&coverage),
             };
-            walk(root, &ctx)
+            (walk(root, &ctx), coverage.finish(root))
         })
-        .reduce(WalkBuffer::default, |mut a, b| {
-            a.merge(b);
-            a
-        });
+        .fold(
+            || (WalkBuffer::default(), Vec::<RootCoverage>::new()),
+            |mut acc, item| {
+                acc.0.merge(item.0);
+                acc.1.push(item.1);
+                acc
+            },
+        )
+        .reduce(
+            || (WalkBuffer::default(), Vec::<RootCoverage>::new()),
+            |mut a, b| {
+                a.0.merge(b.0);
+                a.1.extend(b.1);
+                a
+            },
+        );
     entries.sort();
     let (errors, error_paths) = errors.report();
     RescanPlan {
         entries,
         roots,
+        coverage,
         errors,
         error_paths,
     }
@@ -491,6 +568,7 @@ pub fn apply_rescan(index: &mut Index, plan: RescanPlan) -> ScanReport {
     let RescanPlan {
         entries,
         roots,
+        coverage,
         errors,
         error_paths,
     } = plan;
@@ -527,7 +605,9 @@ pub fn apply_rescan(index: &mut Index, plan: RescanPlan) -> ScanReport {
         }
     }
 
-    // Records under a root that the walk did not confirm are stale.
+    // Only records the walk actually established absent are stale: a subtree
+    // it pruned (removable media or a nested mount) or a root whose traversal
+    // was incomplete (deadline, cancellation, read failure) was not visited.
     let mut stale: Vec<PathBuf> = Vec::new();
     let mut buf = String::new();
     for (i, rec) in index.records().iter().enumerate() {
@@ -536,8 +616,9 @@ pub fn apply_rescan(index: &mut Index, plan: RescanPlan) -> ScanReport {
         }
         buf.clear();
         index.write_path(i as u32, &mut buf);
-        if roots.iter().any(|(r, _)| Path::new(&buf).starts_with(r)) {
-            stale.push(PathBuf::from(&buf));
+        let path = Path::new(&buf);
+        if coverage.iter().any(|c| c.established_absent(path)) {
+            stale.push(path.to_path_buf());
         }
     }
     // Removing a directory tombstones its whole subtree, so drop descendants of
@@ -626,6 +707,25 @@ struct WalkCtx<'a> {
     cancel: Option<&'a ScanCancel<'a>>,
     /// Traversal deadline (A6): a network-filesystem root is time-boxed.
     deadline: Option<Instant>,
+    /// Coverage tracking for rescan reconciliation; only [`plan_rescan`] needs
+    /// it, other walkers pass `None`.
+    coverage: Option<&'a WalkCoverage>,
+}
+
+impl WalkCtx<'_> {
+    /// Record that this root was not traversed in full.
+    fn mark_incomplete(&self) {
+        if let Some(coverage) = self.coverage {
+            coverage.mark_incomplete();
+        }
+    }
+
+    /// Record a subtree the walk deliberately did not descend into.
+    fn prune(&self, path: &Path) {
+        if let Some(coverage) = self.coverage {
+            coverage.prune(path);
+        }
+    }
 }
 
 /// The set of mount points from `/proc/self/mountinfo`, used to prune nested
@@ -654,11 +754,13 @@ fn walk(dir: &Path, ctx: &WalkCtx) -> WalkBuffer {
     // within one readdir rather than recursing unboundedly.
     if let Some(cancel) = ctx.cancel {
         if cancel.cancelled() {
+            ctx.mark_incomplete();
             return batch;
         }
     }
     if let Some(deadline) = ctx.deadline {
         if Instant::now() >= deadline {
+            ctx.mark_incomplete();
             return batch;
         }
     }
@@ -683,6 +785,7 @@ fn walk(dir: &Path, ctx: &WalkCtx) -> WalkBuffer {
             // returned, so on ext4/xfs/btrfs it costs no extra syscall. Only
             // fall back to `metadata()` when size/mtime are actually needed.
             let Ok(file_type) = entry.file_type() else {
+                ctx.mark_incomplete();
                 continue;
             };
             let is_dir = file_type.is_dir();
@@ -709,14 +812,17 @@ fn walk(dir: &Path, ctx: &WalkCtx) -> WalkBuffer {
                 // it even when it is reachable from another root. A targeted
                 // on-demand scan of a non-NTFS volume opts in.
                 if !ctx.allow_removable && mounts::is_removable_media_path(&path) {
+                    ctx.prune(&path);
                     continue;
                 }
                 if boundaries.contains(&path) && path != root {
+                    ctx.prune(&path);
                     continue;
                 }
                 if let (Some(dev), Some(root_dev)) = (metadata.as_ref().map(|m| m.dev()), root_dev)
                 {
                     if dev != root_dev {
+                        ctx.prune(&path);
                         continue;
                     }
                 }
@@ -728,6 +834,7 @@ fn walk(dir: &Path, ctx: &WalkCtx) -> WalkBuffer {
                     let key = (m.dev(), m.ino());
                     if let Ok(mut seen) = visited.lock() {
                         if !seen.insert(key) {
+                            ctx.prune(&path);
                             continue;
                         }
                     }
@@ -753,6 +860,7 @@ fn walk(dir: &Path, ctx: &WalkCtx) -> WalkBuffer {
         }
     } else {
         errors.record(dir);
+        ctx.mark_incomplete();
     }
 
     // Recurse in parallel and merge each subtree's buffer exactly once, so the
@@ -855,6 +963,7 @@ mod tests {
         let config = ScanConfig::with_roots(vec![base.clone()]);
         let plan = plan_rescan_cancellable(&config, Some(&cancel));
         assert_eq!(plan.entries.entries.len(), 0);
+        assert!(!plan.coverage[0].complete);
 
         // A3: the shutdown flag also cancels the walk.
         let generation = std::sync::atomic::AtomicU64::new(0);
@@ -862,11 +971,13 @@ mod tests {
         let cancel = ScanCancel::new(&generation, &shutdown);
         let plan = plan_rescan_cancellable(&config, Some(&cancel));
         assert_eq!(plan.entries.entries.len(), 0);
+        assert!(!plan.coverage[0].complete);
 
         // Without a cancel the same tree is fully walked (the root itself is
         // not part of the plan; its five descendants are).
         let plan = plan_rescan(&config);
         assert_eq!(plan.entries.entries.len(), 5);
+        assert!(plan.coverage[0].complete);
 
         let _ = fs::remove_dir_all(&base);
     }
@@ -1005,6 +1116,57 @@ mod tests {
         assert!(index.find(&base).is_some());
         assert_eq!(report.entries, 1); // new.txt
         assert_eq!(report.skipped, 1); // sub/b.txt
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn rescan_preserves_records_under_pruned_subtrees() {
+        let base = temp_dir("rescan-pruned");
+        fs::create_dir_all(base.join("media/vol")).unwrap();
+        fs::write(base.join("gone.txt"), b"x").unwrap();
+        fs::write(base.join("media/vol/keep.txt"), b"y").unwrap();
+
+        let config = ScanConfig::with_roots(vec![base.clone()]);
+        let (mut index, _) = scan(&config);
+        assert!(index.find(&base.join("gone.txt")).is_some());
+        assert!(index.find(&base.join("media/vol/keep.txt")).is_some());
+
+        fs::remove_file(base.join("gone.txt")).unwrap();
+        fs::remove_file(base.join("media/vol/keep.txt")).unwrap();
+
+        let mut plan = plan_rescan(&config);
+        // Simulate the walker pruning removable media or a nested mount: the
+        // subtree is still indexed but was deliberately not visited.
+        plan.coverage[0].pruned.push(base.join("media"));
+        apply_rescan(&mut index, plan);
+
+        assert!(index.find(&base.join("gone.txt")).is_none());
+        assert!(index.find(&base.join("media/vol/keep.txt")).is_some());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn rescan_preserves_records_when_root_walk_is_incomplete() {
+        let base = temp_dir("rescan-incomplete");
+        fs::create_dir_all(base.join("sub")).unwrap();
+        fs::write(base.join("gone.txt"), b"x").unwrap();
+        fs::write(base.join("sub/keep.txt"), b"y").unwrap();
+
+        let config = ScanConfig::with_roots(vec![base.clone()]);
+        let (mut index, _) = scan(&config);
+        fs::remove_file(base.join("gone.txt")).unwrap();
+        fs::remove_file(base.join("sub/keep.txt")).unwrap();
+
+        let mut plan = plan_rescan(&config);
+        // A deadline, cancellation, or read failure leaves the root partly
+        // unvisited; absence was not established, so nothing may be removed.
+        plan.coverage[0].complete = false;
+        apply_rescan(&mut index, plan);
+
+        assert!(index.find(&base.join("gone.txt")).is_some());
+        assert!(index.find(&base.join("sub/keep.txt")).is_some());
 
         let _ = fs::remove_dir_all(&base);
     }

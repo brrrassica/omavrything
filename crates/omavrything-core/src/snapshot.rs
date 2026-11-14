@@ -353,98 +353,132 @@ pub fn decode(bytes: &[u8]) -> Result<(Index, Vec<RootIdentity>), SnapshotError>
     Ok((image.to_index(), identities))
 }
 
-/// A borrowed view over a v6 snapshot image.
+/// The byte layout of a snapshot's sections, extracted by a checksum-validated
+/// parse.
 ///
-/// The image is byte-identical to the on-disk snapshot: `records` and `paths`
-/// borrow directly from the mapping (no decode, no rebuild), so loading is an
-/// `mmap` plus header validation. `roots` and `identities` are parsed from the
-/// small `ROOTS`/`ROOT_STRINGS` sections.
-pub struct IndexImage<'a> {
+/// The daemon's evicted state caches this map so later reads over the same
+/// mapping skip the O(snapshot) FNV-1a checksum: the arenas are borrowed in
+/// O(1) via [`SectionMap::view`], and materialization re-parses via
+/// [`SectionMap::image`] without re-hashing. A snapshot mapping is never
+/// mutated in place, so the layout cannot go stale.
+#[derive(Debug, Clone, Copy)]
+pub struct SectionMap {
+    body_len: usize,
+    roots: (usize, usize),
+    records: (usize, usize),
+    paths: (usize, usize),
+    root_strings: (usize, usize),
+}
+
+/// Validate the header, checksum, and section table of `bytes` and return the
+/// section layout.
+///
+/// This is the only place the FNV-1a checksum is computed; callers that parse
+/// the same buffer repeatedly (the daemon's evicted mapping) extract the layout
+/// once and reuse it.
+pub fn sections_from_bytes(bytes: &[u8]) -> Result<SectionMap, SnapshotError> {
+    if bytes.len() < HEADER_FIXED + 8 {
+        return Err(SnapshotError::Truncated);
+    }
+    if &bytes[..8] != MAGIC {
+        return Err(SnapshotError::BadMagic);
+    }
+    let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    if version != VERSION {
+        return Err(SnapshotError::UnsupportedVersion(version));
+    }
+    let header_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+    let section_count = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+
+    // The checksum covers everything before the trailing 8 bytes.
+    let (body, tail) = bytes.split_at(bytes.len() - 8);
+    let expected = u64::from_le_bytes(tail.try_into().unwrap());
+    let actual = fnv1a64(body);
+    if expected != actual {
+        return Err(SnapshotError::ChecksumMismatch { expected, actual });
+    }
+
+    // Section table.
+    let table_end = HEADER_FIXED
+        .checked_add(
+            section_count
+                .checked_mul(SECTION_ENTRY)
+                .ok_or(SnapshotError::Truncated)?,
+        )
+        .ok_or(SnapshotError::Truncated)?;
+    if table_end > body.len() || header_len < table_end || header_len % 8 != 0 {
+        return Err(SnapshotError::Truncated);
+    }
+    let mut sections: [Option<(usize, usize)>; 4] = [None; 4];
+    for i in 0..section_count {
+        let base = HEADER_FIXED + i * SECTION_ENTRY;
+        let kind = u32::from_le_bytes(body[base..base + 4].try_into().unwrap());
+        let offset = u64::from_le_bytes(body[base + 8..base + 16].try_into().unwrap()) as usize;
+        let len = u64::from_le_bytes(body[base + 16..base + 24].try_into().unwrap()) as usize;
+        let end = offset.checked_add(len).ok_or(SnapshotError::Truncated)?;
+        if offset % 8 != 0 || end > body.len() {
+            return Err(SnapshotError::Truncated);
+        }
+        let slot = match kind {
+            SECTION_ROOTS => 0,
+            SECTION_RECORDS => 1,
+            SECTION_PATHS => 2,
+            SECTION_ROOT_STRINGS => 3,
+            _ => continue,
+        };
+        sections[slot] = Some((offset, len));
+    }
+    let roots = sections[0].ok_or(SnapshotError::Truncated)?;
+    let records = sections[1].ok_or(SnapshotError::Truncated)?;
+    let paths = sections[2].ok_or(SnapshotError::Truncated)?;
+    let root_strings = sections[3].ok_or(SnapshotError::Truncated)?;
+    Ok(SectionMap {
+        body_len: body.len(),
+        roots,
+        records,
+        paths,
+        root_strings,
+    })
+}
+
+/// A checksum-free borrowed view of a validated snapshot's arenas.
+///
+/// [`SectionMap::view`] builds this in O(1) from an already-validated mapping;
+/// no record data is copied unless the buffer is unaligned.
+pub struct ImageView<'a> {
     records: Records<'a>,
     paths: &'a [u8],
-    roots: Vec<Root>,
-    identities: Vec<RootIdentity>,
-    live: usize,
 }
 
-/// The record array of an image: borrowed from the mapping when the backing
-/// buffer is 8-byte aligned, or an owned copy otherwise (the read path).
-enum Records<'a> {
-    Borrowed(&'a [FileRecord]),
-    Owned(Vec<FileRecord>),
-}
+impl ImageView<'_> {
+    /// The raw record array.
+    pub fn records(&self) -> &[FileRecord] {
+        self.records.as_slice()
+    }
 
-impl Records<'_> {
-    fn as_slice(&self) -> &[FileRecord] {
-        match self {
-            Records::Borrowed(s) => s,
-            Records::Owned(v) => v,
-        }
+    /// The path arena.
+    pub fn paths(&self) -> &[u8] {
+        self.paths
     }
 }
 
-impl<'a> IndexImage<'a> {
-    /// Parse and validate a v6 image from `bytes`.
+impl SectionMap {
+    /// Parse a full [`IndexImage`] from `bytes` using this cached layout.
     ///
-    /// The record and path arenas are borrowed from `bytes` (no allocation, no
-    /// rebuild); only the small `ROOTS`/`ROOT_STRINGS` sections are parsed into
-    /// owned vectors.
-    pub fn from_bytes(bytes: &'a [u8]) -> Result<Self, SnapshotError> {
-        if bytes.len() < HEADER_FIXED + 8 {
+    /// The checksum is **not** recomputed: [`sections_from_bytes`] verified it
+    /// when this map was built, and a snapshot mapping is never mutated in
+    /// place. Records are still validated (path ranges, parent links, parent
+    /// cycles) and the roots are parsed, so this is O(records), not O(1); the
+    /// per-event hot path uses [`SectionMap::view`] instead.
+    pub fn image<'a>(&self, bytes: &'a [u8]) -> Result<IndexImage<'a>, SnapshotError> {
+        if bytes.len() < self.body_len + 8 {
             return Err(SnapshotError::Truncated);
         }
-        if &bytes[..8] != MAGIC {
-            return Err(SnapshotError::BadMagic);
-        }
-        let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-        if version != VERSION {
-            return Err(SnapshotError::UnsupportedVersion(version));
-        }
-        let header_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
-        let section_count = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
-
-        // The checksum covers everything before the trailing 8 bytes.
-        let (body, tail) = bytes.split_at(bytes.len() - 8);
-        let expected = u64::from_le_bytes(tail.try_into().unwrap());
-        let actual = fnv1a64(body);
-        if expected != actual {
-            return Err(SnapshotError::ChecksumMismatch { expected, actual });
-        }
-
-        // Section table.
-        let table_end = HEADER_FIXED
-            .checked_add(
-                section_count
-                    .checked_mul(SECTION_ENTRY)
-                    .ok_or(SnapshotError::Truncated)?,
-            )
-            .ok_or(SnapshotError::Truncated)?;
-        if table_end > body.len() || header_len < table_end || header_len % 8 != 0 {
-            return Err(SnapshotError::Truncated);
-        }
-        let mut sections: [Option<(usize, usize)>; 4] = [None; 4];
-        for i in 0..section_count {
-            let base = HEADER_FIXED + i * SECTION_ENTRY;
-            let kind = u32::from_le_bytes(body[base..base + 4].try_into().unwrap());
-            let offset = u64::from_le_bytes(body[base + 8..base + 16].try_into().unwrap()) as usize;
-            let len = u64::from_le_bytes(body[base + 16..base + 24].try_into().unwrap()) as usize;
-            let end = offset.checked_add(len).ok_or(SnapshotError::Truncated)?;
-            if offset % 8 != 0 || end > body.len() {
-                return Err(SnapshotError::Truncated);
-            }
-            let slot = match kind {
-                SECTION_ROOTS => 0,
-                SECTION_RECORDS => 1,
-                SECTION_PATHS => 2,
-                SECTION_ROOT_STRINGS => 3,
-                _ => continue,
-            };
-            sections[slot] = Some((offset, len));
-        }
-        let (roots_off, roots_len) = sections[0].ok_or(SnapshotError::Truncated)?;
-        let (records_off, records_len) = sections[1].ok_or(SnapshotError::Truncated)?;
-        let (paths_off, paths_len) = sections[2].ok_or(SnapshotError::Truncated)?;
-        let (root_strings_off, root_strings_len) = sections[3].ok_or(SnapshotError::Truncated)?;
+        let body = &bytes[..self.body_len];
+        let (roots_off, roots_len) = self.roots;
+        let (records_off, records_len) = self.records;
+        let (paths_off, paths_len) = self.paths;
+        let (root_strings_off, root_strings_len) = self.root_strings;
 
         let root_strings = &body[root_strings_off..root_strings_off + root_strings_len];
         let paths = &body[paths_off..paths_off + paths_len];
@@ -569,6 +603,89 @@ impl<'a> IndexImage<'a> {
             identities,
             live,
         })
+    }
+
+    /// The record and path arenas borrowed from `bytes`, with no checksum and
+    /// no record validation: O(1).
+    ///
+    /// Contract: `bytes` is the same immutable buffer [`sections_from_bytes`]
+    /// validated this layout against. The daemon's evicted state uses this so
+    /// that applying a filesystem event does not re-hash the whole snapshot.
+    /// An unaligned record arena falls back to a copy, mirroring
+    /// [`IndexImage::from_bytes`]; a page-aligned mmap is always aligned.
+    pub fn view<'a>(&self, bytes: &'a [u8]) -> Result<ImageView<'a>, SnapshotError> {
+        if bytes.len() < self.body_len + 8 {
+            return Err(SnapshotError::Truncated);
+        }
+        let body = &bytes[..self.body_len];
+        let (records_off, records_len) = self.records;
+        if records_len < 8 || records_off + records_len > body.len() {
+            return Err(SnapshotError::Truncated);
+        }
+        let records_bytes = &body[records_off + 8..records_off + records_len];
+        let records = if records_bytes.as_ptr() as usize % std::mem::align_of::<FileRecord>() == 0 {
+            // SAFETY: the slice is 8-byte aligned and its length is an exact
+            // multiple of `size_of::<FileRecord>()` (checked above).
+            Records::Borrowed(unsafe { records_from_bytes(records_bytes) })
+        } else {
+            let mut v = Vec::with_capacity(records_bytes.len() / RECORD_BYTES);
+            for chunk in records_bytes.chunks_exact(RECORD_BYTES) {
+                v.push(read_record(chunk));
+            }
+            Records::Owned(v)
+        };
+        let (paths_off, paths_len) = self.paths;
+        if paths_off + paths_len > body.len() {
+            return Err(SnapshotError::Truncated);
+        }
+        Ok(ImageView {
+            records,
+            paths: &body[paths_off..paths_off + paths_len],
+        })
+    }
+}
+
+/// A borrowed view over a v6 snapshot image.
+///
+/// The image is byte-identical to the on-disk snapshot: `records` and `paths`
+/// borrow directly from the mapping (no decode, no rebuild), so loading is an
+/// `mmap` plus header validation. `roots` and `identities` are parsed from the
+/// small `ROOTS`/`ROOT_STRINGS` sections.
+pub struct IndexImage<'a> {
+    records: Records<'a>,
+    paths: &'a [u8],
+    roots: Vec<Root>,
+    identities: Vec<RootIdentity>,
+    live: usize,
+}
+
+/// The record array of an image: borrowed from the mapping when the backing
+/// buffer is 8-byte aligned, or an owned copy otherwise (the read path).
+enum Records<'a> {
+    Borrowed(&'a [FileRecord]),
+    Owned(Vec<FileRecord>),
+}
+
+impl Records<'_> {
+    fn as_slice(&self) -> &[FileRecord] {
+        match self {
+            Records::Borrowed(s) => s,
+            Records::Owned(v) => v,
+        }
+    }
+}
+
+impl<'a> IndexImage<'a> {
+    /// Parse and validate a v6 image from `bytes`.
+    ///
+    /// The header, checksum, and section table are validated by
+    /// [`sections_from_bytes`]; the arenas are then borrowed from `bytes` (no
+    /// allocation, no rebuild) and every record's path range and parent links
+    /// are validated. Only the small `ROOTS`/`ROOT_STRINGS` sections are parsed
+    /// into owned vectors.
+    pub fn from_bytes(bytes: &'a [u8]) -> Result<Self, SnapshotError> {
+        let sections = sections_from_bytes(bytes)?;
+        sections.image(bytes)
     }
 
     /// The raw record array.
@@ -1042,6 +1159,54 @@ mod tests {
         assert_eq!(out.hits[0].size, 1234);
         assert_eq!(out.hits[0].mtime, 42);
         assert_eq!(out.hits[0].path, "/home/sam/report.pdf");
+    }
+
+    #[test]
+    fn cached_sections_view_matches_the_validated_parse() {
+        // Issue 55: the daemon caches the section layout from one validated
+        // parse and reuses it per event without re-hashing. The cached view
+        // must expose exactly the arenas `from_bytes` borrows, and a corrupted
+        // snapshot must still fail at layout extraction (the checksum).
+        let index = sample_index();
+        let bytes = encode(&index, &[]);
+
+        let sections = sections_from_bytes(&bytes).unwrap();
+        let image = IndexImage::from_bytes(&bytes).unwrap();
+        let view = sections.view(&bytes).unwrap();
+        assert_eq!(view.records(), image.records());
+        assert_eq!(view.paths(), image.paths());
+
+        // A materialization from the cached layout equals the full parse.
+        let back = sections.image(&bytes).unwrap();
+        assert_eq!(back.records(), image.records());
+        let back_paths: Vec<&str> = back.roots().iter().map(|r| r.path.as_str()).collect();
+        let image_paths: Vec<&str> = image.roots().iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(back_paths, image_paths);
+        assert_eq!(back.len(), image.len());
+
+        // Corrupting the body fails the checksum in `sections_from_bytes`...
+        let mut bad = bytes.clone();
+        let mid = bad.len() / 2;
+        bad[mid] ^= 0xff;
+        assert!(matches!(
+            sections_from_bytes(&bad),
+            Err(SnapshotError::ChecksumMismatch { .. })
+        ));
+        // ...so a stale or mismatched buffer is rejected before any view.
+        assert!(IndexImage::from_bytes(&bad).is_err());
+    }
+
+    #[test]
+    fn view_rejects_a_short_buffer() {
+        // The cached layout must not read past a buffer that no longer holds
+        // the snapshot it was validated against.
+        let index = sample_index();
+        let bytes = encode(&index, &[]);
+        let sections = sections_from_bytes(&bytes).unwrap();
+        assert!(matches!(
+            sections.view(&bytes[..bytes.len() / 2]),
+            Err(SnapshotError::Truncated)
+        ));
     }
 
     #[test]
