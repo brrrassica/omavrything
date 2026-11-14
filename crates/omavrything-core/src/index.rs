@@ -500,20 +500,24 @@ impl SubtreeIndex {
     /// Besides the linked subtree, this covers parentless records whose path
     /// falls under the key: an orphan's immediate parent may be absent from the
     /// index (or the key is `/`, whose descendants include every rootless
-    /// record), so it has no link from the directory record.
+    /// record), so it has no link from the directory record. `root` is `None`
+    /// when the path has no indexed record of its own; the parentless scan then
+    /// finds every matching subtree without walking the whole index.
     pub(crate) fn collect_under_path(
         &self,
         records: &[FileRecord],
         paths: &[u8],
-        root: u32,
+        root: Option<u32>,
         key: &[u8],
         prefix: &[u8],
         out: &mut Vec<u32>,
     ) {
-        self.collect_subtree(records, root, out);
+        if let Some(root) = root {
+            self.collect_subtree(records, root, out);
+        }
         let mut buf: Vec<u8> = Vec::new();
         for &i in &self.parentless {
-            if i == root {
+            if Some(i) == root {
                 continue;
             }
             let rec = &records[i as usize];
@@ -1808,7 +1812,8 @@ impl Index {
         let key_bytes = key.as_bytes();
         let prefix_bytes = prefix.as_bytes();
 
-        if let Some(idx) = self.find_str(key.as_ref()) {
+        let exact = self.find_str(key.as_ref());
+        if let Some(idx) = exact {
             let rec = &self.records[idx as usize];
             if !rec.is_deleted() && !rec.is_dir() {
                 // A file has no descendants, so the path map resolves the
@@ -1827,7 +1832,7 @@ impl Index {
                 self.subtree.collect_under_path(
                     &self.records,
                     &self.paths,
-                    idx,
+                    Some(idx),
                     key_bytes,
                     prefix_bytes,
                     &mut candidates,
@@ -1869,21 +1874,37 @@ impl Index {
                 }
             }
         }
-        // A path whose own record is missing may still have indexed children
-        // (e.g. a test or a partial scan), so retain the subtree prefix scan for
-        // that case.
+        // A directory whose record was already tombstoned, or a path whose own
+        // record is missing (e.g. a test or a partial scan), may still have
+        // indexed children. Resolve them from the directory's stored subtree
+        // when the record exists, otherwise from the parentless roots and
+        // orphans, instead of scanning every record in the index.
+        let mut candidates: Vec<u32> = Vec::new();
+        self.subtree.collect_under_path(
+            &self.records,
+            &self.paths,
+            exact,
+            key_bytes,
+            prefix_bytes,
+            &mut candidates,
+        );
         let mut to_delete: Vec<u32> = Vec::new();
         let mut buf: Vec<u8> = Vec::new();
         let mut visited = 0usize;
-        for (i, rec) in self.records.iter().enumerate() {
+        for &i in &candidates {
             visited += 1;
-            if rec.is_deleted() {
+            if self.records[i as usize].is_deleted() {
                 continue;
             }
             buf.clear();
-            write_full_path_bytes(rec, &self.records, &self.paths, &mut buf);
+            write_full_path_bytes(
+                &self.records[i as usize],
+                &self.records,
+                &self.paths,
+                &mut buf,
+            );
             if buf == key_bytes || buf.starts_with(prefix_bytes) {
-                to_delete.push(i as u32);
+                to_delete.push(i);
             }
         }
         if to_delete.is_empty() {
@@ -1924,8 +1945,8 @@ impl Index {
         // Capture each affected record's *old* full path now, before any record is
         // rewritten. Reconstructing it inside the mutation loop would observe the
         // already-updated ancestor paths and compute the wrong suffix. A file
-        // rename resolves through the path map; only a directory (or a missing
-        // exact record) needs the subtree prefix scan.
+        // rename resolves through the path map; a directory (or a missing exact
+        // record) resolves through its stored subtree or the parentless roots.
         let affected: Vec<(u32, Vec<u8>)> = match exact {
             Some(i)
                 if !self.records[i as usize].is_deleted() && !self.records[i as usize].is_dir() =>
@@ -1939,7 +1960,7 @@ impl Index {
                 self.subtree.collect_under_path(
                     &self.records,
                     &self.paths,
-                    i,
+                    Some(i),
                     old_bytes,
                     old_prefix_bytes,
                     &mut candidates,
@@ -1962,23 +1983,38 @@ impl Index {
                 }
                 affected
             }
-            _ => self
-                .records
-                .iter()
-                .enumerate()
-                .filter_map(|(i, rec)| {
-                    if rec.is_deleted() {
-                        return None;
+            _ => {
+                // No usable exact record: descendants can still be parentless
+                // orphans (or linked under an already-tombstoned directory), so
+                // resolve them from the stored subtree or the parentless roots
+                // instead of scanning every record.
+                let mut candidates: Vec<u32> = Vec::new();
+                self.subtree.collect_under_path(
+                    &self.records,
+                    &self.paths,
+                    exact,
+                    old_bytes,
+                    old_prefix_bytes,
+                    &mut candidates,
+                );
+                let mut affected = Vec::new();
+                for &j in &candidates {
+                    if self.records[j as usize].is_deleted() {
+                        continue;
                     }
                     buf.clear();
-                    write_full_path_bytes(rec, &self.records, &self.paths, &mut buf);
+                    write_full_path_bytes(
+                        &self.records[j as usize],
+                        &self.records,
+                        &self.paths,
+                        &mut buf,
+                    );
                     if buf == old_bytes || buf.starts_with(old_prefix_bytes) {
-                        Some((i as u32, buf.clone()))
-                    } else {
-                        None
+                        affected.push((j, buf.clone()));
                     }
-                })
-                .collect(),
+                }
+                affected
+            }
         };
         if affected.is_empty() {
             return false;
@@ -2954,6 +2990,22 @@ mod tests {
 
         let (changed, _) = index.remove_inner(Path::new("/data/not-indexed.txt"));
         assert!(!changed);
+    }
+
+    #[test]
+    fn removing_a_missing_path_visits_only_parentless_roots() {
+        let mut index = Index::new();
+        index.insert(Path::new("/data"), true, 0, 0);
+        for i in 0..10_000 {
+            index.insert(Path::new(&format!("/data/file-{i:05}.txt")), false, 1, 0);
+        }
+
+        let (changed, visited) = index.remove_inner(Path::new("/data/not-indexed.txt"));
+        assert!(!changed);
+        assert!(
+            visited <= 1,
+            "a missing-path removal visited {visited} records"
+        );
     }
 
     #[test]

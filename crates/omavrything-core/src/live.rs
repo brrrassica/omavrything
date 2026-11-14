@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use crate::glob::GlobSet;
-use crate::index::{DeltaIndex, FileRecord, Index, PathIndex, SubtreeIndex, write_full_path_bytes};
+use crate::index::{DeltaIndex, FileRecord, Index, PathIndex, SubtreeIndex};
 use crate::scan::{ScanConfig, scan_subtree, scan_subtree_into_delta};
 
 /// A filesystem change observed by the watcher.
@@ -188,7 +188,8 @@ fn delta_removed(
     };
     let key_bytes = key.as_bytes();
     let prefix_bytes = prefix.as_bytes();
-    if let Some(idx) = by_path.get(&key, records, paths) {
+    let exact = by_path.get(&key, records, paths);
+    if let Some(idx) = exact {
         let rec = &records[idx as usize];
         if !rec.is_deleted() {
             if !rec.is_dir() {
@@ -204,7 +205,7 @@ fn delta_removed(
                 subtree.collect_under_path(
                     records,
                     paths,
-                    idx,
+                    Some(idx),
                     key.as_bytes(),
                     prefix.as_bytes(),
                     &mut descendants,
@@ -219,20 +220,24 @@ fn delta_removed(
         }
     }
     if !changed {
-        // A path whose own record is missing may still have indexed children,
-        // so retain the subtree prefix scan for that case.
-        let mut buf: Vec<u8> = Vec::new();
+        // A path whose own record is missing (or already tombstoned) may still
+        // have indexed children, so resolve them from the stored base subtree
+        // or the parentless roots instead of scanning every base record.
         // inotify reports a directory removal or rename as one event, without
         // per-child events, so drop the whole base subtree, not just the exact
         // path.
-        for (i, rec) in records.iter().enumerate() {
-            if rec.is_deleted() {
-                continue;
-            }
-            buf.clear();
-            write_full_path_bytes(rec, records, paths, &mut buf);
-            if buf == key_bytes || buf.starts_with(prefix_bytes) {
-                delta.remove(i as u32);
+        let mut descendants: Vec<u32> = Vec::new();
+        subtree.collect_under_path(
+            records,
+            paths,
+            exact,
+            key_bytes,
+            prefix_bytes,
+            &mut descendants,
+        );
+        for &i in &descendants {
+            if !records[i as usize].is_deleted() {
+                delta.remove(i);
                 changed = true;
             }
         }
@@ -448,6 +453,28 @@ mod tests {
         assert_eq!(hits[0].path, new_child.to_string_lossy());
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn delta_removal_of_a_missing_directory_drops_orphaned_descendants() {
+        // Regression: the directory record is absent from the base image, so the
+        // removal must resolve its children through the parentless roots rather
+        // than walking every base record.
+        let mut index = Index::new();
+        index.insert(Path::new("/home/sam/a.txt"), false, 1, 0);
+        let by_path = PathIndex::build(index.records(), index.paths());
+        let config = ScanConfig::default();
+        let mut delta = DeltaIndex::new();
+        assert!(apply_delta(
+            &mut delta,
+            &by_path,
+            index.records(),
+            index.paths(),
+            &FsEvent::Removed(PathBuf::from("/home/sam")),
+            &config
+        ));
+        index.apply_delta(&delta);
+        assert!(index.find(Path::new("/home/sam/a.txt")).is_none());
     }
 
     #[test]
