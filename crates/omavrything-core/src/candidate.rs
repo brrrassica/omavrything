@@ -15,9 +15,11 @@
 //!   - **Level 1** — the trigrams of each record's **basename**, once per record.
 //!   - **Level 2** — the trigrams of each **directory's name**, once per
 //!     directory. A directory's trigrams apply to all of its descendants, which
-//!     are a **contiguous range** of record indices because records are inserted
-//!     sorted by path. The range is stored in `subtree_end` and expanded at
-//!     lookup time.
+//!     are represented as an index range. Records are usually inserted sorted by
+//!     path, but a file moved into a directory created later keeps a lower index
+//!     than its new parent, so the range can start before the directory's own
+//!     index (a superset of the descendants). The range is stored in
+//!     `subtree_end` and expanded at lookup time.
 //!
 //!   A query term that is ASCII, at least three bytes long, and free of `/`
 //!   cannot span a separator, so intersecting the posting lists of its trigrams
@@ -180,9 +182,12 @@ pub struct CandidateIndex {
     /// Level 2: finalized directory-name-trigram postings (E). Empty until
     /// `finish_bulk`.
     dir_csr: CsrPostings,
-    /// Sorted `(directory record, exclusive end of its descendant range)` pairs
-    /// (E). Only directories appear; the range is `[dir, end)`.
-    subtree_end: Vec<(u32, u32)>,
+    /// Sorted `(directory record, inclusive start, exclusive end)` descendant
+    /// range triples (E). Only directories appear. The range is normally
+    /// `[dir, end)`, but starts before `dir` when a descendant has a lower
+    /// record index (a file moved into a later-created directory); the range is
+    /// then a superset that still contains every descendant.
+    subtree_end: Vec<(u32, u32, u32)>,
     /// Bulk-build staging for level 1 (basename trigrams), then the live overlay
     /// (full-path component trigrams) after `finish_bulk`.
     delta: TrigramMap,
@@ -472,7 +477,7 @@ impl CandidateIndex {
 
     /// Record the exclusive end of directory `d`'s descendant range.
     fn set_dir_end(&mut self, d: u32, end: u32) {
-        self.subtree_end.push((d, end));
+        self.subtree_end.push((d, d, end));
     }
 
     /// Replace the subtree-range array with one derived from the record parent
@@ -481,13 +486,37 @@ impl CandidateIndex {
     /// batch inserts several roots before their descendants (issue #30). The
     /// supplied ranges are authoritative, so any directories still open on the
     /// incremental stack are discarded.
+    ///
+    /// A descendant can have a lower record index than its directory (a file
+    /// renamed into a directory created after it), so the lower bound is the
+    /// minimum index over the directory and its descendants rather than the
+    /// directory index itself. The resulting range may cover unrelated records
+    /// between the two, which is harmless: candidates are always verified.
     pub fn set_subtree_end(&mut self, ends: Vec<u32>) {
         self.stack.clear();
+        // Minimum record index in each record's subtree, derived from the same
+        // parent links the ends were derived from.
+        let mut starts = vec![u32::MAX; ends.len()];
+        for (i, &parent) in self.parent.iter().enumerate() {
+            let mut p = parent;
+            while p != u32::MAX {
+                let pi = p as usize;
+                if starts[pi] > i as u32 {
+                    starts[pi] = i as u32;
+                }
+                p = self.parent[pi];
+            }
+        }
         self.subtree_end = ends
             .into_iter()
             .enumerate()
             .filter(|(_, e)| *e != 0)
-            .map(|(i, e)| (i as u32, e))
+            .map(|(i, e)| {
+                let d = i as u32;
+                let start = starts.get(i).copied().unwrap_or(u32::MAX).min(d);
+                // The directory itself is always part of its own range.
+                (d, start, e.max(d.saturating_add(1)))
+            })
             .collect();
     }
 
@@ -745,29 +774,42 @@ impl CandidateIndex {
     }
 
     /// Expand a sorted list of directory records to the union of their
-    /// descendant ranges `[dir, subtree_end[dir])`, merging overlapping ranges.
+    /// descendant ranges, merging overlapping ranges.
     fn expand_dirs(&self, dirs: &[u32]) -> Vec<u32> {
-        // An unset range (0) means the directory is still open (the bulk build
-        // has not closed it), so its subtree extends to the current end. This
-        // keeps the expansion a superset even before `finish_bulk`.
+        // A missing range means the directory is still open (the bulk build has
+        // not closed it) or has no descendants, so its subtree extends to the
+        // current end. This keeps the expansion a superset even before
+        // `finish_bulk`.
         let n = self.off.len() as u32;
-        let end_of = |d: u32| -> u32 {
-            match self.subtree_end.binary_search_by_key(&d, |&(k, _)| k) {
-                Ok(i) => self.subtree_end[i].1,
-                Err(_) => n,
+        let range_of = |d: u32| -> (u32, u32) {
+            match self.subtree_end.binary_search_by_key(&d, |&(k, _, _)| k) {
+                Ok(i) => (self.subtree_end[i].1, self.subtree_end[i].2),
+                Err(_) => (d, n),
             }
         };
+        // A range can start before its directory (a descendant with a lower
+        // record index), so ranges may overlap or fall out of order. Sort and
+        // merge them before emitting; the result stays sorted and duplicate-free
+        // for the posting-list union/intersection.
+        let mut ranges: Vec<(u32, u32)> = dirs.iter().map(|&d| range_of(d)).collect();
+        // The common case is already ordered by start (each range begins at its
+        // directory), so only pay for a sort when a lower-index descendant made
+        // the starts fall out of order.
+        if !ranges.windows(2).all(|w| w[0].0 <= w[1].0) {
+            ranges.sort_unstable_by_key(|&(start, _)| start);
+        }
         let mut out = Vec::new();
         let mut i = 0usize;
-        while i < dirs.len() {
-            let start = dirs[i];
-            let mut end = end_of(start);
+        while i < ranges.len() {
+            let (start, mut end) = ranges[i];
             i += 1;
-            while i < dirs.len() && dirs[i] < end {
-                end = end.max(end_of(dirs[i]));
+            while i < ranges.len() && ranges[i].0 <= end {
+                end = end.max(ranges[i].1);
                 i += 1;
             }
-            out.extend(start..end);
+            if start < end {
+                out.extend(start..end);
+            }
         }
         out
     }
@@ -794,7 +836,7 @@ impl CandidateIndex {
             + (self.csr.offsets.len() + self.dir_csr.offsets.len()) as u64
                 * std::mem::size_of::<u32>() as u64
             + (self.delta.len() + self.dir_delta.len()) as u64 * (4 + 24 + 1);
-        let subtree = (self.subtree_end.len() * std::mem::size_of::<(u32, u32)>()) as u64;
+        let subtree = (self.subtree_end.len() * std::mem::size_of::<(u32, u32, u32)>()) as u64;
         // A stop-list entry is a `u32` key plus a control byte.
         let stop = (self.stop.len() * (4 + 1)) as u64;
 
@@ -820,7 +862,8 @@ impl CandidateIndex {
             + (self.csr.offsets.capacity() + self.dir_csr.offsets.capacity()) as u64
                 * std::mem::size_of::<u32>() as u64
             + (self.delta.capacity() + self.dir_delta.capacity()) as u64 * (4 + 24 + 1);
-        let subtree_cap = (self.subtree_end.capacity() * std::mem::size_of::<(u32, u32)>()) as u64;
+        let subtree_cap =
+            (self.subtree_end.capacity() * std::mem::size_of::<(u32, u32, u32)>()) as u64;
         let stop_cap = (self.stop.capacity() * (4 + 1)) as u64;
         let stack_cap = (self.stack.capacity() * std::mem::size_of::<(u32, u32, u32)>()) as u64;
 

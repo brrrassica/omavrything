@@ -18,7 +18,8 @@
 
 use std::borrow::Cow;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
+use std::ops::Bound;
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -2463,8 +2464,10 @@ pub struct DeltaIndex {
     paths: Vec<u8>,
     removes: HashSet<u32>,
     /// Full path -> index into `records`, so a repeated insert of the same path
-    /// replaces the earlier one instead of appending a duplicate.
-    index: HashMap<Box<str>, u32>,
+    /// replaces the earlier one instead of appending a duplicate. Sorted so a
+    /// subtree removal can range-scan `path/` without walking every pending
+    /// entry (issue #79).
+    index: BTreeMap<Box<str>, u32>,
     /// Number of `records` entries tombstoned by [`DeltaIndex::remove_path`].
     /// Tracked so `len`/`is_empty` stay O(1) and a delta that holds only dead
     /// inserts is treated as empty: it is not scanned, and it does not count
@@ -2571,21 +2574,42 @@ impl DeltaIndex {
         } else {
             format!("{key}/")
         };
-        let doomed: Vec<Box<str>> = self
+        // Range-scan the sorted map instead of filtering every pending entry:
+        // all keys under `<key>/` are contiguous, so an unrelated removal costs
+        // O(log n) rather than O(delta size) (issue #79).
+        let mut doomed: Vec<u32> = Vec::new();
+        if let Some(&i) = self.index.get(key.as_ref()) {
+            doomed.push(i);
+        }
+        for (k, &i) in self
             .index
-            .keys()
-            .filter(|k| k.as_ref() == key.as_ref() || k.starts_with(&prefix))
-            .cloned()
-            .collect();
+            .range::<str, _>((Bound::Included(prefix.as_str()), Bound::Unbounded))
+        {
+            if !k.starts_with(prefix.as_str()) {
+                break;
+            }
+            // The exact key was already collected above (it equals the prefix
+            // only when `path` had a trailing slash).
+            if k.as_ref() != key.as_ref() {
+                doomed.push(i);
+            }
+        }
         let mut changed = false;
-        for k in doomed {
-            if let Some(i) = self.index.remove(&k) {
-                let rec = &mut self.records[i as usize];
-                if !rec.is_deleted() {
-                    rec.flags |= FLAG_DELETED;
-                    self.tombstones += 1;
+        for i in doomed {
+            let rec = self.records[i as usize];
+            let start = rec.path_off as usize;
+            let end = start + rec.path_len as usize;
+            // The record already carries the full path, so the key can be
+            // removed without cloning it into a temporary allocation.
+            if let Ok(k) = std::str::from_utf8(&self.paths[start..end]) {
+                if self.index.remove(k).is_some() {
+                    changed = true;
                 }
-                changed = true;
+            }
+            let rec = &mut self.records[i as usize];
+            if !rec.is_deleted() {
+                rec.flags |= FLAG_DELETED;
+                self.tombstones += 1;
             }
         }
         self.compact_if_needed();
@@ -2630,7 +2654,7 @@ impl DeltaIndex {
             });
         }
         // Rebuild the lookup map from the surviving records' full paths.
-        let mut index = HashMap::with_capacity(records.len());
+        let mut index = BTreeMap::new();
         for (i, rec) in records.iter().enumerate() {
             let start = rec.path_off as usize;
             let end = start + rec.path_len as usize;
@@ -3323,6 +3347,51 @@ mod tests {
         let out = index.search("file", 10, 0);
         assert_eq!(out.total, 1);
         assert_eq!(out.hits[0].path, "/home/newdir/file.txt");
+    }
+
+    #[test]
+    fn compact_and_snapshot_include_lower_index_descendants_in_ancestor_queries() {
+        // Renaming a file into a directory created after it leaves the child
+        // with a lower record index than its parent. The candidate index's
+        // ancestor-name postings must still expand to that child after a
+        // compaction or snapshot reload (issue #78).
+        let mut index = Index::new();
+        index.add_root(Path::new("/"), FsKind::Other);
+        index.insert(Path::new("/home"), true, 0, 0);
+        let file = index.insert(Path::new("/home/file.txt"), false, 1, 0);
+        index.insert(Path::new("/home/newdir"), true, 0, 0);
+        assert!(index.rename(
+            Path::new("/home/file.txt"),
+            Path::new("/home/newdir/file.txt")
+        ));
+        let newdir = idx_of(&index, "/home/newdir");
+        assert!(file < newdir, "the child must keep its lower record index");
+
+        // Any tombstone triggers compaction, which rebuilds the candidate
+        // subtree ranges from the parent links.
+        index.insert(Path::new("/home/dead.txt"), false, 0, 0);
+        assert!(index.remove(Path::new("/home/dead.txt")));
+        index.compact();
+
+        let out = index.search("newdir", 10, 0);
+        assert_eq!(
+            out.total,
+            2,
+            "ancestor query after compaction must return the moved child: {:?}",
+            out.hits.iter().map(|h| &h.path).collect::<Vec<_>>()
+        );
+        assert!(out.hits.iter().any(|h| h.path == "/home/newdir/file.txt"));
+
+        // A snapshot load rebuilds the ranges through `Index::from_parts` and
+        // must not reintroduce the false negative.
+        let bytes = crate::snapshot::encode(&index, &[]);
+        let (back, _) = crate::snapshot::decode(&bytes).unwrap();
+        let out = back.search("newdir", 10, 0);
+        assert_eq!(
+            out.total, 2,
+            "ancestor query after a snapshot reload must return the moved child"
+        );
+        assert!(out.hits.iter().any(|h| h.path == "/home/newdir/file.txt"));
     }
 
     #[test]
@@ -4028,6 +4097,49 @@ mod tests {
         assert_eq!(delta.len(), 1);
         let live_rec = delta.records().iter().find(|r| !r.is_deleted()).unwrap();
         assert_eq!(live_rec.size, 99);
+    }
+
+    #[test]
+    fn delta_remove_subtree_matches_only_the_path_prefix() {
+        // The prefix range must drop the exact path and everything below it,
+        // without touching siblings that merely share the text prefix.
+        let mut delta = DeltaIndex::new();
+        delta.insert(Path::new("/a"), true, false, 0, 0);
+        delta.insert(Path::new("/a/b"), false, false, 1, 0);
+        delta.insert(Path::new("/a/b/c"), false, false, 1, 0);
+        delta.insert(Path::new("/ab"), false, false, 1, 0);
+        delta.insert(Path::new("/a.b"), false, false, 1, 0);
+
+        assert!(delta.remove_subtree(Path::new("/a")));
+        assert!(!delta.contains_path(Path::new("/a")));
+        assert!(!delta.contains_path(Path::new("/a/b")));
+        assert!(!delta.contains_path(Path::new("/a/b/c")));
+        assert!(delta.contains_path(Path::new("/ab")));
+        assert!(delta.contains_path(Path::new("/a.b")));
+        assert_eq!(delta.len(), 2);
+
+        // Removing an absent subtree changes nothing.
+        assert!(!delta.remove_subtree(Path::new("/a")));
+        assert_eq!(delta.len(), 2);
+    }
+
+    #[test]
+    fn delta_remove_subtree_of_an_unrelated_path_leaves_large_delta_intact() {
+        // A removal only needs to look at the matching key range; this must
+        // stay correct with many pending entries (the full-scan regression).
+        let mut delta = DeltaIndex::new();
+        for i in 0..5_000 {
+            delta.insert(
+                Path::new(&format!("/data/file-{i:05}.txt")),
+                false,
+                false,
+                1,
+                0,
+            );
+        }
+        assert!(!delta.remove_subtree(Path::new("/unrelated/file.txt")));
+        assert_eq!(delta.len(), 5_000);
+        assert!(delta.contains_path(Path::new("/data/file-04999.txt")));
     }
 
     #[test]
