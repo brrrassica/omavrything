@@ -499,12 +499,18 @@ impl CandidateIndex {
         let mut starts = vec![u32::MAX; ends.len()];
         for (i, &parent) in self.parent.iter().enumerate() {
             let mut p = parent;
-            while p != u32::MAX {
+            // Bound the walk by the record count: a valid chain visits each
+            // record at most once, so a longer walk means a corrupt parent
+            // cycle. Breaking there leaves the ranges incomplete instead of
+            // hanging.
+            let mut steps = 0usize;
+            while p != u32::MAX && steps < self.parent.len() {
                 let pi = p as usize;
                 if starts[pi] > i as u32 {
                     starts[pi] = i as u32;
                 }
                 p = self.parent[pi];
+                steps += 1;
             }
         }
         self.subtree_end = ends
@@ -1062,6 +1068,17 @@ mod tests {
         }
         c.finish_bulk();
         c
+    }
+
+    #[test]
+    fn subtree_ranges_terminate_on_a_parent_cycle() {
+        // Defence in depth: `set_subtree_end` shares the ancestry walk with
+        // `subtree_ends`, so a corrupt parent chain must not spin it forever.
+        let mut c = build(&["/a", "/a/b"]);
+        c.parent[0] = 1;
+        c.parent[1] = 0;
+        c.set_subtree_end(vec![2, 2]);
+        assert_eq!(c.subtree_end.len(), 2);
     }
 
     #[test]
