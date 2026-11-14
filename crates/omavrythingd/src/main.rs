@@ -630,6 +630,21 @@ fn watch_new_roots(watcher: &mut Watcher, index: &IndexManager, known: &mut Hash
     }
 }
 
+/// Watch a directory created under an already-watched root.
+///
+/// `symlink_metadata` (unlike `Path::is_dir`, which follows links) mirrors the
+/// scanner and `apply_event`: a symlink to a directory is indexed as a single
+/// symlink record, so watching its target would deliver events for paths the
+/// scanner never indexes.
+fn watch_created_dir(watcher: &mut Watcher, path: &Path) {
+    let is_dir = std::fs::symlink_metadata(path)
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
+    if is_dir {
+        let _ = watcher.watch_dir(path);
+    }
+}
+
 /// Watch the indexed roots with inotify and apply events to the index.
 fn run_watcher(
     index: Arc<IndexManager>,
@@ -722,9 +737,7 @@ fn run_watcher(
                 // Watch newly created directories.
                 for event in &batch {
                     if let FsEvent::Created(path) = event {
-                        if path.is_dir() {
-                            let _ = watcher.watch_dir(path);
-                        }
+                        watch_created_dir(&mut watcher, path);
                     }
                 }
                 let entries = index.len() as u64;
@@ -1889,5 +1902,38 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&late);
+    }
+
+    #[test]
+    fn created_symlinked_directory_is_not_watched() {
+        let base =
+            std::env::temp_dir().join(format!("omavrything-created-link-{}", std::process::id()));
+        let target = std::env::temp_dir().join(format!(
+            "omavrything-created-link-target-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&target);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(target.join("nested")).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let mut watcher = Watcher::new().unwrap();
+        watch_created_dir(&mut watcher, &link);
+        assert_eq!(
+            watcher.watch_count(),
+            0,
+            "a created symlink to a directory must not be watched"
+        );
+
+        // A real directory is still watched, and its subtree with it.
+        let real = base.join("real");
+        std::fs::create_dir_all(real.join("nested")).unwrap();
+        watch_created_dir(&mut watcher, &real);
+        assert_eq!(watcher.watch_count(), 2);
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&target);
     }
 }
