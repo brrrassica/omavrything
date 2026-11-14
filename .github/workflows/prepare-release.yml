@@ -14,7 +14,7 @@ name: Prepare release (pre-tag gate)
 #
 # Trigger it on the release branch (or on the release PR) with:
 #
-#   gh workflow run prepare-release.yml --ref release/0.2.6
+#   gh workflow run prepare-release.yml --ref release/0.2.7
 #
 # Nothing is published, nothing is tagged, no `contents: write`. It is safe to
 # run as often as needed.
@@ -27,7 +27,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to verify (e.g. 0.2.6); defaults to the workspace version'
+        description: 'Version to verify (e.g. 0.2.7); defaults to the workspace version'
         required: false
       base:
         description: 'Branch the pin file must be a superset of (main or develop)'

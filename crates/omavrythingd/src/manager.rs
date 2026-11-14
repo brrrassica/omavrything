@@ -45,7 +45,11 @@ enum State {
     /// mutated in place, so the cached layout cannot go stale.
     Image {
         mmap: Arc<Mmap>,
-        by_path: PathIndex,
+        /// Boxed: the two hash maps are by far the largest fields, and keeping
+        /// them inline would make this variant ~216 bytes against the 8-byte
+        /// `Owned(Box<Index>)` (clippy::large_enum_variant). Neither the
+        /// `RwLock<State>` nor a moved state should carry that size.
+        by_path: Box<PathIndex>,
         /// Base-image parent -> child links, so an evicted directory removal
         /// resolves its descendants without scanning the whole image.
         subtree: Box<SubtreeIndex>,
@@ -328,7 +332,7 @@ impl IndexManager {
         let len = image.len();
         *state = State::Image {
             mmap: Arc::new(mmap),
-            by_path,
+            by_path: Box::new(by_path),
             subtree: Box::new(subtree),
             sections,
             roots,
@@ -448,9 +452,7 @@ impl IndexManager {
                 by_path,
                 subtree,
                 ..
-            } => {
-                mmap.len() as u64 + by_path.memory_bytes() + subtree.memory_bytes()
-            }
+            } => mmap.len() as u64 + by_path.memory_bytes() + subtree.memory_bytes(),
         }
     }
 

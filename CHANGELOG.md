@@ -6,8 +6,76 @@ Notable changes to `omavrything`. The format follows
 
 ## [Unreleased]
 
+## [0.2.7] — 2026-11-14
+
+### Changed
+
+- **Directory removals and renames are resolved through child links instead of
+  scanning the whole index** (issues #70, #76). Both the owned index and the
+  evicted delta re-validated every record — rebuilding each full path — under
+  the manager's state write lock whenever a removed or renamed directory had no
+  exact path entry, so a burst of directory churn was O(N × index size) and
+  blocked concurrent queries. A compact `SubtreeIndex` (first/next/previous
+  child links plus a list of parentless roots) is maintained on insert, rename,
+  compaction, and snapshot load, and removal/rename visit only the affected
+  subtree. Orphans whose immediate parent was never indexed are still covered
+  by checking the small parentless list against the path prefix. Exact-file
+  paths keep their existing O(1) lookup. Regression tests:
+  `removing_a_directory_visits_only_its_subtree`,
+  `renaming_a_directory_does_not_affect_interleaved_siblings`, and
+  `removing_a_directory_includes_orphaned_descendants`.
+- **CI is green again on `develop`.** Two formatting deviations and one lint
+  landed in the merged fixes and failed the `fmt` and `clippy -D warnings` gates:
+  a manually wrapped `assert!` in `index.rs`, an over-wrapped `match` arm in
+  `manager.rs`, and a `clippy::large_enum_variant` on the daemon's `State::Image`
+  (216 bytes against the 8-byte `Owned(Box<Index>)`). The variant's `PathIndex`
+  is now boxed, which also keeps the `RwLock<State>` copy small. No behaviour
+  change.
+- **Single-file removals no longer rebuild every live path, and result windows
+  are bounded** (issues #67, #68). `Index::remove`, `Index::rename`, and the
+  evicted-delta removal now take an exact-path fast path through the resident
+  `PathIndex` before falling back to a subtree scan. Separately, a request could
+  size the top-N collector from an attacker-controlled `offset`; every scan
+  entry point now clamps to a single `MAX_RESULT_WINDOW`-bound helper, and
+  `Request::effective_offset` clamps as well.
+
 ### Fixed
 
+- **A rescan no longer tombstones records it did not actually visit** (issue
+  #71). Reconciliation treated every unseen record under a walked root as
+  deleted, even when the walk deliberately pruned `/run/media` or a nested mount
+  boundary, or stopped early on deadline, cancellation, or `read_dir` failure.
+  `RescanPlan` now carries per-root coverage (a complete flag plus pruned
+  prefixes), and `apply_rescan` only tombstones a path that some covering root
+  actually established as absent. Regression tests cover pruned-subtree
+  preservation, incomplete-root preservation, and cancellation coverage.
+- **The watcher no longer descends through, or watches, symlinked directories**
+  (issue #74). The watcher decided directory-ness by following symlinks while
+  the scanner classifies entries with `readdir`'s `d_type` and never descends
+  through links, so it recursed into symlink targets, watched subtrees with no
+  index entries, and overwrote the real directory's watch-descriptor mapping
+  when the target was also inside a root. `Watcher::watch_dir` now uses
+  `DirEntry::file_type()`, recording a symlinked directory as a single symlink
+  record, and the daemon's post-create watch step checks `symlink_metadata`, so
+  a symlink created after startup is not watched through either.
+- **The inotify watch set is reconciled as subtrees move out and roots appear**
+  (issues #56, #57). `forget_subtree` only dropped a moved-out subtree's path
+  mappings and left its kernel watches installed, and `run_watcher` never
+  watched a root added after startup (a D-Bus mount, a remembered volume, NTFS
+  startup/hotplug), so those roots were indexed but not live-updated.
+  `forget_subtree` now removes the kernel watches, and `run_watcher` reconciles
+  against `index.roots()` each poll so a late root goes through the same
+  `watch_dir` path. Regression tests:
+  `move_out_of_tree_drops_subtree_watches` and
+  `watches_roots_added_after_the_watcher_starts`.
+- **Subprocess pipes are drained, and un-excluded subtrees are watched again**
+  (issues #64, #65). The bounded command runner piped `stdout`/`stderr` but
+  never read them, so a talkative child could block on a full pipe until its
+  deadline; the reader threads now drain to EOF while `try_wait` polls, and are
+  detached rather than joined when the deadline fires. `Watcher::set_excludes`
+  now drops watches for directories the new set excludes, and `run_watcher`
+  re-reads `scan().excludes` on every poll, applies a changed set, and re-walks
+  all indexed roots so a subtree that left the exclude list is watched again.
 - **A non-ASCII query term containing `/` now matches across the parent/basename
   boundary** (issue #53). `Term::find_boundary` early-returned for every
   non-ASCII term, so a query like `café/report` silently failed to match a file

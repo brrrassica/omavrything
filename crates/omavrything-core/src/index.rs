@@ -3025,7 +3025,10 @@ mod tests {
 
         let (changed, visited) = index.remove_inner(Path::new("/data"));
         assert!(changed);
-        assert!(visited <= 4, "a directory removal visited {visited} records");
+        assert!(
+            visited <= 4,
+            "a directory removal visited {visited} records"
+        );
         assert!(index.find(Path::new("/data/sub/b.txt")).is_none());
         assert!(index.find(Path::new("/other/file-05000.txt")).is_some());
         assert!(index.find(Path::new("/other/late.txt")).is_some());

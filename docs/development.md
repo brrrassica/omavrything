@@ -124,7 +124,7 @@ Three things now prevent that:
 Run it on the release branch before tagging:
 
 ```sh
-gh workflow run prepare-release.yml --ref release/0.2.6
+gh workflow run prepare-release.yml --ref release/0.2.7
 ```
 
 It builds the archive in the exact release container and toolchain, then fails
