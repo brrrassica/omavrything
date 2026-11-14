@@ -178,6 +178,8 @@ fn delta_removed(
     path: &Path,
 ) -> bool {
     let mut changed = false;
+    // A base record that is a regular file cannot have descendants.
+    let mut known_file = false;
     let key = path.to_string_lossy();
     // For the filesystem root "/", the subtree prefix is "/" itself; for any
     // other path it is "<key>/".
@@ -195,6 +197,7 @@ fn delta_removed(
             if !rec.is_dir() {
                 // A file has no descendants, so the resident path map resolves
                 // the base removal in O(1) instead of scanning every base record.
+                known_file = true;
                 delta.remove(idx);
                 changed = true;
             } else {
@@ -243,8 +246,12 @@ fn delta_removed(
         }
     }
     // Pending inserts of the old subtree were created while evicted, so they
-    // have no base record; tombstone them too.
-    changed |= delta.remove_subtree(path);
+    // have no base record; tombstone them too. A regular file cannot have
+    // descendants, so skip the scan unless a pending insert recreated the same
+    // path (which may have made it a directory again).
+    if !known_file || delta.contains_path(path) {
+        changed |= delta.remove_subtree(path);
+    }
     changed
 }
 
