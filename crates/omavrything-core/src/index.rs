@@ -467,6 +467,32 @@ impl SubtreeIndex {
         self.prev_sibling[i] = u32::MAX;
     }
 
+    /// Move `old`'s live direct children onto `new`, preserving their parent
+    /// links. A delta fold can replace a directory record in place while its
+    /// children stay live; without this the children keep pointing at the
+    /// tombstoned record and subtree operations starting from the replacement
+    /// cannot reach them.
+    fn adopt_children(&mut self, records: &mut [FileRecord], old: u32, new: u32) {
+        let mut child = self
+            .first_child
+            .get(old as usize)
+            .copied()
+            .unwrap_or(u32::MAX);
+        while child != u32::MAX {
+            let next = self
+                .next_sibling
+                .get(child as usize)
+                .copied()
+                .unwrap_or(u32::MAX);
+            if records[child as usize].parent == old && !records[child as usize].is_deleted() {
+                records[child as usize].parent = new;
+                self.detach(child, old);
+                self.attach(child, new);
+            }
+            child = next;
+        }
+    }
+
     /// Append `root` and its live descendants to `out`.
     ///
     /// Traversal is iterative so a deeply nested tree cannot overflow the
@@ -1549,9 +1575,14 @@ impl Index {
     /// full paths, so each is re-inserted through the normal path (which
     /// re-derives its parent link from the current index). A delta insert that
     /// updates a path already in the base tombstones the old record first, so
-    /// the fold does not leave a duplicate.
+    /// the fold does not leave a duplicate. If that path was a directory, its
+    /// live children move onto the replacement record rather than stay linked
+    /// to the tombstone.
     pub fn apply_delta(&mut self, delta: &DeltaIndex) {
         let mut buf: Vec<u8> = Vec::new();
+        // Remember which record each removal displaced. A later insert at the
+        // same path (a directory metadata update) must adopt its live children.
+        let mut removed: HashMap<String, u32> = HashMap::new();
         for &idx in delta.removes() {
             let i = idx as usize;
             if i < self.records.len() && !self.records[i].is_deleted() {
@@ -1561,6 +1592,17 @@ impl Index {
                 self.map_remove(&key);
                 self.records[i].flags |= FLAG_DELETED;
                 self.live -= 1;
+                // Only a path the delta also re-inserts needs its old record
+                // kept for child adoption; retaining every removed path would
+                // double the memory a large subtree deletion already streams.
+                let reinserted = delta
+                    .index
+                    .get(key.as_str())
+                    .and_then(|&i| delta.records().get(i as usize))
+                    .is_some_and(|rec| !rec.is_deleted());
+                if reinserted {
+                    removed.insert(key, idx);
+                }
             }
         }
         for rec in delta.records() {
@@ -1573,21 +1615,33 @@ impl Index {
             }
             let bytes = stored_bytes(rec, delta.paths());
             let path = Path::new(std::str::from_utf8(bytes).unwrap_or(""));
-            if let Some(existing) = self.find(path) {
+            let key = path.to_string_lossy();
+            let old = removed
+                .get(key.as_ref())
+                .copied()
+                .or_else(|| self.find(path));
+            if let Some(existing) = old {
                 let e = existing as usize;
                 if !self.records[e].is_deleted() {
-                    self.map_remove(&path.to_string_lossy());
+                    self.map_remove(key.as_ref());
                     self.records[e].flags |= FLAG_DELETED;
                     self.live -= 1;
                 }
             }
-            self.insert_with_flags(
+            let new_idx = self.insert_with_flags(
                 path,
                 rec.is_dir(),
                 rec.is_symlink(),
                 rec.size as u64,
                 rec.mtime as i64,
             );
+            if rec.is_dir() {
+                if let Some(old) = old {
+                    if self.records[old as usize].is_dir() {
+                        self.subtree.adopt_children(&mut self.records, old, new_idx);
+                    }
+                }
+            }
         }
         self.invalidate_cache();
     }
@@ -3469,9 +3523,9 @@ mod tests {
 
     #[test]
     fn compact_keeps_full_paths_when_a_parent_is_tombstoned() {
-        // A delta fold can replace a directory record while its children stay
-        // live, so the old parent index becomes a tombstone. Compaction remaps
-        // that link to the sentinel; a basename-stored child must then switch to
+        // A directory record can be tombstoned while its children stay live
+        // (e.g. an older fold left this split state). Compaction remaps that
+        // link to the sentinel; a basename-stored child must then switch to
         // full-path storage or its basename is reinterpreted as a whole path.
         let mut index = Index::new();
         index.add_root(Path::new("/"), FsKind::Other);
@@ -3481,8 +3535,8 @@ mod tests {
 
         let mut delta = DeltaIndex::new();
         delta.remove(dir);
-        delta.insert(Path::new("/home/dir"), true, false, 0, 0);
         index.apply_delta(&delta);
+        assert!(index.record(dir).is_deleted());
         index.compact();
 
         let file = index
@@ -4054,6 +4108,69 @@ mod tests {
         assert!(index.find(Path::new("/c.txt")).is_some());
         // Live: the root, /b.txt, and /c.txt.
         assert_eq!(index.len(), 3);
+    }
+
+    #[test]
+    fn apply_delta_replacing_a_directory_keeps_its_children_live() {
+        // A metadata event on an evicted directory queues a removal of the base
+        // record plus an insert at the same path. The replacement must adopt the
+        // still-live children, or later subtree operations miss them.
+        let mut index = Index::new();
+        index.add_root(Path::new("/"), FsKind::Other);
+        index.insert(Path::new("/home"), true, 0, 0);
+        let dir = index.insert(Path::new("/home/dir"), true, 0, 0);
+        index.insert(Path::new("/home/dir/file.txt"), false, 1, 0);
+        let sub = index.insert(Path::new("/home/dir/sub"), true, 0, 0);
+        index.insert(Path::new("/home/dir/sub/nested.txt"), false, 2, 0);
+
+        let mut delta = DeltaIndex::new();
+        delta.remove(dir);
+        delta.insert(Path::new("/home/dir"), true, false, 0, 0);
+        index.apply_delta(&delta);
+
+        let replacement = index.find(Path::new("/home/dir")).unwrap();
+        assert!(!index.record(replacement).is_deleted());
+        let file = index.find(Path::new("/home/dir/file.txt")).unwrap();
+        assert_eq!(index.record(file).parent, replacement);
+        assert_eq!(index.path(file), "/home/dir/file.txt");
+        assert_eq!(
+            index
+                .record(index.find(Path::new("/home/dir/sub")).unwrap())
+                .parent,
+            replacement
+        );
+        assert_eq!(
+            index
+                .record(index.find(Path::new("/home/dir/sub/nested.txt")).unwrap())
+                .parent,
+            sub
+        );
+
+        assert!(index.rename(Path::new("/home/dir"), Path::new("/home/other")));
+        assert!(index.find(Path::new("/home/dir/file.txt")).is_none());
+        let moved = index.find(Path::new("/home/other/file.txt")).unwrap();
+        assert_eq!(index.path(moved), "/home/other/file.txt");
+        let nested = index.find(Path::new("/home/other/sub/nested.txt")).unwrap();
+        assert_eq!(index.path(nested), "/home/other/sub/nested.txt");
+        assert_eq!(index.search("nested", 10, 0).total, 1);
+    }
+
+    #[test]
+    fn removing_a_replaced_directory_drops_its_live_children() {
+        let mut index = Index::new();
+        index.add_root(Path::new("/"), FsKind::Other);
+        index.insert(Path::new("/home"), true, 0, 0);
+        let dir = index.insert(Path::new("/home/dir"), true, 0, 0);
+        index.insert(Path::new("/home/dir/file.txt"), false, 1, 0);
+
+        let mut delta = DeltaIndex::new();
+        delta.remove(dir);
+        delta.insert(Path::new("/home/dir"), true, false, 0, 0);
+        index.apply_delta(&delta);
+
+        assert!(index.remove(Path::new("/home/dir")));
+        assert!(index.find(Path::new("/home/dir/file.txt")).is_none());
+        assert_eq!(index.search("file.txt", 10, 0).total, 0);
     }
 
     #[test]
