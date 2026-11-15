@@ -499,8 +499,11 @@ impl SubtreeIndex {
     /// stack. A child whose `parent` no longer points at the directory is a
     /// stale link left by a rename and is skipped, along with its subtree.
     pub(crate) fn collect_subtree(&self, records: &[FileRecord], root: u32, out: &mut Vec<u32>) {
+        // Walk only the records this call appends. `out` may already hold a
+        // previous subtree, and starting the cursor at zero would revisit those
+        // records and append their descendants again.
+        let mut cursor = out.len();
         out.push(root);
-        let mut cursor = 0usize;
         while cursor < out.len() {
             let dir = out[cursor];
             cursor += 1;
@@ -3134,6 +3137,25 @@ mod tests {
         assert!(index.remove(Path::new("/home")));
         assert_eq!(index.len(), 0);
         assert!(index.find(Path::new("/home/sam/a.txt")).is_none());
+    }
+
+    #[test]
+    fn removing_a_directory_does_not_duplicate_parentless_subtree_records() {
+        let mut index = Index::new();
+        // Inserting /home/sam before /home leaves it parentless, so its linked
+        // child is collected from the parentless scan rather than /home's
+        // child links. /home/bob/b.txt is a second, separate parentless
+        // orphan under the same prefix.
+        index.insert(Path::new("/home/sam"), true, 0, 0);
+        index.insert(Path::new("/home"), true, 0, 0);
+        index.insert(Path::new("/home/sam/a.txt"), false, 1, 0);
+        index.insert(Path::new("/home/bob/b.txt"), false, 1, 0);
+        assert_eq!(index.len(), 4);
+
+        assert!(index.remove(Path::new("/home")));
+        assert_eq!(index.len(), 0);
+        assert!(index.find(Path::new("/home/sam/a.txt")).is_none());
+        assert!(index.find(Path::new("/home/bob/b.txt")).is_none());
     }
 
     #[test]
