@@ -589,12 +589,17 @@ fn subtree_ends(records: &[FileRecord]) -> Vec<u32> {
     for (i, rec) in records.iter().enumerate() {
         let end = (i + 1) as u32;
         let mut p = rec.parent;
-        while p != u32::MAX {
+        // Bound the walk by the record count: a valid chain visits each record
+        // at most once, so a longer walk means a corrupt parent cycle. Breaking
+        // there leaves the affected ranges incomplete instead of hanging.
+        let mut steps = 0usize;
+        while p != u32::MAX && steps < records.len() {
             let pi = p as usize;
             if ends[pi] < end {
                 ends[pi] = end;
             }
             p = records[pi].parent;
+            steps += 1;
         }
     }
     ends
@@ -1931,6 +1936,13 @@ impl Index {
     /// Rename or move `old` to `new`, updating the record and its subtree.
     /// Returns whether anything was renamed.
     pub fn rename(&mut self, old: &Path, new: &Path) -> bool {
+        // Reject a rename onto itself or into its own subtree. Renaming `/a` to
+        // `/a/b/a` would make `/a` a child of `/a/b` while `/a/b` remains a
+        // child of `/a`, forming a parent cycle that the subtree walks never
+        // terminate on. Moving to an ancestor (`/a/b` -> `/a`) is legal.
+        if new.starts_with(old) {
+            return false;
+        }
         let old_key = old.to_string_lossy();
         let new_key = new.to_string_lossy();
         let old_prefix = format!("{old_key}/");
@@ -3125,6 +3137,67 @@ mod tests {
         let mut index = Index::new();
         index.insert(Path::new("/a.txt"), false, 1, 0);
         assert!(!index.rename(Path::new("/nope.txt"), Path::new("/x.txt")));
+    }
+
+    #[test]
+    fn rename_into_own_descendant_is_rejected_and_leaves_index_usable() {
+        let mut index = Index::new();
+        index.insert(Path::new("/a"), true, 0, 0);
+        index.insert(Path::new("/a/b"), true, 0, 0);
+        index.insert(Path::new("/a/b/c.txt"), false, 1, 0);
+
+        let a = idx_of(&index, "/a");
+        let b = idx_of(&index, "/a/b");
+
+        // Moving `/a` below `/a/b` would make `/a` its own ancestor and leave
+        // `subtree_ends` walking `0 -> 1 -> 0` forever.
+        assert!(!index.rename(Path::new("/a"), Path::new("/a/b/a")));
+        // A rename onto the same path must also be rejected.
+        assert!(!index.rename(Path::new("/a"), Path::new("/a")));
+        assert_eq!(index.record(a).parent, u32::MAX);
+        assert_eq!(index.record(b).parent, a);
+        assert!(index.find(Path::new("/a/b/a")).is_none());
+        assert_eq!(index.search("c.txt", 10, 0).hits.len(), 1);
+
+        // A destination outside the old subtree, even one sharing its prefix,
+        // is still a legal move.
+        assert!(index.rename(Path::new("/a/b"), Path::new("/a/c")));
+        assert!(index.find(Path::new("/a/c/c.txt")).is_some());
+
+        // Compaction and scan batches rebuild the subtree ranges; the rejected
+        // rename must not make either walk hang.
+        index.insert(Path::new("/a/c/gone.txt"), false, 1, 0);
+        assert!(index.remove(Path::new("/a/c/gone.txt")));
+        index.compact();
+        assert_eq!(index.search("c.txt", 10, 0).hits.len(), 1);
+
+        index.insert_batch([BatchEntry {
+            path: b"/a/d.txt",
+            is_dir: false,
+            is_symlink: false,
+            size: 1,
+            mtime: 0,
+        }]);
+        assert!(index.find(Path::new("/a/d.txt")).is_some());
+    }
+
+    #[test]
+    fn subtree_ends_terminates_on_a_parent_cycle() {
+        // Defence in depth: even if a corrupt chain slips in, the ancestry walk
+        // must terminate rather than spin forever.
+        let records: Vec<FileRecord> = [1, 0]
+            .into_iter()
+            .map(|parent| FileRecord {
+                size: 0,
+                mtime: 0,
+                parent,
+                path_off: 0,
+                path_len: 0,
+                depth: 1,
+                flags: FLAG_DIR,
+            })
+            .collect();
+        assert_eq!(subtree_ends(&records), vec![2, 2]);
     }
 
     #[test]
