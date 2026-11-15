@@ -503,6 +503,47 @@ mod tests {
     }
 
     #[test]
+    fn modified_directory_keeps_evicted_children_after_fold() {
+        // A metadata event on an evicted directory queues a removal of the base
+        // record plus an insert at the same path. Folding that delta must move
+        // the live children onto the replacement, or removing the directory
+        // later leaves its children searchable forever.
+        let base = temp_dir("delta-modified-dir");
+        let dir = base.join("dir");
+        let child = dir.join("sub/child.txt");
+        fs::create_dir_all(child.parent().unwrap()).unwrap();
+        fs::write(&child, b"x").unwrap();
+
+        let mut index = Index::new();
+        let config = ScanConfig::with_roots(vec![base.clone()]);
+        apply(&mut index, &FsEvent::Created(base.clone()), &config);
+        let by_path = PathIndex::build(index.records(), index.paths());
+
+        let mut delta = DeltaIndex::new();
+        assert!(apply_delta(
+            &mut delta,
+            &by_path,
+            index.records(),
+            index.paths(),
+            &FsEvent::Modified(dir.clone()),
+            &config
+        ));
+        index.apply_delta(&delta);
+
+        let replacement = index.find(&dir).unwrap();
+        let sub_idx = index.find(&dir.join("sub")).unwrap();
+        assert_eq!(index.record(sub_idx).parent, replacement);
+        let child_idx = index.find(&child).unwrap();
+        assert_eq!(index.record(child_idx).parent, sub_idx);
+
+        assert!(index.remove(&dir));
+        assert!(index.find(&child).is_none());
+        assert_eq!(index.search("child.txt", 10, 0).total, 0);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn excluded_paths_are_not_added_by_live_events() {
         // Regression (issue #32): `apply` never consulted the excludes, so a
         // created (or renamed-in) excluded file/directory was indexed even

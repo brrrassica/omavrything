@@ -1327,10 +1327,10 @@ mod tests {
 
     #[test]
     fn encode_keeps_full_paths_when_a_parent_is_tombstoned() {
-        // A delta fold can replace a directory record while its children stay
-        // live. The encoder remaps the dead parent to the sentinel, so the child
-        // must be written with its full path, not the basename it stored while
-        // the parent was alive.
+        // A directory record can be tombstoned while its children stay live
+        // (e.g. an older fold left this split state). The encoder remaps the
+        // dead parent to the sentinel, so the child must be written with its
+        // full path, not the basename it stored while the parent was alive.
         let mut index = Index::new();
         index.add_root(Path::new("/"), FsKind::Other);
         index.insert(Path::new("/home"), true, 0, 0);
@@ -1339,8 +1339,8 @@ mod tests {
 
         let mut delta = DeltaIndex::new();
         delta.remove(dir);
-        delta.insert(Path::new("/home/dir"), true, false, 0, 0);
         index.apply_delta(&delta);
+        assert!(index.record(dir).is_deleted());
 
         let bytes = encode(&index, &[]);
         let (decoded, _) = decode(&bytes).unwrap();
