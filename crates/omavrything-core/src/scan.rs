@@ -1121,6 +1121,48 @@ mod tests {
     }
 
     #[test]
+    fn rescan_removes_stale_records_with_non_utf8_paths() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let base = temp_dir("rescan-nonutf8");
+        fs::create_dir_all(&base).unwrap();
+        let name = OsString::from_vec(b"bad\xff.txt".to_vec());
+        let path = base.join(&name);
+        fs::write(&path, b"x").unwrap();
+
+        let config = ScanConfig::with_roots(vec![base.clone()]);
+        let (mut index, _) = scan(&config);
+        let before = index
+            .iter()
+            .filter(|(i, r)| !r.is_dir() && index.name(*i).contains("bad"))
+            .count();
+        assert_eq!(before, 1, "non-UTF8 file should be indexed");
+
+        fs::remove_file(&path).unwrap();
+        let plan = plan_rescan(&config);
+        let rec_idx = index
+            .iter()
+            .find(|(i, r)| !r.is_dir() && index.name(*i).contains("bad"))
+            .map(|(i, _)| i)
+            .unwrap();
+        let mut buf = String::new();
+        index.write_path(rec_idx, &mut buf);
+        let p = std::path::Path::new(&buf);
+        let absent = plan.coverage.iter().any(|c| c.established_absent(p));
+        assert!(absent, "path {buf:?} should be established absent");
+        let removed = index.remove(p);
+        assert!(removed, "remove should succeed for {buf:?}");
+        let after = index
+            .iter()
+            .filter(|(i, r)| !r.is_dir() && index.name(*i).contains("bad"))
+            .count();
+        assert_eq!(after, 0, "stale non-UTF8 record should be removed by rescan");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn rescan_preserves_records_under_pruned_subtrees() {
         let base = temp_dir("rescan-pruned");
         fs::create_dir_all(base.join("media/vol")).unwrap();

@@ -254,7 +254,13 @@ impl PathIndex {
     /// The record index for `key`, or `None`. `records`/`paths` are the index's
     /// arenas, used to confirm the hash match.
     pub fn get(&self, key: &str, records: &[FileRecord], paths: &[u8]) -> Option<u32> {
-        self.get_bytes(key.as_bytes(), records, paths)
+        let h = fnv1a32(key.as_bytes());
+        if let Some(&idx) = self.main.get(&h) {
+            if record_path_eq_lossy(&records[idx as usize], records, paths, key) {
+                return Some(idx);
+            }
+        }
+        self.collisions.get(key).copied()
     }
 
     /// Build the map from a record/path arena (e.g. a snapshot image).
@@ -283,27 +289,17 @@ impl PathIndex {
 
     /// Like [`PathIndex::get`], but takes the key as raw bytes so a bulk insert
     /// that already holds the path in an arena avoids allocating a `String` per
-    /// lookup (F5).
+    /// lookup (F5). The bytes are interpreted as a lossy UTF-8 path key.
     fn get_bytes(&self, key: &[u8], records: &[FileRecord], paths: &[u8]) -> Option<u32> {
-        let h = fnv1a32(key);
-        if let Some(&idx) = self.main.get(&h) {
-            if record_path_eq(&records[idx as usize], records, paths, key) {
-                return Some(idx);
-            }
-        }
-        // Collisions are keyed by the full path; a byte key is valid UTF-8 in
-        // practice (paths come from `OsStr` bytes), so a lossy conversion is
-        // only reached for the rare colliding path.
-        std::str::from_utf8(key)
-            .ok()
-            .and_then(|s| self.collisions.get(s).copied())
+        let key = String::from_utf8_lossy(key);
+        self.get(key.as_ref(), records, paths)
     }
 
     /// Record `key` -> `idx`, keeping a colliding path in the fallback map.
     fn insert(&mut self, key: &str, idx: u32, records: &[FileRecord], paths: &[u8]) {
         let h = fnv1a32(key.as_bytes());
         let collides = self.main.get(&h).copied().is_some_and(|existing| {
-            !record_path_eq(&records[existing as usize], records, paths, key.as_bytes())
+            !record_path_eq_lossy(&records[existing as usize], records, paths, key)
         });
         if collides {
             self.collisions.insert(key.into(), idx);
@@ -315,29 +311,18 @@ impl PathIndex {
 
     /// Like [`PathIndex::insert`], but takes the key as raw bytes so callers
     /// that already have the path in the arena (`compact`, `from_parts`) avoid
-    /// allocating a `String` per record. The caller must ensure `key` is not
-    /// currently in `collisions`, which holds when the map is built from
-    /// scratch.
+    /// allocating a `String` per record. The bytes are interpreted as a lossy
+    /// UTF-8 path key.
     fn insert_bytes(&mut self, key: &[u8], idx: u32, records: &[FileRecord], paths: &[u8]) {
-        let h = fnv1a32(key);
-        let collides = self.main.get(&h).copied().is_some_and(|existing| {
-            !record_path_eq(&records[existing as usize], records, paths, key)
-        });
-        if collides {
-            self.collisions.insert(
-                String::from_utf8_lossy(key).into_owned().into_boxed_str(),
-                idx,
-            );
-        } else {
-            self.main.insert(h, idx);
-        }
+        let key = String::from_utf8_lossy(key);
+        self.insert(key.as_ref(), idx, records, paths);
     }
 
     /// Remove `key` from the index.
     fn remove(&mut self, key: &str, records: &[FileRecord], paths: &[u8]) {
         let h = fnv1a32(key.as_bytes());
         if let Some(&idx) = self.main.get(&h) {
-            if record_path_eq(&records[idx as usize], records, paths, key.as_bytes()) {
+            if record_path_eq_lossy(&records[idx as usize], records, paths, key) {
                 self.main.remove(&h);
                 return;
             }
@@ -690,19 +675,35 @@ pub(crate) fn write_full_path_bytes(
     }
 }
 
-/// Whether `rec`'s full path equals `key`.
-fn record_path_eq(rec: &FileRecord, records: &[FileRecord], paths: &[u8], key: &[u8]) -> bool {
+/// Whether `rec`'s lossy-decoded full path equals `key`.
+fn record_path_eq_lossy(
+    rec: &FileRecord,
+    records: &[FileRecord],
+    paths: &[u8],
+    key: &str,
+) -> bool {
+    let mut buf = String::new();
+    write_full_path_lossy(rec, records, paths, &mut buf);
+    buf == key
+}
+
+/// Write a record's lossy-decoded full path into `out`.
+fn write_full_path_lossy(
+    rec: &FileRecord,
+    records: &[FileRecord],
+    paths: &[u8],
+    out: &mut String,
+) {
     if stores_full_path(rec) {
-        stored_bytes(rec, paths) == key
+        out.push_str(&String::from_utf8_lossy(stored_bytes(rec, paths)));
     } else {
         let parent = &records[rec.parent as usize];
-        let p = stored_bytes(parent, paths);
-        let n = stored_bytes(rec, paths);
-        let sep = if p.ends_with(b"/") { 0 } else { 1 };
-        key.len() == p.len() + sep + n.len()
-            && key.starts_with(p)
-            && (sep == 0 || key[p.len()] == b'/')
-            && &key[p.len() + sep..] == n
+        let p = String::from_utf8_lossy(stored_bytes(parent, paths));
+        out.push_str(&p);
+        if !p.ends_with('/') {
+            out.push('/');
+        }
+        out.push_str(&String::from_utf8_lossy(stored_bytes(rec, paths)));
     }
 }
 
@@ -863,7 +864,7 @@ fn hit_image(records: &[FileRecord], paths: &[u8], idx: u32) -> Hit {
     let mut buf: Vec<u8> = Vec::new();
     write_full_path_bytes(rec, records, paths, &mut buf);
     Hit {
-        path: String::from_utf8(buf).unwrap_or_default(),
+        path: String::from_utf8_lossy(&buf).into_owned(),
         name: String::from_utf8_lossy(name_bytes(rec, paths)).into_owned(),
         size: rec.size as u64,
         mtime: rec.mtime as i64,
@@ -1815,9 +1816,9 @@ impl Index {
     }
 
     /// The basename of a record, derived from its full path.
-    pub fn name(&self, idx: u32) -> &str {
+    pub fn name(&self, idx: u32) -> Cow<'_, str> {
         let rec = &self.records[idx as usize];
-        std::str::from_utf8(name_bytes(rec, &self.paths)).unwrap_or("")
+        String::from_utf8_lossy(name_bytes(rec, &self.paths))
     }
 
     /// The full path of a record.
@@ -1827,7 +1828,7 @@ impl Index {
     pub fn path(&self, idx: u32) -> Cow<'_, str> {
         let rec = &self.records[idx as usize];
         if stores_full_path(rec) {
-            Cow::Borrowed(std::str::from_utf8(stored_bytes(rec, &self.paths)).unwrap_or(""))
+            String::from_utf8_lossy(stored_bytes(rec, &self.paths))
         } else {
             let mut s = String::new();
             self.write_path(idx, &mut s);
@@ -1839,16 +1840,16 @@ impl Index {
     pub fn write_path(&self, idx: u32, out: &mut String) {
         let rec = &self.records[idx as usize];
         if stores_full_path(rec) {
-            out.push_str(std::str::from_utf8(stored_bytes(rec, &self.paths)).unwrap_or(""));
+            out.push_str(&String::from_utf8_lossy(stored_bytes(rec, &self.paths)));
         } else {
             let parent = &self.records[rec.parent as usize];
-            let p = std::str::from_utf8(stored_bytes(parent, &self.paths)).unwrap_or("");
-            out.push_str(p);
+            let p = String::from_utf8_lossy(stored_bytes(parent, &self.paths));
+            out.push_str(&p);
             // The filesystem root "/" already ends with a separator.
             if !p.ends_with('/') {
                 out.push('/');
             }
-            out.push_str(std::str::from_utf8(stored_bytes(rec, &self.paths)).unwrap_or(""));
+            out.push_str(&String::from_utf8_lossy(stored_bytes(rec, &self.paths)));
         }
     }
 
