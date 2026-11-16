@@ -934,7 +934,7 @@ pub(crate) fn run_ntfs_startup(
         // `ntfs_remount_readonly` is remounted read-only here; every other
         // writable mount is left untouched and the MFT path refuses it, so the
         // generic walker indexes it read-only instead.
-        let allow_remount = config.may_remount_readonly(part.uuid.as_deref());
+        let allow_remount = ntfs::automatic_remount_allowed(config.as_ref(), part);
         match contain_panic(|| {
             ntfs::mount_index_and_remember_with_ownership(
                 index.as_ref(),
@@ -992,9 +992,15 @@ pub(crate) fn run_ntfs_startup(
     // toggled on again at runtime).
     let hotplug_index = Arc::clone(&index);
     let hotplug_policy = Arc::clone(&policy);
+    let hotplug_config = Arc::clone(&config);
     let hotplug_ownership = Arc::clone(&ownership);
     spawn_thread("omavry-ntfs-hotplug", CONTROL_STACK, move || {
-        ntfs::run_hotplug_monitor(hotplug_index, hotplug_policy, hotplug_ownership)
+        ntfs::run_hotplug_monitor(
+            hotplug_index,
+            hotplug_policy,
+            hotplug_config,
+            hotplug_ownership,
+        )
     });
 }
 

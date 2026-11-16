@@ -6,6 +6,19 @@ Notable changes to `omavrything`. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **Hotplug no longer remounts a writable NTFS volume read-only just because it
+  was indexed before.** `run_hotplug_monitor` treated a remembered UUID as
+  permission and passed `allow_remount = true`, so a volume first seen
+  read-only could be indexed automatically and then, when the desktop mounted
+  it writable, be remounted read-only even though `ntfs_remount_readonly` was
+  empty — taking write access away from desktop applications. Startup and
+  hotplug now share `automatic_remount_allowed`, which consults only the
+  explicit opt-in list: being remembered authorizes re-indexing, not
+  remounting. Regression test:
+  `a_remembered_uuid_does_not_authorize_an_automatic_remount`.
+
 ## [0.2.7] — 2026-11-14
 
 ### Changed
