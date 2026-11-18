@@ -21,6 +21,8 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::ops::Bound;
 use std::path::Path;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
@@ -203,16 +205,13 @@ impl SearchTiming {
 /// Maps full paths to record indices without duplicating the path bytes.
 ///
 /// The primary map is keyed by a 32-bit hash of the path; the path arena is
-/// consulted to confirm a match. A 32-bit key halves the map's per-entry cost
-/// (a `(u32, u32)` tuple is 8 bytes, versus 16 for `(u64, u32)`). A hash
-/// collision (two distinct paths with the same hash) is kept in `collisions`,
-/// keyed by the full path, so lookups stay correct. This replaces the previous
-/// `HashMap<Box<str>, u32>`, which stored a second copy of every path and
-/// dominated the index's memory use.
+/// consulted to confirm a match. A 32-bit key halves the map's per-entry cost.
+/// A hash collision (two distinct paths with the same hash) is kept in
+/// `collisions`, keyed by the full path bytes, so lookups stay correct.
 #[derive(Debug, Default, Clone)]
 pub struct PathIndex {
     main: HashMap<u32, u32>,
-    collisions: HashMap<Box<str>, u32>,
+    collisions: HashMap<Vec<u8>, u32>,
 }
 
 impl PathIndex {
@@ -253,10 +252,11 @@ impl PathIndex {
 
     /// The record index for `key`, or `None`. `records`/`paths` are the index's
     /// arenas, used to confirm the hash match.
-    pub fn get(&self, key: &str, records: &[FileRecord], paths: &[u8]) -> Option<u32> {
-        let h = fnv1a32(key.as_bytes());
+    pub fn get(&self, key: impl AsRef<[u8]>, records: &[FileRecord], paths: &[u8]) -> Option<u32> {
+        let key = key.as_ref();
+        let h = fnv1a32(key);
         if let Some(&idx) = self.main.get(&h) {
-            if record_path_eq_lossy(&records[idx as usize], records, paths, key) {
+            if record_path_eq(&records[idx as usize], records, paths, key) {
                 return Some(idx);
             }
         }
@@ -287,42 +287,36 @@ impl PathIndex {
         (self.len() * (std::mem::size_of::<u32>() + std::mem::size_of::<u32>() + 1)) as u64
     }
 
-    /// Like [`PathIndex::get`], but takes the key as raw bytes so a bulk insert
-    /// that already holds the path in an arena avoids allocating a `String` per
-    /// lookup (F5). The bytes are interpreted as a lossy UTF-8 path key.
-    fn get_bytes(&self, key: &[u8], records: &[FileRecord], paths: &[u8]) -> Option<u32> {
-        let key = String::from_utf8_lossy(key);
-        self.get(key.as_ref(), records, paths)
+    /// Like [`PathIndex::get`], but takes the key as raw bytes.
+    pub(crate) fn get_bytes(&self, key: &[u8], records: &[FileRecord], paths: &[u8]) -> Option<u32> {
+        self.get(key, records, paths)
     }
 
     /// Record `key` -> `idx`, keeping a colliding path in the fallback map.
-    fn insert(&mut self, key: &str, idx: u32, records: &[FileRecord], paths: &[u8]) {
-        let h = fnv1a32(key.as_bytes());
+    fn insert(&mut self, key: impl AsRef<[u8]>, idx: u32, records: &[FileRecord], paths: &[u8]) {
+        self.insert_bytes(key.as_ref(), idx, records, paths);
+    }
+
+    /// Like [`PathIndex::insert`], but takes the key as raw bytes.
+    fn insert_bytes(&mut self, key: &[u8], idx: u32, records: &[FileRecord], paths: &[u8]) {
+        let h = fnv1a32(key);
         let collides = self.main.get(&h).copied().is_some_and(|existing| {
-            !record_path_eq_lossy(&records[existing as usize], records, paths, key)
+            !record_path_eq(&records[existing as usize], records, paths, key)
         });
         if collides {
-            self.collisions.insert(key.into(), idx);
+            self.collisions.insert(key.to_vec(), idx);
         } else {
             self.main.insert(h, idx);
             self.collisions.remove(key);
         }
     }
 
-    /// Like [`PathIndex::insert`], but takes the key as raw bytes so callers
-    /// that already have the path in the arena (`compact`, `from_parts`) avoid
-    /// allocating a `String` per record. The bytes are interpreted as a lossy
-    /// UTF-8 path key.
-    fn insert_bytes(&mut self, key: &[u8], idx: u32, records: &[FileRecord], paths: &[u8]) {
-        let key = String::from_utf8_lossy(key);
-        self.insert(key.as_ref(), idx, records, paths);
-    }
-
     /// Remove `key` from the index.
-    fn remove(&mut self, key: &str, records: &[FileRecord], paths: &[u8]) {
-        let h = fnv1a32(key.as_bytes());
+    fn remove(&mut self, key: impl AsRef<[u8]>, records: &[FileRecord], paths: &[u8]) {
+        let key = key.as_ref();
+        let h = fnv1a32(key);
         if let Some(&idx) = self.main.get(&h) {
-            if record_path_eq_lossy(&records[idx as usize], records, paths, key) {
+            if record_path_eq(&records[idx as usize], records, paths, key) {
                 self.main.remove(&h);
                 return;
             }
@@ -584,6 +578,23 @@ fn fnv1a32(data: &[u8]) -> u32 {
     hash
 }
 
+#[cfg(unix)]
+#[inline]
+fn path_as_bytes(path: &Path) -> &[u8] {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes()
+}
+
+#[cfg(not(unix))]
+#[inline]
+fn path_as_bytes(path: &Path) -> &[u8] {
+    // Non-Unix platforms encode paths as UTF-16/other; the index stores UTF-8
+    // byte paths, so fall back to the lossy UTF-8 form there.
+    // This allocates-free path is not available; callers that need owned bytes
+    // should not use this on non-Unix. Kept for API symmetry.
+    path.to_str().unwrap_or("").as_bytes()
+}
+
 /// Saturating conversion of a byte size to the record's `u32` field.
 fn size_to_u32(size: u64) -> u32 {
     size.min(u32::MAX as u64) as u32
@@ -675,7 +686,20 @@ pub(crate) fn write_full_path_bytes(
     }
 }
 
+/// Whether `rec`'s full path equals `key` byte-for-byte.
+fn record_path_eq(
+    rec: &FileRecord,
+    records: &[FileRecord],
+    paths: &[u8],
+    key: &[u8],
+) -> bool {
+    let mut buf = Vec::new();
+    write_full_path_bytes(rec, records, paths, &mut buf);
+    buf == key
+}
+
 /// Whether `rec`'s lossy-decoded full path equals `key`.
+#[allow(dead_code)]
 fn record_path_eq_lossy(
     rec: &FileRecord,
     records: &[FileRecord],
@@ -688,6 +712,7 @@ fn record_path_eq_lossy(
 }
 
 /// Write a record's lossy-decoded full path into `out`.
+#[allow(dead_code)]
 fn write_full_path_lossy(
     rec: &FileRecord,
     records: &[FileRecord],
@@ -1586,14 +1611,13 @@ impl Index {
         let mut buf: Vec<u8> = Vec::new();
         // Remember which record each removal displaced. A later insert at the
         // same path (a directory metadata update) must adopt its live children.
-        let mut removed: HashMap<String, u32> = HashMap::new();
+        let mut removed: HashMap<Vec<u8>, u32> = HashMap::new();
         for &idx in delta.removes() {
             let i = idx as usize;
             if i < self.records.len() && !self.records[i].is_deleted() {
                 buf.clear();
                 write_full_path_bytes(&self.records[i], &self.records, &self.paths, &mut buf);
-                let key = String::from_utf8_lossy(&buf).into_owned();
-                self.map_remove(&key);
+                self.map_remove(&buf);
                 self.records[i].flags |= FLAG_DELETED;
                 self.live -= 1;
                 // Only a path the delta also re-inserts needs its old record
@@ -1601,39 +1625,37 @@ impl Index {
                 // double the memory a large subtree deletion already streams.
                 let reinserted = delta
                     .index
-                    .get(key.as_str())
+                    .get(buf.as_slice())
                     .and_then(|&i| delta.records().get(i as usize))
                     .is_some_and(|rec| !rec.is_deleted());
                 if reinserted {
-                    removed.insert(key, idx);
+                    removed.insert(buf.clone(), idx);
                 }
             }
         }
         for rec in delta.records() {
             // A path created and then removed before the fold is tombstoned by
             // `DeltaIndex::remove_path`; re-inserting it here would resurrect a
-            // path that no longer exists, because `insert_with_flags` rebuilds
-            // the flags and drops the tombstone.
+            // path that no longer exists, because `insert_with_flags_bytes`
+            // rebuilds the flags and drops the tombstone.
             if rec.is_deleted() {
                 continue;
             }
             let bytes = stored_bytes(rec, delta.paths());
-            let path = Path::new(std::str::from_utf8(bytes).unwrap_or(""));
-            let key = path.to_string_lossy();
             let old = removed
-                .get(key.as_ref())
+                .get(bytes)
                 .copied()
-                .or_else(|| self.find(path));
+                .or_else(|| self.find_bytes(bytes));
             if let Some(existing) = old {
                 let e = existing as usize;
                 if !self.records[e].is_deleted() {
-                    self.map_remove(key.as_ref());
+                    self.map_remove(bytes);
                     self.records[e].flags |= FLAG_DELETED;
                     self.live -= 1;
                 }
             }
-            let new_idx = self.insert_with_flags(
-                path,
+            let new_idx = self.insert_with_flags_bytes(
+                bytes,
                 rec.is_dir(),
                 rec.is_symlink(),
                 rec.size as u64,
@@ -1642,7 +1664,8 @@ impl Index {
             if rec.is_dir() {
                 if let Some(old) = old {
                     if self.records[old as usize].is_dir() {
-                        self.subtree.adopt_children(&mut self.records, old, new_idx);
+                        self.subtree
+                            .adopt_children(&mut self.records, old, new_idx);
                     }
                 }
             }
@@ -1652,13 +1675,14 @@ impl Index {
 
     /// The record index for a path given as raw bytes, if present.
     pub(crate) fn find_bytes(&self, key: &[u8]) -> Option<u32> {
-        self.by_path.get_bytes(key, &self.records, &self.paths)
+        self.by_path.get(key, &self.records, &self.paths)
     }
 
     /// Invalidate every memoized query result. Called on any mutation (F7); a
     /// single atomic increment, so it does not slow the insert path.
     fn invalidate_cache(&self) {
-        self.cache_generation.fetch_add(1, AtomicOrdering::Relaxed);
+        self.cache_generation
+            .fetch_add(1, AtomicOrdering::Relaxed);
     }
 
     /// Iterate over live (non-deleted) records as `(record index, record)`.
@@ -1680,7 +1704,8 @@ impl Index {
             Some(idx) => idx,
             None => self.insert(path, true, 0, 0),
         };
-        let path_str = path.to_string_lossy().into_owned();
+        // Roots are tracked as display strings; preserve bytes lossily for storage.
+        let path_str = String::from_utf8_lossy(path_as_bytes(path)).into_owned();
         match self.roots.iter_mut().find(|r| r.path == path_str) {
             Some(root) => root.fs_kind = fs_kind,
             None => self.roots.push(Root {
@@ -1698,9 +1723,9 @@ impl Index {
     /// Used when a volume is unmounted: its records must stop being served and
     /// the root must no longer be reported by [`Index::roots`].
     pub fn remove_root(&mut self, path: &Path) -> bool {
-        let path_str = path.to_string_lossy();
-        let had_root = self.roots.iter().any(|r| r.path == path_str);
-        self.roots.retain(|r| r.path != path_str);
+        let path_str = String::from_utf8_lossy(path_as_bytes(path));
+        let had_root = self.roots.iter().any(|r| r.path == path_str.as_ref());
+        self.roots.retain(|r| r.path != path_str.as_ref());
         let removed = self.remove(path);
         self.invalidate_cache();
         had_root || removed
@@ -1720,26 +1745,35 @@ impl Index {
         size: u64,
         mtime: i64,
     ) -> u32 {
-        let path_str = path.to_string_lossy();
-        let parent = path
-            .parent()
-            .and_then(|p| self.find_str(p.to_string_lossy().as_ref()))
+        self.insert_with_flags_bytes(path_as_bytes(path), is_dir, is_symlink, size, mtime)
+    }
+
+    /// Insert a record from a byte path, preserving non-UTF-8 bytes.
+    fn insert_with_flags_bytes(
+        &mut self,
+        path: &[u8],
+        is_dir: bool,
+        is_symlink: bool,
+        size: u64,
+        mtime: i64,
+    ) -> u32 {
+        let parent = parent_bytes(path)
+            .and_then(|p| self.find_bytes(p))
             .unwrap_or(u32::MAX);
-        let depth = path_str
-            .bytes()
-            .filter(|&b| b == b'/')
+        let depth = path
+            .iter()
+            .filter(|&&b| b == b'/')
             .count()
             .min(u8::MAX as usize) as u8;
 
         // Directories (and parentless records) store their full path; files with
         // a parent store only their basename, so the parent's path is not
         // duplicated in every child.
-        let bytes = path_str.as_bytes();
         let stored: &[u8] = if is_dir || parent == u32::MAX {
-            bytes
+            path
         } else {
-            let start = bytes.iter().rposition(|&b| b == b'/').map_or(0, |p| p + 1);
-            &bytes[start..]
+            let start = path.iter().rposition(|&b| b == b'/').map_or(0, |p| p + 1);
+            &path[start..]
         };
 
         let path_off = self.paths.len() as u32;
@@ -1765,11 +1799,11 @@ impl Index {
             flags,
         });
         self.subtree.push(idx, parent);
-        self.map_insert(path_str.as_ref(), idx);
+        self.map_insert(path, idx);
         // Index the full path (not the stored basename) so a term can match the
         // parent components too. The candidate index stores it ASCII-lowercased.
         if self.candidate_enabled {
-            let mut lower = path_str.as_bytes().to_vec();
+            let mut lower = path.to_vec();
             lower.make_ascii_lowercase();
             self.candidate.insert(idx, &lower, is_dir, parent);
         }
@@ -1780,28 +1814,28 @@ impl Index {
 
     /// The record index for `path`, if present.
     pub fn find(&self, path: &Path) -> Option<u32> {
-        self.find_str(path.to_string_lossy().as_ref())
+        self.find_bytes(path_as_bytes(path))
     }
 
-    /// The record index for a path string, if present.
-    fn find_str(&self, key: &str) -> Option<u32> {
+    /// The record index for a path string or byte path, if present.
+    fn find_str(&self, key: impl AsRef<[u8]>) -> Option<u32> {
         self.by_path.get(key, &self.records, &self.paths)
     }
 
     /// Record `key` -> `idx` in the path index.
-    fn map_insert(&mut self, key: &str, idx: u32) {
+    fn map_insert(&mut self, key: impl AsRef<[u8]>, idx: u32) {
         self.by_path.insert(key, idx, &self.records, &self.paths);
     }
 
     /// Remove `key` from the path index.
-    fn map_remove(&mut self, key: &str) {
+    fn map_remove(&mut self, key: impl AsRef<[u8]>) {
         self.by_path.remove(key, &self.records, &self.paths);
     }
 
     /// Update the size and mtime of an existing record. Returns whether the
     /// record existed.
     pub fn update_metadata(&mut self, path: &Path, size: u64, mtime: i64) -> bool {
-        let Some(idx) = self.find_str(path.to_string_lossy().as_ref()) else {
+        let Some(idx) = self.find_bytes(path_as_bytes(path)) else {
             return false;
         };
         let rec = &mut self.records[idx as usize];
@@ -1865,25 +1899,26 @@ impl Index {
     /// number of records visited, so tests can assert that an exact file
     /// removal does not scan the whole index.
     fn remove_inner(&mut self, path: &Path) -> (bool, usize) {
-        let key = path.to_string_lossy();
+        let key_bytes = path_as_bytes(path);
         // For the filesystem root "/", the subtree prefix is "/" itself; for any
         // other path it is "<key>/".
-        let prefix = if key.ends_with('/') {
-            key.to_string()
+        let prefix_bytes: Vec<u8> = if key_bytes.ends_with(b"/") {
+            key_bytes.to_vec()
         } else {
-            format!("{key}/")
+            let mut p = Vec::with_capacity(key_bytes.len() + 1);
+            p.extend_from_slice(key_bytes);
+            p.push(b'/');
+            p
         };
-        let key_bytes = key.as_bytes();
-        let prefix_bytes = prefix.as_bytes();
 
-        let exact = self.find_str(key.as_ref());
+        let exact = self.find_bytes(key_bytes);
         if let Some(idx) = exact {
             let rec = &self.records[idx as usize];
             if !rec.is_deleted() && !rec.is_dir() {
                 // A file has no descendants, so the path map resolves the
                 // entire removal in O(1) instead of scanning every record.
                 self.records[idx as usize].flags |= FLAG_DELETED;
-                self.map_remove(key.as_ref());
+                self.map_remove(key_bytes);
                 self.live -= 1;
                 self.invalidate_cache();
                 return (true, 1);
@@ -1898,7 +1933,7 @@ impl Index {
                     &self.paths,
                     Some(idx),
                     key_bytes,
-                    prefix_bytes,
+                    &prefix_bytes,
                     &mut candidates,
                 );
                 let mut to_delete: Vec<u32> = Vec::new();
@@ -1916,7 +1951,7 @@ impl Index {
                         &self.paths,
                         &mut buf,
                     );
-                    if buf == key_bytes || buf.starts_with(prefix_bytes) {
+                    if buf.as_slice() == key_bytes || buf.starts_with(&prefix_bytes) {
                         to_delete.push(i);
                     }
                 }
@@ -1930,7 +1965,7 @@ impl Index {
                             &self.paths,
                             &mut buf,
                         );
-                        self.map_remove(String::from_utf8_lossy(&buf).as_ref());
+                        self.map_remove(&buf);
                     }
                     self.live -= to_delete.len();
                     self.invalidate_cache();
@@ -1949,7 +1984,7 @@ impl Index {
             &self.paths,
             exact,
             key_bytes,
-            prefix_bytes,
+            &prefix_bytes,
             &mut candidates,
         );
         let mut to_delete: Vec<u32> = Vec::new();
@@ -1967,7 +2002,7 @@ impl Index {
                 &self.paths,
                 &mut buf,
             );
-            if buf == key_bytes || buf.starts_with(prefix_bytes) {
+            if buf.as_slice() == key_bytes || buf.starts_with(&prefix_bytes) {
                 to_delete.push(i);
             }
         }
@@ -1984,7 +2019,7 @@ impl Index {
                 &self.paths,
                 &mut buf,
             );
-            self.map_remove(String::from_utf8_lossy(&buf).as_ref());
+            self.map_remove(&buf);
         }
         self.live -= to_delete.len();
         self.invalidate_cache();
@@ -2001,16 +2036,28 @@ impl Index {
         if new.starts_with(old) {
             return false;
         }
-        let old_key = old.to_string_lossy();
-        let new_key = new.to_string_lossy();
-        let old_prefix = format!("{old_key}/");
-        let new_prefix = format!("{new_key}/");
-        let old_bytes = old_key.as_bytes();
-        let old_prefix_bytes = old_prefix.as_bytes();
+        let old_bytes = path_as_bytes(old);
+        let new_bytes = path_as_bytes(new);
+        let old_prefix_bytes: Vec<u8> = if old_bytes.ends_with(b"/") {
+            old_bytes.to_vec()
+        } else {
+            let mut p = Vec::with_capacity(old_bytes.len() + 1);
+            p.extend_from_slice(old_bytes);
+            p.push(b'/');
+            p
+        };
+        let new_prefix_bytes: Vec<u8> = if new_bytes.ends_with(b"/") {
+            new_bytes.to_vec()
+        } else {
+            let mut p = Vec::with_capacity(new_bytes.len() + 1);
+            p.extend_from_slice(new_bytes);
+            p.push(b'/');
+            p
+        };
 
         // The renamed record itself, if it is indexed (a directory may be
         // renamed before its own record exists).
-        let exact = self.find_str(old_key.as_ref());
+        let exact = self.find_bytes(old_bytes);
 
         let mut buf: Vec<u8> = Vec::new();
         // Capture each affected record's *old* full path now, before any record is
@@ -2022,7 +2069,7 @@ impl Index {
             Some(i)
                 if !self.records[i as usize].is_deleted() && !self.records[i as usize].is_dir() =>
             {
-                vec![(i, old_key.as_bytes().to_vec())]
+                vec![(i, old_bytes.to_vec())]
             }
             Some(i) if !self.records[i as usize].is_deleted() => {
                 // A directory's descendants are reachable through the
@@ -2033,7 +2080,7 @@ impl Index {
                     &self.paths,
                     Some(i),
                     old_bytes,
-                    old_prefix_bytes,
+                    &old_prefix_bytes,
                     &mut candidates,
                 );
                 let mut affected = Vec::new();
@@ -2048,7 +2095,7 @@ impl Index {
                         &self.paths,
                         &mut buf,
                     );
-                    if buf == old_bytes || buf.starts_with(old_prefix_bytes) {
+                    if buf.as_slice() == old_bytes || buf.starts_with(&old_prefix_bytes) {
                         affected.push((j, buf.clone()));
                     }
                 }
@@ -2065,7 +2112,7 @@ impl Index {
                     &self.paths,
                     exact,
                     old_bytes,
-                    old_prefix_bytes,
+                    &old_prefix_bytes,
                     &mut candidates,
                 );
                 let mut affected = Vec::new();
@@ -2080,7 +2127,7 @@ impl Index {
                         &self.paths,
                         &mut buf,
                     );
-                    if buf == old_bytes || buf.starts_with(old_prefix_bytes) {
+                    if buf.as_slice() == old_bytes || buf.starts_with(&old_prefix_bytes) {
                         affected.push((j, buf.clone()));
                     }
                 }
@@ -2093,25 +2140,28 @@ impl Index {
 
         let new_parent = new
             .parent()
-            .and_then(|p| self.find_str(p.to_string_lossy().as_ref()))
+            .and_then(|p| self.find_bytes(path_as_bytes(p)))
             .unwrap_or(u32::MAX);
 
         for (i, old_path) in affected {
             let rec = self.records[i as usize];
-            let new_path: String = if old_path == old_bytes {
-                new_key.to_string()
+            let new_path: Vec<u8> = if old_path.as_slice() == old_bytes {
+                new_bytes.to_vec()
             } else {
                 let suffix = &old_path[old_prefix_bytes.len()..];
-                format!("{new_prefix}{}", String::from_utf8_lossy(suffix))
+                let mut np = Vec::with_capacity(new_prefix_bytes.len() + suffix.len());
+                np.extend_from_slice(&new_prefix_bytes);
+                np.extend_from_slice(suffix);
+                np
             };
 
             let is_exact = exact == Some(i);
 
-            self.map_remove(String::from_utf8_lossy(&old_path).as_ref());
+            self.map_remove(&old_path);
             // If the destination already exists (rename over an existing file or
             // empty directory), tombstone the displaced record so it does not
             // linger as a duplicate.
-            let existing = self.find_str(new_path.as_str());
+            let existing = self.find_bytes(&new_path);
             if let Some(existing) = existing {
                 if existing != i && !self.records[existing as usize].is_deleted() {
                     self.records[existing as usize].flags |= FLAG_DELETED;
@@ -2126,9 +2176,9 @@ impl Index {
             let record_parent = if is_exact { new_parent } else { rec.parent };
             let full_path = rec.is_dir() || record_parent == u32::MAX;
             let stored_new: &[u8] = if full_path {
-                new_path.as_bytes()
+                &new_path
             } else {
-                basename_of(new_path.as_bytes())
+                basename_of(&new_path)
             };
             // The arena is append-only, so appending is safe. Rewrite when the
             // storage form changed (the same bytes now mean something different)
@@ -2148,8 +2198,8 @@ impl Index {
             // including files whose basename did not change but whose ancestors
             // moved to a different depth.
             let depth = new_path
-                .bytes()
-                .filter(|&b| b == b'/')
+                .iter()
+                .filter(|&&b| b == b'/')
                 .count()
                 .min(u8::MAX as usize) as u8;
             self.records[i as usize].depth = depth;
@@ -2164,14 +2214,14 @@ impl Index {
             }
             // Insert the new key only after the record's bytes, parent, and depth
             // are consistent, so the path map never observes a half-applied rename.
-            self.map_insert(new_path.as_str(), i);
+            self.map_insert(&new_path, i);
 
             // The candidate index stores the full path, which changed for every
             // affected record (including files, whose basename is unchanged but
             // whose parent path moved). Append the new lowercased path; the old
             // postings are filtered out at match time and reclaimed on compaction.
             if self.candidate_enabled {
-                let mut lower = new_path.as_bytes().to_vec();
+                let mut lower = new_path.clone();
                 lower.make_ascii_lowercase();
                 let parent = self.records[i as usize].parent;
                 self.candidate.insert(i, &lower, rec.is_dir(), parent);
@@ -2537,7 +2587,7 @@ pub struct DeltaIndex {
     /// replaces the earlier one instead of appending a duplicate. Sorted so a
     /// subtree removal can range-scan `path/` without walking every pending
     /// entry (issue #79).
-    index: BTreeMap<Box<str>, u32>,
+    index: BTreeMap<Vec<u8>, u32>,
     /// Number of `records` entries tombstoned by [`DeltaIndex::remove_path`].
     /// Tracked so `len`/`is_empty` stay O(1) and a delta that holds only dead
     /// inserts is treated as empty: it is not scanned, and it does not count
@@ -2563,7 +2613,18 @@ impl DeltaIndex {
 
     /// Record an insert (or an update) of `path`.
     pub fn insert(&mut self, path: &Path, is_dir: bool, is_symlink: bool, size: u64, mtime: i64) {
-        let path_str = path.to_string_lossy();
+        self.insert_bytes(path_as_bytes(path), is_dir, is_symlink, size, mtime);
+    }
+
+    /// Record an insert (or an update) from a byte path.
+    pub(crate) fn insert_bytes(
+        &mut self,
+        path: &[u8],
+        is_dir: bool,
+        is_symlink: bool,
+        size: u64,
+        mtime: i64,
+    ) {
         let mut flags = 0u8;
         if is_dir {
             flags |= FLAG_DIR;
@@ -2572,7 +2633,7 @@ impl DeltaIndex {
             flags |= FLAG_SYMLINK;
         }
         // Replace an existing insert for the same path in place.
-        if let Some(&i) = self.index.get(path_str.as_ref()) {
+        if let Some(&i) = self.index.get(path) {
             let rec = &mut self.records[i as usize];
             if rec.is_deleted() {
                 // Re-inserting a path that was tombstoned makes it live again.
@@ -2583,10 +2644,9 @@ impl DeltaIndex {
             rec.flags = flags;
             return;
         }
-        let bytes = path_str.as_bytes();
         let path_off = self.paths.len() as u32;
-        self.paths.extend_from_slice(bytes);
-        let depth = bytes
+        self.paths.extend_from_slice(path);
+        let depth = path
             .iter()
             .filter(|&&b| b == b'/')
             .count()
@@ -2597,12 +2657,11 @@ impl DeltaIndex {
             mtime: mtime_to_u32(mtime),
             parent: u32::MAX,
             path_off,
-            path_len: bytes.len().min(u16::MAX as usize) as u16,
+            path_len: path.len().min(u16::MAX as usize) as u16,
             depth,
             flags,
         });
-        self.index
-            .insert(path_str.into_owned().into_boxed_str(), idx);
+        self.index.insert(path.to_vec(), idx);
     }
 
     /// Record the removal of base-image record `idx`.
@@ -2617,19 +2676,17 @@ impl DeltaIndex {
     /// [`FLAG_DELETED`]. [`Index::apply_delta`] skips it, and `len`/`is_empty`
     /// do not count it.
     pub fn remove_path(&mut self, path: &Path) {
-        let key = path.to_string_lossy();
-        if let Some(i) = self.index.remove(key.as_ref()) {
+        self.remove_path_bytes(path_as_bytes(path));
+    }
+
+    fn remove_path_bytes(&mut self, key: &[u8]) {
+        if let Some(i) = self.index.remove(key) {
             let rec = &mut self.records[i as usize];
             if !rec.is_deleted() {
                 rec.flags |= FLAG_DELETED;
                 self.tombstones += 1;
             }
         }
-        // The arenas are append-only, so a create/remove cycle of an initially
-        // absent path leaves a dead record plus its path bytes behind even
-        // though the logical length returns to zero. Compact once tombstones
-        // dominate so retained records/bytes stay proportional to the live set
-        // rather than to the number of processed events.
         self.compact_if_needed();
     }
 
@@ -2638,29 +2695,34 @@ impl DeltaIndex {
     /// old subtree does not survive alongside its replacement. Returns whether
     /// anything was dropped.
     pub(crate) fn remove_subtree(&mut self, path: &Path) -> bool {
-        let key = path.to_string_lossy();
-        let prefix = if key.ends_with('/') {
-            key.to_string()
+        self.remove_subtree_bytes(path_as_bytes(path))
+    }
+
+    fn remove_subtree_bytes(&mut self, key: &[u8]) -> bool {
+        let prefix: Vec<u8> = if key.ends_with(b"/") {
+            key.to_vec()
         } else {
-            format!("{key}/")
+            let mut p = Vec::with_capacity(key.len() + 1);
+            p.extend_from_slice(key);
+            p.push(b'/');
+            p
         };
+
         // Range-scan the sorted map instead of filtering every pending entry:
         // all keys under `<key>/` are contiguous, so an unrelated removal costs
         // O(log n) rather than O(delta size) (issue #79).
         let mut doomed: Vec<u32> = Vec::new();
-        if let Some(&i) = self.index.get(key.as_ref()) {
+        if let Some(&i) = self.index.get(key) {
             doomed.push(i);
         }
         for (k, &i) in self
             .index
-            .range::<str, _>((Bound::Included(prefix.as_str()), Bound::Unbounded))
+            .range::<[u8], _>((Bound::Included(prefix.as_slice()), Bound::Unbounded))
         {
-            if !k.starts_with(prefix.as_str()) {
+            if !k.starts_with(prefix.as_slice()) {
                 break;
             }
-            // The exact key was already collected above (it equals the prefix
-            // only when `path` had a trailing slash).
-            if k.as_ref() != key.as_ref() {
+            if k.as_slice() != key {
                 doomed.push(i);
             }
         }
@@ -2669,12 +2731,9 @@ impl DeltaIndex {
             let rec = self.records[i as usize];
             let start = rec.path_off as usize;
             let end = start + rec.path_len as usize;
-            // The record already carries the full path, so the key can be
-            // removed without cloning it into a temporary allocation.
-            if let Ok(k) = std::str::from_utf8(&self.paths[start..end]) {
-                if self.index.remove(k).is_some() {
-                    changed = true;
-                }
+            let k = &self.paths[start..end];
+            if self.index.remove(k).is_some() {
+                changed = true;
             }
             let rec = &mut self.records[i as usize];
             if !rec.is_deleted() {
@@ -2728,9 +2787,7 @@ impl DeltaIndex {
         for (i, rec) in records.iter().enumerate() {
             let start = rec.path_off as usize;
             let end = start + rec.path_len as usize;
-            if let Ok(path) = std::str::from_utf8(&paths[start..end]) {
-                index.insert(Box::<str>::from(path), i as u32);
-            }
+            index.insert(paths[start..end].to_vec(), i as u32);
         }
         self.records = records;
         self.paths = paths;
@@ -2740,7 +2797,7 @@ impl DeltaIndex {
 
     /// Whether `path` has a pending insert.
     pub fn contains_path(&self, path: &Path) -> bool {
-        self.index.contains_key(path.to_string_lossy().as_ref())
+        self.index.contains_key(path_as_bytes(path))
     }
 
     /// The number of pending changes (live inserts + removes). Tombstoned

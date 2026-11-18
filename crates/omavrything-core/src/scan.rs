@@ -1148,10 +1148,9 @@ mod tests {
             .unwrap();
         let mut buf = String::new();
         index.write_path(rec_idx, &mut buf);
-        let p = std::path::Path::new(&buf);
-        let absent = plan.coverage.iter().any(|c| c.established_absent(p));
+        let absent = plan.coverage.iter().any(|c| c.established_absent(&path));
         assert!(absent, "path {buf:?} should be established absent");
-        let removed = index.remove(p);
+        let removed = index.remove(&path);
         assert!(removed, "remove should succeed for {buf:?}");
         let after = index
             .iter()
