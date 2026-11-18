@@ -1,6 +1,8 @@
 //! Applying filesystem change events to the index.
 
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::time::UNIX_EPOCH;
 
 use crate::glob::GlobSet;
@@ -18,6 +20,19 @@ pub enum FsEvent {
     Renamed { from: PathBuf, to: PathBuf },
     /// A file's contents or metadata changed.
     Modified(PathBuf),
+}
+
+
+#[cfg(unix)]
+#[inline]
+fn path_bytes(path: &Path) -> &[u8] {
+    path.as_os_str().as_bytes()
+}
+
+#[cfg(not(unix))]
+#[inline]
+fn path_bytes(path: &Path) -> &[u8] {
+    path.to_str().unwrap_or("").as_bytes()
 }
 
 /// Apply one event to the index. Returns whether the index changed.
@@ -159,7 +174,7 @@ fn delta_created(
     let is_symlink = metadata.file_type().is_symlink();
     let size = if is_dir { 0 } else { metadata.len() };
     // A create over an existing base record is an update: drop the base record.
-    if let Some(idx) = by_path.get(&path.to_string_lossy(), records, paths) {
+    if let Some(idx) = by_path.get(path_bytes(path), records, paths) {
         delta.remove(idx);
     }
     delta.insert(path, is_dir, is_symlink, size, mtime_of(&metadata));
@@ -180,17 +195,18 @@ fn delta_removed(
     let mut changed = false;
     // A base record that is a regular file cannot have descendants.
     let mut known_file = false;
-    let key = path.to_string_lossy();
+    let key_bytes = path_bytes(path);
     // For the filesystem root "/", the subtree prefix is "/" itself; for any
     // other path it is "<key>/".
-    let prefix = if key.ends_with('/') {
-        key.to_string()
+    let prefix_bytes: Vec<u8> = if key_bytes.ends_with(b"/") {
+        key_bytes.to_vec()
     } else {
-        format!("{key}/")
+        let mut p = Vec::with_capacity(key_bytes.len() + 1);
+        p.extend_from_slice(key_bytes);
+        p.push(b'/');
+        p
     };
-    let key_bytes = key.as_bytes();
-    let prefix_bytes = prefix.as_bytes();
-    let exact = by_path.get(&key, records, paths);
+    let exact = by_path.get(key_bytes, records, paths);
     if let Some(idx) = exact {
         let rec = &records[idx as usize];
         if !rec.is_deleted() {
@@ -209,8 +225,8 @@ fn delta_removed(
                     records,
                     paths,
                     Some(idx),
-                    key.as_bytes(),
-                    prefix.as_bytes(),
+                    key_bytes,
+                    &prefix_bytes,
                     &mut descendants,
                 );
                 for &i in &descendants {
@@ -235,7 +251,7 @@ fn delta_removed(
             paths,
             exact,
             key_bytes,
-            prefix_bytes,
+            &prefix_bytes,
             &mut descendants,
         );
         for &i in &descendants {
@@ -266,7 +282,7 @@ fn delta_modified(
         return false;
     };
     let size = if metadata.is_dir() { 0 } else { metadata.len() };
-    if let Some(idx) = by_path.get(&path.to_string_lossy(), records, paths) {
+    if let Some(idx) = by_path.get(path_bytes(path), records, paths) {
         delta.remove(idx);
     }
     delta.insert(
