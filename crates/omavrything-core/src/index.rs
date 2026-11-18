@@ -3427,6 +3427,53 @@ mod tests {
     }
 
     #[test]
+    fn non_utf8_path_resolves_on_hash_collision() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let mut index = Index::new();
+        index.add_root(Path::new("/"), FsKind::Other);
+        index.insert(Path::new("/home"), true, 0, 0);
+        index.insert(Path::new("/home/a.txt"), false, 1, 0);
+
+        let bad = b"/home/\xFF.txt";
+        let h = fnv1a32(String::from_utf8_lossy(bad).as_bytes());
+        let occupant = index.find(Path::new("/home/a.txt")).unwrap();
+        // Force the colliding path into the overflow map while a different
+        // record occupies the primary slot for the same hash.
+        index.by_path.main.insert(h, occupant);
+
+        let inserted = index.insert_batch([BatchEntry {
+            path: bad,
+            is_dir: false,
+            is_symlink: false,
+            size: 7,
+            mtime: 0,
+        }]);
+        assert_eq!(inserted, 1);
+
+        let idx = index
+            .find_bytes(bad)
+            .expect("non-UTF8 path must resolve after a hash collision");
+        assert_eq!(index.name(idx), String::from_utf8_lossy(b"\xFF.txt"));
+        assert_eq!(
+            index.path(idx),
+            String::from_utf8_lossy(b"/home/\xFF.txt")
+        );
+
+        let hit = index
+            .search("\u{FFFD}.txt", 10, 0)
+            .hits
+            .into_iter()
+            .find(|h| h.path == String::from_utf8_lossy(b"/home/\xFF.txt"));
+        assert!(hit.is_some(), "lossy search must find the non-UTF8 path");
+
+        let path = Path::new(OsStr::from_bytes(bad));
+        assert!(index.remove(path));
+        assert!(index.find_bytes(bad).is_none());
+    }
+
+    #[test]
     fn rename_over_existing_with_indexed_parent_keeps_one_record() {
         let mut index = Index::new();
         index.insert(Path::new("/home/sam"), true, 0, 0);
