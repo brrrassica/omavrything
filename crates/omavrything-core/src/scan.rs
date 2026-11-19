@@ -608,15 +608,18 @@ pub fn apply_rescan(index: &mut Index, plan: RescanPlan) -> ScanReport {
     // Only records the walk actually established absent are stale: a subtree
     // it pruned (removable media or a nested mount) or a root whose traversal
     // was incomplete (deadline, cancellation, read failure) was not visited.
+    // Paths are rebuilt from raw bytes: a lossy `String` would not byte-match
+    // the stored record, so `established_absent` and `remove` would miss
+    // non-UTF-8 records and they would survive every rescan.
     let mut stale: Vec<PathBuf> = Vec::new();
-    let mut buf = String::new();
+    let mut buf = Vec::new();
     for (i, rec) in index.records().iter().enumerate() {
         if rec.is_deleted() || seen[i] {
             continue;
         }
         buf.clear();
-        index.write_path(i as u32, &mut buf);
-        let path = Path::new(&buf);
+        index.write_path_bytes(i as u32, &mut buf);
+        let path = Path::new(OsStr::from_bytes(&buf));
         if coverage.iter().any(|c| c.established_absent(path)) {
             stale.push(path.to_path_buf());
         }
