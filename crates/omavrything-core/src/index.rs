@@ -21,8 +21,6 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
-use std::os::unix::ffi::OsStrExt;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
@@ -285,11 +283,6 @@ impl PathIndex {
     /// An estimate of the resident bytes held by the map.
     pub fn memory_bytes(&self) -> u64 {
         (self.len() * (std::mem::size_of::<u32>() + std::mem::size_of::<u32>() + 1)) as u64
-    }
-
-    /// Like [`PathIndex::get`], but takes the key as raw bytes.
-    pub(crate) fn get_bytes(&self, key: &[u8], records: &[FileRecord], paths: &[u8]) -> Option<u32> {
-        self.get(key, records, paths)
     }
 
     /// Record `key` -> `idx`, keeping a colliding path in the fallback map.
@@ -1814,10 +1807,6 @@ impl Index {
         self.find_bytes(path_as_bytes(path))
     }
 
-    /// The record index for a path string or byte path, if present.
-    fn find_str(&self, key: impl AsRef<[u8]>) -> Option<u32> {
-        self.by_path.get(key, &self.records, &self.paths)
-    }
 
     /// Record `key` -> `idx` in the path index.
     fn map_insert(&mut self, key: impl AsRef<[u8]>, idx: u32) {

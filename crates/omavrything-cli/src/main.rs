@@ -468,7 +468,8 @@ fn print_help() {
     ));
 }
 
-/// Format a byte count as MiB with two decimals (used by unit tests).
+/// Format a byte count as MiB with two decimals.
+#[cfg(test)]
 fn format_mib(bytes: u64) -> String {
     format!("{:.2}", bytes as f64 / (1024.0 * 1024.0))
 }
