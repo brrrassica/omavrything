@@ -246,7 +246,11 @@ impl Manager {
 
     /// The indexed roots.
     async fn list_roots(&self) -> Vec<String> {
-        self.index.roots().iter().map(|r| r.path.clone()).collect()
+        self.index
+            .roots()
+            .iter()
+            .map(|r| r.path.to_string_lossy().into_owned())
+            .collect()
     }
 
     /// Every detected block volume with its indexing status.
@@ -464,7 +468,7 @@ async fn run_rescan(
     root: &str,
 ) -> zbus::fdo::Result<u64> {
     if !root.is_empty() {
-        let known = index.roots().iter().any(|r| r.path == root);
+        let known = index.roots().iter().any(|r| r.path.as_path() == Path::new(root));
         if !known {
             return Err(zbus::fdo::Error::InvalidArgs(format!(
                 "unknown root: {root}"

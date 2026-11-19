@@ -320,7 +320,7 @@ pub fn status(volume: &Volume, index: &IndexManager) -> &'static str {
     let Some(mount_point) = &volume.mount_point else {
         return "unmounted";
     };
-    if index.roots().iter().any(|r| &r.path == mount_point) {
+    if index.roots().iter().any(|r| r.path.as_path() == mount_point.as_path()) {
         "indexed"
     } else {
         "unmounted"

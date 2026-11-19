@@ -8,6 +8,9 @@
 
 use std::path::Path;
 
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+
 /// A compiled glob pattern.
 #[derive(Debug, Clone)]
 pub struct Glob {
@@ -40,16 +43,23 @@ impl Glob {
 
     /// Whether `path` matches this pattern.
     pub fn matches(&self, path: &Path) -> bool {
-        match path.to_str() {
-            Some(s) => self.matches_str(s),
-            None => self.matches_str(&path.to_string_lossy()),
-        }
+        self.matches_bytes(path_bytes(path))
     }
 
-    fn matches_str(&self, path: &str) -> bool {
-        let text: Vec<&str> = path.split('/').collect();
+    fn matches_bytes(&self, path: &[u8]) -> bool {
+        let text: Vec<&[u8]> = path.split(|&b| b == b'/').collect();
         match_segments(&self.segments, &text)
     }
+}
+
+#[cfg(unix)]
+fn path_bytes(path: &Path) -> &[u8] {
+    path.as_os_str().as_bytes()
+}
+
+#[cfg(not(unix))]
+fn path_bytes(path: &Path) -> &[u8] {
+    path.to_str().map_or(&[], str::as_bytes)
 }
 
 /// A set of exclude globs. An empty set matches nothing.
@@ -74,7 +84,7 @@ impl GlobSet {
     }
 }
 
-fn match_segments(pats: &[Segment], text: &[&str]) -> bool {
+fn match_segments(pats: &[Segment], text: &[&[u8]]) -> bool {
     let Some((first, rest)) = pats.split_first() else {
         return text.is_empty();
     };
@@ -84,7 +94,7 @@ fn match_segments(pats: &[Segment], text: &[&str]) -> bool {
             (0..=text.len()).any(|i| match_segments(rest, &text[i..]))
         }
         Segment::Pattern(p) => match text.split_first() {
-            Some((head, tail)) => seg_match(p, head.as_bytes()) && match_segments(rest, tail),
+            Some((head, tail)) => seg_match(p, head) && match_segments(rest, tail),
             None => false,
         },
     }
@@ -159,5 +169,18 @@ mod tests {
         assert!(set.matches(Path::new("/a/b/.git/x")));
         assert!(!set.matches(Path::new("/home/sam")));
         assert!(GlobSet::default().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn matches_non_utf8_paths() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::path::PathBuf;
+
+        let path = PathBuf::from(OsString::from_vec(b"/tmp/na\xffme/file".to_vec()));
+        assert!(Glob::new("/tmp/*/file").matches(&path));
+        assert!(Glob::new("**/file").matches(&path));
+        assert!(!Glob::new("/tmp/other/file").matches(&path));
     }
 }

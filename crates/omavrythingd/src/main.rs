@@ -349,7 +349,7 @@ fn run_startup(
             let identities = index
                 .roots()
                 .iter()
-                .filter_map(|r| snapshot::root_identity(Path::new(&r.path)))
+                .filter_map(|r| snapshot::root_identity(r.path.as_path()))
                 .collect();
             (index, report, identities, None)
         }
@@ -386,7 +386,7 @@ fn run_startup(
         ),
     }
     for root in built.roots() {
-        info!(path = %root.path, fs_kind = ?root.fs_kind, "root");
+        info!(path = %root.path.display().display(), fs_kind = ?root.fs_kind, "root");
     }
 
     // F10: honour the candidate-index preference before the index settles, so a
@@ -513,7 +513,7 @@ fn run_remembered_volumes(
         if index
             .roots()
             .iter()
-            .any(|r| Path::new(&r.path) == mount_point.as_path())
+            .any(|r| r.path.as_path() == mount_point.as_path())
         {
             continue;
         }
@@ -620,7 +620,7 @@ fn login1_idle_hint(rt: &tokio::runtime::Runtime) -> Option<bool> {
 /// newly added roots instead of re-walking every tree.
 fn watch_new_roots(watcher: &mut Watcher, index: &IndexManager, known: &mut HashSet<PathBuf>) {
     for root in index.roots() {
-        let path = PathBuf::from(&root.path);
+        let path = root.path.clone();
         if !known.insert(path.clone()) {
             continue;
         }
@@ -690,7 +690,7 @@ fn run_watcher(
         if excludes != known_excludes {
             watcher.set_excludes(GlobSet::new(&excludes));
             for root in index.roots() {
-                let path = PathBuf::from(&root.path);
+                let path = root.path.clone();
                 if let Err(err) = watcher.watch_dir(&path) {
                     warn!(
                         path = %path.display(),
