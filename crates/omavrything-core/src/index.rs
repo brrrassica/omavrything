@@ -20,7 +20,7 @@ use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::ops::Bound;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::sync::Mutex;
@@ -77,7 +77,7 @@ pub enum FsKind {
 /// An indexed mount point.
 #[derive(Debug, Clone)]
 pub struct Root {
-    pub path: String,
+    pub path: PathBuf,
     pub fs_kind: FsKind,
 }
 
@@ -1199,7 +1199,7 @@ impl Index {
     }
 
     /// Keep only the roots whose path is in `keep`.
-    pub(crate) fn retain_roots(&mut self, keep: &HashSet<String>) {
+    pub(crate) fn retain_roots(&mut self, keep: &HashSet<PathBuf>) {
         self.roots.retain(|r| keep.contains(&r.path));
         self.invalidate_cache();
     }
@@ -1704,12 +1704,10 @@ impl Index {
             Some(idx) => idx,
             None => self.insert(path, true, 0, 0),
         };
-        // Roots are tracked as display strings; preserve bytes lossily for storage.
-        let path_str = String::from_utf8_lossy(path_as_bytes(path)).into_owned();
-        match self.roots.iter_mut().find(|r| r.path == path_str) {
+        match self.roots.iter_mut().find(|r| r.path.as_path() == path) {
             Some(root) => root.fs_kind = fs_kind,
             None => self.roots.push(Root {
-                path: path_str,
+                path: path.to_path_buf(),
                 fs_kind,
             }),
         }
@@ -1723,9 +1721,8 @@ impl Index {
     /// Used when a volume is unmounted: its records must stop being served and
     /// the root must no longer be reported by [`Index::roots`].
     pub fn remove_root(&mut self, path: &Path) -> bool {
-        let path_str = String::from_utf8_lossy(path_as_bytes(path));
-        let had_root = self.roots.iter().any(|r| r.path == path_str.as_ref());
-        self.roots.retain(|r| r.path != path_str.as_ref());
+        let had_root = self.roots.iter().any(|r| r.path.as_path() == path);
+        self.roots.retain(|r| r.path.as_path() != path);
         let removed = self.remove(path);
         self.invalidate_cache();
         had_root || removed

@@ -821,7 +821,7 @@ pub fn run_hotplug_monitor(
             if index
                 .roots()
                 .iter()
-                .any(|root| Path::new(&root.path) == mount_point.as_path())
+                .any(|root| root.path.as_path() == mount_point.as_path())
             {
                 continue;
             }
@@ -1479,7 +1479,7 @@ mod tests {
             manager
                 .roots()
                 .iter()
-                .all(|root| Path::new(&root.path) != mp)
+                .all(|root| root.path.as_path() != mp)
         );
 
         // A mount point that is still live (any real mount, e.g. /) is kept.
@@ -1505,7 +1505,7 @@ mod tests {
             manager
                 .roots()
                 .iter()
-                .all(|root| Path::new(&root.path) != mp)
+                .all(|root| root.path.as_path() != mp)
         );
 
         // A remount re-adds the root and the file.
@@ -1517,7 +1517,7 @@ mod tests {
             manager
                 .roots()
                 .iter()
-                .any(|root| Path::new(&root.path) == mp)
+                .any(|root| root.path.as_path() == mp)
         );
         assert!(
             manager
