@@ -1867,6 +1867,21 @@ impl Index {
         }
     }
 
+    /// Write the raw byte form of a record's full path into `out`, reusing its
+    /// capacity.
+    ///
+    /// Unlike [`Index::write_path`] this preserves non-UTF-8 components, so the
+    /// result can be turned back into a `Path` that byte-matches the stored
+    /// record (needed for `find`/`remove`).
+    pub(crate) fn write_path_bytes(&self, idx: u32, out: &mut Vec<u8>) {
+        write_full_path_bytes(
+            &self.records[idx as usize],
+            &self.records,
+            &self.paths,
+            out,
+        );
+    }
+
     /// Write the full path of a record into `out`, reusing its capacity.
     pub fn write_path(&self, idx: u32, out: &mut String) {
         let rec = &self.records[idx as usize];
