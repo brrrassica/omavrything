@@ -41,14 +41,27 @@ impl BootSector {
         if bytes_per_sector == 0 || sectors_per_cluster == 0 {
             return None;
         }
+        // A corrupt (or crafted) "clusters per X" byte must be rejected before
+        // it is ever used as a shift amount: `signed_size` computes
+        // `1u64 << (-value)`, so a value like -100 would panic the caller in
+        // debug builds and is undefined in release builds. The daemon parses
+        // raw volumes automatically, so this surfaces as `InvalidData` in
+        // `volume::open`, not as a crash.
+        let clusters_per_mft_record = bytes[0x40] as i8;
+        let clusters_per_index_buffer = bytes[0x44] as i8;
+        if !is_legal_clusters_per(clusters_per_mft_record)
+            || !is_legal_clusters_per(clusters_per_index_buffer)
+        {
+            return None;
+        }
         Some(Self {
             bytes_per_sector,
             sectors_per_cluster,
             total_sectors: u64::from_le_bytes(bytes[0x28..0x30].try_into().unwrap()),
             mft_lcn: u64::from_le_bytes(bytes[0x30..0x38].try_into().unwrap()),
             mft_mirror_lcn: u64::from_le_bytes(bytes[0x38..0x40].try_into().unwrap()),
-            clusters_per_mft_record: bytes[0x40] as i8,
-            clusters_per_index_buffer: bytes[0x44] as i8,
+            clusters_per_mft_record,
+            clusters_per_index_buffer,
             serial: u64::from_le_bytes(bytes[0x48..0x50].try_into().unwrap()),
         })
     }
@@ -69,9 +82,18 @@ impl BootSector {
     }
 }
 
-/// Resolve a signed "clusters per X" field: a positive value is a cluster
-/// count, a negative value is `2^-value` bytes.
+/// Whether a "clusters per record" byte from the boot sector is NTFS-legal.
+///
+/// The byte is a signed shift amount: a positive value means "the record size
+/// is `value` clusters", a negative value means "the record size is
+/// `2^-value` bytes". Legal on-disk values are `0..=62` and `-31..=-1`;
+/// anything else would make `signed_size` shift out of range.
+fn is_legal_clusters_per(value: i8) -> bool {
+    (0..=62).contains(&value) || (-31..=-1).contains(&value)
+}
+
 fn signed_size(value: i8, cluster_size: u64) -> u64 {
+    debug_assert!(is_legal_clusters_per(value), "validated in parse");
     if value > 0 {
         value as u64 * cluster_size
     } else {
@@ -134,5 +156,53 @@ mod tests {
         b[0x40] = 2;
         let bs = BootSector::parse(&b).unwrap();
         assert_eq!(bs.mft_record_size(), 8192);
+    }
+
+    #[test]
+    fn rejects_a_corrupt_clusters_per_mft_record_byte() {
+        // Byte 0x40 is a signed shift amount; out-of-range values must be
+        // rejected at parse time so `mft_record_size()` never shifts out of
+        // range (a panic in debug builds, UB in release builds).
+        let mut b = boot_bytes();
+        b[0x40] = 100u8.wrapping_neg(); // -100
+        assert!(BootSector::parse(&b).is_none());
+
+        let mut b = boot_bytes();
+        b[0x40] = 63;
+        assert!(BootSector::parse(&b).is_none());
+    }
+
+    #[test]
+    fn accepts_the_legal_boundary_values_for_byte_0x40() {
+        // Largest positive shift (62) is still legal.
+        let mut b = boot_bytes();
+        b[0x40] = 62;
+        assert!(BootSector::parse(&b).is_some());
+
+        // -1 -> 1 << 1.
+        let mut b = boot_bytes();
+        b[0x40] = 0xFF;
+        let bs = BootSector::parse(&b).unwrap();
+        assert_eq!(bs.mft_record_size(), 2);
+
+        // -31 -> 1 << 31 (2 GiB, the documented cap).
+        let mut b = boot_bytes();
+        b[0x40] = 0xE1;
+        let bs = BootSector::parse(&b).unwrap();
+        assert_eq!(bs.mft_record_size(), 1u64 << 31);
+
+        // -32 and 63+ are rejected.
+        let mut b = boot_bytes();
+        b[0x40] = 0xE0; // -32
+        assert!(BootSector::parse(&b).is_none());
+    }
+
+    #[test]
+    fn rejects_a_corrupt_clusters_per_index_buffer_byte() {
+        // Byte 0x44 is validated the same way as byte 0x40, even though the
+        // index-buffer size is not yet consumed anywhere.
+        let mut b = boot_bytes();
+        b[0x44] = 100u8.wrapping_neg(); // -100
+        assert!(BootSector::parse(&b).is_none());
     }
 }

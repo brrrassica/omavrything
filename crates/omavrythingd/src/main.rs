@@ -290,8 +290,17 @@ fn main() {
                     .name("omavry-conn".to_owned())
                     .stack_size(CONNECTION_STACK)
                     .spawn(move || {
-                        serve(stream, index, profile);
-                        active.fetch_sub(1, Ordering::Relaxed);
+                        // A panic in `serve` must not leak the connection
+                        // slot: the bare decrement that used to follow `serve`
+                        // is skipped by an unwind, so one slot of
+                        // `MAX_CONNECTIONS` would be gone for good and
+                        // repeated panics would permanently stop the daemon
+                        // accepting clients. The guard's `Drop` runs on unwind
+                        // too; containing the panic also matches the
+                        // job-runner defence (`contain_panic`) so one bad
+                        // request never kills the connection thread at all.
+                        let _guard = SlotGuard { active: &active };
+                        let _ = contain_panic(|| serve(stream, index, profile));
                     }) {
                     Ok(_join) => {}
                     Err(err) => {
@@ -386,7 +395,7 @@ fn run_startup(
         ),
     }
     for root in built.roots() {
-        info!(path = %root.path.display().display(), fs_kind = ?root.fs_kind, "root");
+        info!(path = %root.path.display(), fs_kind = ?root.fs_kind, "root");
     }
 
     // F10: honour the candidate-index preference before the index settles, so a
@@ -1368,6 +1377,19 @@ pub(crate) const CONTROL_STACK: usize = 1 << 20;
 /// Stack size for a per-connection thread.
 const CONNECTION_STACK: usize = 512 << 10;
 
+/// Releases the connection slot when the connection thread's body exits,
+/// including via a panic unwind. Drop-guard style, since `scopeguard` is not a
+/// workspace dependency.
+struct SlotGuard<'a> {
+    active: &'a AtomicUsize,
+}
+
+impl Drop for SlotGuard<'_> {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Bound the rayon global pool used by the scan and the parallel search.
 ///
 /// The scan is I/O-bound and scales only ~1.4x from one to sixteen cores (F8),
@@ -1851,10 +1873,25 @@ mod tests {
 
     #[test]
     fn contain_panic_turns_a_panic_into_an_error() {
-        // The NTFS startup pass uses this so that a malformed volume cannot unwind
-        // the thread and stop the remaining partitions from being indexed.
         assert_eq!(contain_panic(|| 7), Ok(7));
         assert!(contain_panic(|| panic!("malformed volume")).is_err());
+    }
+
+    #[test]
+    fn a_panicking_connection_still_releases_its_slot() {
+        // Issue #107: the spawn body wraps `serve` in `contain_panic` behind a
+        // `SlotGuard`; even if the unwind escaped the guard would drop, so the
+        // slot is released either way. Simulate the body's exact shape.
+        let active = Arc::new(AtomicUsize::new(1));
+        let handle = {
+            let active = Arc::clone(&active);
+            std::thread::spawn(move || {
+                let _guard = SlotGuard { active: &active };
+                let _ = contain_panic(|| panic!("malformed volume"));
+            })
+        };
+        handle.join().ok();
+        assert_eq!(active.load(Ordering::Relaxed), 0);
     }
 
     #[test]

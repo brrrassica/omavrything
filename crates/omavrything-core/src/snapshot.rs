@@ -1539,12 +1539,7 @@ mod tests {
             &ScanConfig::with_roots(vec![a.clone(), missing.clone()]),
             &snap,
         );
-        assert!(
-            warm.index
-                .roots()
-                .iter()
-                .all(|r| r.path != missing.to_string_lossy())
-        );
+        assert!(warm.index.roots().iter().all(|r| r.path != missing));
         assert_eq!(warm.identities.len(), warm.index.roots().len());
 
         let _ = fs::remove_dir_all(&dir);
