@@ -429,8 +429,16 @@ impl SubtreeIndex {
         let next = self.next_sibling[i];
         if prev != u32::MAX {
             self.next_sibling[prev as usize] = next;
-        } else if parent != u32::MAX && self.first_child[parent as usize] == idx {
+        } else if self.first_child[parent as usize] == idx {
             self.first_child[parent as usize] = next;
+        } else {
+            // Corrupt link: the node claims to be a list head but the parent's
+            // head points elsewhere. Clearing its links is the only safe move —
+            // stitching it out would need a full-list scan, and leaving them
+            // set lets a later re-attach create a sibling-chain cycle.
+            self.next_sibling[i] = u32::MAX;
+            self.prev_sibling[i] = u32::MAX;
+            return;
         }
         if next != u32::MAX {
             self.prev_sibling[next as usize] = prev;
@@ -475,6 +483,13 @@ impl SubtreeIndex {
         // previous subtree, and starting the cursor at zero would revisit those
         // records and append their descendants again.
         let mut cursor = out.len();
+        // Defence in depth against corrupt child links: every record can appear
+        // at most once, so the total number of pushes is bounded by the arena
+        // length. Without this bound a sibling-chain cycle (a stale link left
+        // by a rename or a delta fold re-attaching a child) would push the same
+        // record forever, doubling one Vec<u32> until it eats all memory.
+        let push_budget = records.len().saturating_sub(cursor);
+        let mut pushed = 0usize;
         out.push(root);
         while cursor < out.len() {
             let dir = out[cursor];
@@ -484,9 +499,20 @@ impl SubtreeIndex {
                 .get(dir as usize)
                 .copied()
                 .unwrap_or(u32::MAX);
+            let mut hops = 0usize;
             while child != u32::MAX {
+                // A sibling chain may not legitimately contain more hops than
+                // there are records; a longer chain is a cycle.
+                hops += 1;
+                if hops > records.len() {
+                    break;
+                }
                 if records[child as usize].parent == dir {
                     out.push(child);
+                    pushed += 1;
+                    if pushed > push_budget {
+                        return;
+                    }
                 }
                 child = self
                     .next_sibling
@@ -3333,6 +3359,41 @@ mod tests {
             })
             .collect();
         assert_eq!(subtree_ends(&records), vec![2, 2]);
+    }
+
+    #[test]
+    fn collect_subtree_terminates_on_a_sibling_chain_cycle() {
+        // Corrupt state: a child link points back into its own chain, so the
+        // sibling walk would push the same records forever. The hop budget must
+        // break the loop and the result must stay a valid subtree.
+        let mut index = Index::new();
+        index.add_root(Path::new("/data"), FsKind::Other);
+        let dir = index.insert(Path::new("/data/dir"), true, 0, 0);
+        let a = index.insert(Path::new("/data/dir/a"), true, 0, 0);
+        let b = index.insert(Path::new("/data/dir/b"), true, 0, 0);
+        // Forge a sibling cycle among dir's children: a -> b -> a.
+        index.subtree.next_sibling[b as usize] = a;
+        let mut out = Vec::new();
+        index.subtree.collect_subtree(&index.records, dir, &mut out);
+        assert!(out.contains(&dir) && out.contains(&a) && out.contains(&b));
+        assert!(out.len() <= index.records.len());
+    }
+
+    #[test]
+    fn detach_clears_links_when_the_head_slot_was_overwritten() {
+        // A rename/delta fold can leave a node whose prev_sibling is MAX but
+        // whose parent's head slot points at a different child. Detaching it
+        // must clear its links (not leave them set), or a later re-attach wires
+        // a cycle that collect_subtree then walks forever.
+        let mut index = Index::new();
+        index.add_root(Path::new("/data"), FsKind::Other);
+        let a = index.insert(Path::new("/data/a"), true, 0, 0);
+        let b = index.insert(Path::new("/data/b"), true, 0, 0);
+        // b claims head position (prev == MAX) but a actually owns it.
+        index.subtree.prev_sibling[b as usize] = u32::MAX;
+        index.subtree.detach(b, a);
+        assert_eq!(index.subtree.next_sibling[b as usize], u32::MAX);
+        assert_eq!(index.subtree.prev_sibling[b as usize], u32::MAX);
     }
 
     #[test]
