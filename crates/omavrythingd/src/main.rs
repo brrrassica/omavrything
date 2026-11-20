@@ -1060,18 +1060,22 @@ fn run_snapshot(index: Arc<IndexManager>, config: Arc<SharedConfig>, path: PathB
         // Encode and write while holding SNAPSHOT_LOCK, so a concurrent
         // eviction write cannot interleave with (and overwrite) this write's
         // bytes (issue 54). `evict()` takes the same lock around its encode and
-        // write, keeping one lock order everywhere.
+        // write, keeping one lock order everywhere. The state write lock is
+        // taken only for the compact and the encode; the write itself runs
+        // without it so a million-record save does not freeze socket searches
+        // for the duration (issue 117).
         let _guard = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ids = index.identities();
         let bytes = index.with_index_mut(|idx| {
             idx.compact();
             snapshot::encode(idx, &ids)
         });
+        drop(_guard);
         if let Err(e) = snapshot::write_atomic(&bytes, &path) {
             error!(error = %e, "snapshot save failed");
         }
-        drop(bytes);
         // The encoded snapshot is a large transient buffer; return its pages.
+        drop(bytes);
         trim_heap();
     }
 }
