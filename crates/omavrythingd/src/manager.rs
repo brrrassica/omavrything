@@ -74,6 +74,12 @@ pub struct IndexManager {
     /// Whether a background materialization of an evicted index is in flight,
     /// so concurrent queries start at most one.
     materializing: AtomicBool,
+    /// Incremented by every mutation that changes the owned index (an event,
+    /// a rescan apply, a root add/remove, a delta fold, a replace). Eviction
+    /// drops the state write lock across the snapshot I/O and afterwards
+    /// checks this counter: if it moved, the encoded bytes are stale and the
+    /// eviction is discarded (issue 117).
+    mutations: AtomicU64,
     start: Instant,
 }
 
@@ -91,6 +97,7 @@ impl IndexManager {
             last_activity: AtomicU64::new(0),
             loading: AtomicBool::new(false),
             materializing: AtomicBool::new(false),
+            mutations: AtomicU64::new(0),
             start: Instant::now(),
         }
     }
@@ -115,6 +122,9 @@ impl IndexManager {
         let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
         *state = State::Owned(Box::new(index));
         *self.identities.write().unwrap_or_else(|e| e.into_inner()) = identities;
+        // The index changed; a concurrent eviction's encoded bytes are stale
+        // after this point.
+        self.mutations.fetch_add(1, Ordering::Relaxed);
         self.loading.store(false, Ordering::Relaxed);
     }
 
@@ -198,6 +208,9 @@ impl IndexManager {
                 // owned index stays bounded even when snapshots are disabled
                 // (the same retention bug the evicted delta had).
                 index.compact_if_needed();
+                // The index changed; a concurrent eviction's encoded bytes are
+                // stale after this point.
+                self.mutations.fetch_add(1, Ordering::Relaxed);
                 (changed, false)
             }
             State::Image {
@@ -235,6 +248,9 @@ impl IndexManager {
         if fold {
             let owned = self.materialize(&state);
             *state = State::Owned(Box::new(owned));
+            // The index changed; a concurrent eviction's encoded bytes are
+            // stale after this point.
+            self.mutations.fetch_add(1, Ordering::Relaxed);
         }
         changed
     }
@@ -253,7 +269,13 @@ impl IndexManager {
             *state = State::Owned(Box::new(owned));
         }
         match &mut *state {
-            State::Owned(index) => f(index),
+            State::Owned(index) => {
+                let result = f(index);
+                // The index may have changed under `f`; a concurrent
+                // eviction's encoded bytes are stale after this point.
+                self.mutations.fetch_add(1, Ordering::Relaxed);
+                result
+            }
             State::Image { .. } => unreachable!("materialized above"),
         }
     }
@@ -281,15 +303,24 @@ impl IndexManager {
     /// index is now evicted. A no-op returning `false` when already evicted,
     /// when there is no snapshot path, or when the snapshot cannot be written.
     pub fn evict(&self) -> bool {
-        // Acquire SNAPSHOT_LOCK before the state lock and hold it across the
-        // encode, the write, and the mapping: `write_atomic` uses a fixed temp
-        // path and requires concurrent writers to serialize, and ordering the
-        // encode under the same lock prevents a periodic or shutdown save from
-        // overwriting this newer snapshot on disk (issue 54). Every snapshot
-        // writer follows this one lock order (snapshot lock before state lock)
-        // so there is no deadlock cycle.
+        // The snapshot I/O (`write_atomic`'s temp file + two `fsync`s, the
+        // mapping, and the whole-snapshot checksum) must not run under the
+        // state write lock: every socket search takes that lock reading, so
+        // a million-record evict would freeze all interactive queries for
+        // the duration (issue 117). Only the encode and the final swap take
+        // the write lock.
+        //
+        // The I/O still serializes on SNAPSHOT_LOCK: `write_atomic` uses a
+        // fixed temp path and requires concurrent writers to serialize, and
+        // holding the lock across the encode prevents a periodic or shutdown
+        // save from overwriting this newer snapshot on disk (issue 54). Every
+        // snapshot writer follows this one lock order (snapshot lock before
+        // state lock) so there is no deadlock cycle.
         let _snapshot_guard = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+        // Encode under the write lock: the encode borrows the arenas, and
+        // encoding from a moved-out index would need a placeholder state that
+        // mutations could reach. The I/O below runs without the state lock.
+        let state = self.state.write().unwrap_or_else(|e| e.into_inner());
         let State::Owned(index) = &*state else {
             return false;
         };
@@ -302,9 +333,15 @@ impl IndexManager {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let bytes = snapshot::encode(index, &ids);
+        // The generation after the encode: if any mutation lands while the
+        // lock is dropped below, the encoded bytes are stale and the eviction
+        // is discarded rather than swapping in an out-of-date image.
+        let generation = self.mutations.load(Ordering::Relaxed);
+        drop(state);
         if snapshot::write_atomic(&bytes, path).is_err() {
             return false;
         }
+        drop(bytes);
         let Ok(file) = File::open(path) else {
             return false;
         };
@@ -330,14 +367,34 @@ impl IndexManager {
         // do not re-parse (and re-checksum) the mapping on every call.
         let roots = image.roots().to_vec();
         let len = image.len();
-        *state = State::Image {
-            mmap: Arc::new(mmap),
-            by_path: Box::new(by_path),
-            subtree: Box::new(subtree),
-            sections,
-            roots,
-            len,
+        // Re-verify before the swap: the state must still be the owned index
+        // the bytes were encoded from, and nothing may have mutated it while
+        // the lock was dropped (an event, a rescan, or a materialization).
+        // Otherwise keep the owned index and report no eviction; the evictor
+        // retries and the next encode picks up the newer state.
+        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+        if self.mutations.load(Ordering::Relaxed) != generation {
+            return false;
+        }
+        if !matches!(&*state, State::Owned(_)) {
+            return false;
+        }
+        // Dropping the replaced index here frees the arenas; the write lock is
+        // held for the swap itself, as before.
+        let State::Owned(index) = std::mem::replace(
+            &mut *state,
+            State::Image {
+                mmap: Arc::new(mmap),
+                by_path: Box::new(by_path),
+                subtree: Box::new(subtree),
+                sections,
+                roots,
+                len,
+            },
+        ) else {
+            unreachable!("checked State::Owned above");
         };
+        drop(index);
         true
     }
 
