@@ -706,12 +706,7 @@ pub(crate) fn write_full_path_bytes(
 }
 
 /// Whether `rec`'s full path equals `key` byte-for-byte.
-fn record_path_eq(
-    rec: &FileRecord,
-    records: &[FileRecord],
-    paths: &[u8],
-    key: &[u8],
-) -> bool {
+fn record_path_eq(rec: &FileRecord, records: &[FileRecord], paths: &[u8], key: &[u8]) -> bool {
     let mut buf = Vec::new();
     write_full_path_bytes(rec, records, paths, &mut buf);
     buf == key
@@ -719,12 +714,7 @@ fn record_path_eq(
 
 /// Whether `rec`'s lossy-decoded full path equals `key`.
 #[allow(dead_code)]
-fn record_path_eq_lossy(
-    rec: &FileRecord,
-    records: &[FileRecord],
-    paths: &[u8],
-    key: &str,
-) -> bool {
+fn record_path_eq_lossy(rec: &FileRecord, records: &[FileRecord], paths: &[u8], key: &str) -> bool {
     let mut buf = String::new();
     write_full_path_lossy(rec, records, paths, &mut buf);
     buf == key
@@ -732,12 +722,7 @@ fn record_path_eq_lossy(
 
 /// Write a record's lossy-decoded full path into `out`.
 #[allow(dead_code)]
-fn write_full_path_lossy(
-    rec: &FileRecord,
-    records: &[FileRecord],
-    paths: &[u8],
-    out: &mut String,
-) {
+fn write_full_path_lossy(rec: &FileRecord, records: &[FileRecord], paths: &[u8], out: &mut String) {
     if stores_full_path(rec) {
         out.push_str(&String::from_utf8_lossy(stored_bytes(rec, paths)));
     } else {
@@ -1683,8 +1668,7 @@ impl Index {
             if rec.is_dir() {
                 if let Some(old) = old {
                     if self.records[old as usize].is_dir() {
-                        self.subtree
-                            .adopt_children(&mut self.records, old, new_idx);
+                        self.subtree.adopt_children(&mut self.records, old, new_idx);
                     }
                 }
             }
@@ -1700,8 +1684,7 @@ impl Index {
     /// Invalidate every memoized query result. Called on any mutation (F7); a
     /// single atomic increment, so it does not slow the insert path.
     fn invalidate_cache(&self) {
-        self.cache_generation
-            .fetch_add(1, AtomicOrdering::Relaxed);
+        self.cache_generation.fetch_add(1, AtomicOrdering::Relaxed);
     }
 
     /// Iterate over live (non-deleted) records as `(record index, record)`.
@@ -1833,7 +1816,6 @@ impl Index {
         self.find_bytes(path_as_bytes(path))
     }
 
-
     /// Record `key` -> `idx` in the path index.
     fn map_insert(&mut self, key: impl AsRef<[u8]>, idx: u32) {
         self.by_path.insert(key, idx, &self.records, &self.paths);
@@ -1889,12 +1871,7 @@ impl Index {
     /// result can be turned back into a `Path` that byte-matches the stored
     /// record (needed for `find`/`remove`).
     pub(crate) fn write_path_bytes(&self, idx: u32, out: &mut Vec<u8>) {
-        write_full_path_bytes(
-            &self.records[idx as usize],
-            &self.records,
-            &self.paths,
-            out,
-        );
+        write_full_path_bytes(&self.records[idx as usize], &self.records, &self.paths, out);
     }
 
     /// Write the full path of a record into `out`, reusing its capacity.
@@ -3575,10 +3552,7 @@ mod tests {
             .find_bytes(bad)
             .expect("non-UTF8 path must resolve after a hash collision");
         assert_eq!(index.name(idx), String::from_utf8_lossy(b"\xFF.txt"));
-        assert_eq!(
-            index.path(idx),
-            String::from_utf8_lossy(b"/home/\xFF.txt")
-        );
+        assert_eq!(index.path(idx), String::from_utf8_lossy(b"/home/\xFF.txt"));
 
         let hit = index
             .search("\u{FFFD}.txt", 10, 0)

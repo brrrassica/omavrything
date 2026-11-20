@@ -1159,7 +1159,10 @@ mod tests {
             .iter()
             .filter(|(i, r)| !r.is_dir() && index.name(*i).contains("bad"))
             .count();
-        assert_eq!(after, 0, "stale non-UTF8 record should be removed by rescan");
+        assert_eq!(
+            after, 0,
+            "stale non-UTF8 record should be removed by rescan"
+        );
 
         let _ = fs::remove_dir_all(&base);
     }

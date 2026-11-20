@@ -1,8 +1,8 @@
 //! Applying filesystem change events to the index.
 
-use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use crate::glob::GlobSet;
@@ -21,7 +21,6 @@ pub enum FsEvent {
     /// A file's contents or metadata changed.
     Modified(PathBuf),
 }
-
 
 #[cfg(unix)]
 #[inline]

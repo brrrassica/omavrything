@@ -468,7 +468,10 @@ async fn run_rescan(
     root: &str,
 ) -> zbus::fdo::Result<u64> {
     if !root.is_empty() {
-        let known = index.roots().iter().any(|r| r.path.as_path() == Path::new(root));
+        let known = index
+            .roots()
+            .iter()
+            .any(|r| r.path.as_path() == Path::new(root));
         if !known {
             return Err(zbus::fdo::Error::InvalidArgs(format!(
                 "unknown root: {root}"

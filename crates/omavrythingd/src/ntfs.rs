@@ -1475,12 +1475,7 @@ mod tests {
         );
         // The root must be gone too, otherwise the volume still reports
         // `indexed` and the hotplug monitor skips the remount.
-        assert!(
-            manager
-                .roots()
-                .iter()
-                .all(|root| root.path.as_path() != mp)
-        );
+        assert!(manager.roots().iter().all(|root| root.path.as_path() != mp));
 
         // A mount point that is still live (any real mount, e.g. /) is kept.
         let mut index = Index::new();
@@ -1501,24 +1496,14 @@ mod tests {
         let manager = IndexManager::new(index, Vec::new(), None);
 
         assert!(drop_mount_entries(&manager, mp));
-        assert!(
-            manager
-                .roots()
-                .iter()
-                .all(|root| root.path.as_path() != mp)
-        );
+        assert!(manager.roots().iter().all(|root| root.path.as_path() != mp));
 
         // A remount re-adds the root and the file.
         manager.with_index_mut(|idx| {
             idx.add_root(mp, FsKind::Ntfs);
             idx.insert(&mp.join("cat-left-right.mp4"), false, 1, 0);
         });
-        assert!(
-            manager
-                .roots()
-                .iter()
-                .any(|root| root.path.as_path() == mp)
-        );
+        assert!(manager.roots().iter().any(|root| root.path.as_path() == mp));
         assert!(
             manager
                 .with_index_mut(|idx| idx.find(&mp.join("cat-left-right.mp4")))

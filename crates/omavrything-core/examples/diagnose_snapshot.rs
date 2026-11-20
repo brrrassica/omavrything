@@ -87,18 +87,12 @@ fn main() {
         while cursor < out.len() {
             let dir = out[cursor];
             cursor += 1;
-            let mut child = first_child
-                .get(dir as usize)
-                .copied()
-                .unwrap_or(MAX);
+            let mut child = first_child.get(dir as usize).copied().unwrap_or(MAX);
             while child != MAX {
                 if records[child as usize].parent == dir {
                     out.push(child);
                 }
-                child = next_sibling
-                    .get(child as usize)
-                    .copied()
-                    .unwrap_or(MAX);
+                child = next_sibling.get(child as usize).copied().unwrap_or(MAX);
                 steps += 1;
                 if steps > BUDGET {
                     eprintln!(
