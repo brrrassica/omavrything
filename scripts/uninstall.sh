@@ -88,6 +88,14 @@ if [[ -n "$target_user" ]]; then
   user_home="$(getent passwd "$target_user" | cut -d: -f6 || true)"
   user_uid="$(id -u "$target_user" 2>/dev/null || true)"
 fi
+# Fail safe: if the home directory could not be resolved to an absolute path
+# (unknown user, atypical LDAP/NIS entries, a stale $SUDO_USER), the
+# root-executed `rm -rf "$user_home/..."` below would collapse to /.config/...
+# and friends. Skip the per-user cleanup entirely in that case.
+if [[ -n "$target_user" && ( -z "$user_home" || "$user_home" != /* ) ]]; then
+  warn "could not resolve the home directory of $target_user; skipping per-user cleanup"
+  user_home=""
+fi
 
 # Run a command as the target user with a usable session environment. We are
 # root, so drop to the target user with runuser and set the session bus and
@@ -168,7 +176,7 @@ fi
 # 5. Remove the shell plugin (the widget). Use omarchy's own command so its
 # registry and shell.json are updated; fall back to removing the directories
 # directly. Both the current id and the older `omavrything` id are handled.
-if [[ -n "$target_user" ]]; then
+if [[ -n "$user_home" ]]; then
   log "removing shell plugin for $target_user"
   if as_user sh -c 'command -v omarchy >/dev/null 2>&1'; then
     as_user omarchy plugin remove tech.alatcerdas.omavrything --yes >/dev/null 2>&1 ||
@@ -295,7 +303,7 @@ if command -v dbus-send >/dev/null 2>&1; then
 fi
 
 # 9. Restart the shell so the widget is dropped from the running bar.
-if [[ -n "$target_user" ]]; then
+if [[ -n "$user_home" ]]; then
   log "restarting the omarchy shell"
   if as_user sh -c 'command -v omarchy >/dev/null 2>&1'; then
     as_user omarchy restart shell >/dev/null 2>&1 ||

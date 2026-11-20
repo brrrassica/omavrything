@@ -144,6 +144,14 @@ if [[ -n "$target_user" ]]; then
   user_home="$(getent passwd "$target_user" | cut -d: -f6 || true)"
   user_uid="$(id -u "$target_user" 2>/dev/null || true)"
 fi
+# Fail safe: if the home directory could not be resolved to an absolute path
+# (unknown user, atypical LDAP/NIS entries, a stale $SUDO_USER), the
+# user-executed `rm -rf "$user_home/..."` below would collapse to /.config/...
+# and friends. Skip the per-user steps entirely in that case.
+if [[ -n "$target_user" && ( -z "$user_home" || "$user_home" != /* ) ]]; then
+  warn "could not resolve the home directory of $target_user; skipping per-user plugin install"
+  user_home=""
+fi
 
 # Run a command as the invoking user with a usable session environment. The
 # per-user plugin, `omarchy plugin enable`, and the shell restart must run in
@@ -392,7 +400,7 @@ fi
 log "omavrything ${version:-unknown} installed"
 echo "  daemon:  /usr/bin/omavrythingd (systemd unit omavrythingd.service)"
 echo "  CLI:     /usr/bin/omavry"
-if [[ -n "$target_user" ]]; then
+if [[ -n "$user_home" ]]; then
   echo "  plugin:  $user_home/.config/omarchy/plugins/tech.alatcerdas.omavrything"
   echo
   echo "The daemon is running and the widget is enabled. The socket ACL covers"

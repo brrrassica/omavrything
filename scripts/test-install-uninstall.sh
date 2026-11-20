@@ -119,6 +119,32 @@ else
   bad "uninstall.sh does not guard /var/lib/omavrything behind --keep-state"
 fi
 
+# --- Issue #118: an unresolvable home dir never reaches `rm -rf` -------------
+# `user_home` comes from `getent passwd | cut -d: -f6`. If it resolves to an
+# empty (or relative) path — a deleted $SUDO_USER, an atypical LDAP/NIS entry,
+# a malformed passwd line — the root-executed `rm -rf "$user_home/.config/..."`
+# and friends would collapse to /.config/... and target root-relative paths.
+# Both scripts must fail safe: resolve-then-verify (absolute path) and gate
+# every per-user step on a non-empty $user_home, not just a non-empty
+# $target_user.
+for script in install uninstall; do
+  if grep -q '\$user_home" != /\*' "$pkg/scripts/$script.sh" &&
+    grep -q 'could not resolve the home directory' "$pkg/scripts/$script.sh"; then
+    ok "$script.sh fails safe when the user's home cannot be resolved"
+  else
+    bad "$script.sh does not guard against an unresolvable home directory"
+  fi
+done
+# Every per-user block must be gated on the resolved home, not only on the
+# user name: the per-user install block (install.sh) and the plugin-cleanup
+# block (uninstall.sh) key on $user_home.
+if grep -q '^if \[\[ -n "\$user_home" \]\]; then' "$pkg/scripts/install.sh" &&
+  grep -q '^if \[\[ -n "\$user_home" \]\]; then' "$pkg/scripts/uninstall.sh"; then
+  ok "per-user install/cleanup blocks are gated on a non-empty home"
+else
+  bad "per-user blocks are not gated on the resolved home directory"
+fi
+
 # --- C9: uninstall.sh removes the per-user plugin in system mode ------------
 # The system uninstall is the inverse of the system install: it must remove the
 # per-user plugin (through omarchy when available) and the CLI symlink.
