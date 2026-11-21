@@ -6,6 +6,8 @@ Notable changes to `omavrything`. The format follows
 
 ## [Unreleased]
 
+## [0.2.8] — 2026-11-21
+
 ### Fixed
 
 - **`omavry status` now shows memory figures in MiB in human-readable output**
