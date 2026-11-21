@@ -1,5 +1,7 @@
 //! Applying filesystem change events to the index.
 
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -18,6 +20,18 @@ pub enum FsEvent {
     Renamed { from: PathBuf, to: PathBuf },
     /// A file's contents or metadata changed.
     Modified(PathBuf),
+}
+
+#[cfg(unix)]
+#[inline]
+fn path_bytes(path: &Path) -> &[u8] {
+    path.as_os_str().as_bytes()
+}
+
+#[cfg(not(unix))]
+#[inline]
+fn path_bytes(path: &Path) -> &[u8] {
+    path.to_str().unwrap_or("").as_bytes()
 }
 
 /// Apply one event to the index. Returns whether the index changed.
@@ -159,7 +173,7 @@ fn delta_created(
     let is_symlink = metadata.file_type().is_symlink();
     let size = if is_dir { 0 } else { metadata.len() };
     // A create over an existing base record is an update: drop the base record.
-    if let Some(idx) = by_path.get(&path.to_string_lossy(), records, paths) {
+    if let Some(idx) = by_path.get(path_bytes(path), records, paths) {
         delta.remove(idx);
     }
     delta.insert(path, is_dir, is_symlink, size, mtime_of(&metadata));
@@ -178,23 +192,27 @@ fn delta_removed(
     path: &Path,
 ) -> bool {
     let mut changed = false;
-    let key = path.to_string_lossy();
+    // A base record that is a regular file cannot have descendants.
+    let mut known_file = false;
+    let key_bytes = path_bytes(path);
     // For the filesystem root "/", the subtree prefix is "/" itself; for any
     // other path it is "<key>/".
-    let prefix = if key.ends_with('/') {
-        key.to_string()
+    let prefix_bytes: Vec<u8> = if key_bytes.ends_with(b"/") {
+        key_bytes.to_vec()
     } else {
-        format!("{key}/")
+        let mut p = Vec::with_capacity(key_bytes.len() + 1);
+        p.extend_from_slice(key_bytes);
+        p.push(b'/');
+        p
     };
-    let key_bytes = key.as_bytes();
-    let prefix_bytes = prefix.as_bytes();
-    let exact = by_path.get(&key, records, paths);
+    let exact = by_path.get(key_bytes, records, paths);
     if let Some(idx) = exact {
         let rec = &records[idx as usize];
         if !rec.is_deleted() {
             if !rec.is_dir() {
                 // A file has no descendants, so the resident path map resolves
                 // the base removal in O(1) instead of scanning every base record.
+                known_file = true;
                 delta.remove(idx);
                 changed = true;
             } else {
@@ -206,8 +224,8 @@ fn delta_removed(
                     records,
                     paths,
                     Some(idx),
-                    key.as_bytes(),
-                    prefix.as_bytes(),
+                    key_bytes,
+                    &prefix_bytes,
                     &mut descendants,
                 );
                 for &i in &descendants {
@@ -232,7 +250,7 @@ fn delta_removed(
             paths,
             exact,
             key_bytes,
-            prefix_bytes,
+            &prefix_bytes,
             &mut descendants,
         );
         for &i in &descendants {
@@ -243,8 +261,12 @@ fn delta_removed(
         }
     }
     // Pending inserts of the old subtree were created while evicted, so they
-    // have no base record; tombstone them too.
-    changed |= delta.remove_subtree(path);
+    // have no base record; tombstone them too. A regular file cannot have
+    // descendants, so skip the scan unless a pending insert recreated the same
+    // path (which may have made it a directory again).
+    if !known_file || delta.contains_path(path) {
+        changed |= delta.remove_subtree(path);
+    }
     changed
 }
 
@@ -259,7 +281,7 @@ fn delta_modified(
         return false;
     };
     let size = if metadata.is_dir() { 0 } else { metadata.len() };
-    if let Some(idx) = by_path.get(&path.to_string_lossy(), records, paths) {
+    if let Some(idx) = by_path.get(path_bytes(path), records, paths) {
         delta.remove(idx);
     }
     delta.insert(
@@ -478,6 +500,123 @@ mod tests {
     }
 
     #[test]
+    fn evicted_delta_remove_and_recreate_non_utf8_path_folds_correctly() {
+        // Regression (issue 115): while the base image is evicted, delta
+        // event lookups and `DeltaIndex` keys were built from lossy UTF-8
+        // strings, so a non-UTF-8 base record was never resolved: the
+        // removal missed the base record, and the recreated insert
+        // collided with the surviving tombstone at fold time, leaving
+        // the path permanently unsearchable. The whole evicted-delta
+        // path is byte-keyed now, so remove + recreate + fold must yield
+        // exactly one live record that `find` resolves by raw bytes.
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let base = temp_dir("evicted-delta-non-utf8");
+        let name = OsString::from_vec(b"bad\xff.txt".to_vec());
+        let file = base.join(&name);
+        fs::write(&file, b"first").unwrap();
+
+        // Build the base image as an evicted index would hold it.
+        let mut index = Index::new();
+        let config = ScanConfig::with_roots(vec![base.clone()]);
+        apply(&mut index, &FsEvent::Created(base.clone()), &config);
+        assert!(index.find(&file).is_some());
+        let by_path = PathIndex::build(index.records(), index.paths());
+
+        // Remove while evicted: the delta must tombstone the base record.
+        fs::remove_file(&file).unwrap();
+        let mut delta = DeltaIndex::new();
+        assert!(apply_delta(
+            &mut delta,
+            &by_path,
+            index.records(),
+            index.paths(),
+            &FsEvent::Removed(file.clone()),
+            &config
+        ));
+        index.apply_delta(&delta);
+        assert!(index.find(&file).is_none(), "removed record survived fold");
+        assert_eq!(index.search("bad", 10, 0).hits.len(), 0);
+
+        // Recreate the same non-UTF-8 path while evicted again, then fold.
+        fs::write(&file, b"second").unwrap();
+        let by_path = PathIndex::build(index.records(), index.paths());
+        let mut delta = DeltaIndex::new();
+        assert!(apply_delta(
+            &mut delta,
+            &by_path,
+            index.records(),
+            index.paths(),
+            &FsEvent::Created(file.clone()),
+            &config
+        ));
+        index.apply_delta(&delta);
+
+        let idx = index
+            .find(&file)
+            .expect("recreated non-UTF-8 path not findable");
+        assert!(!index.record(idx).is_deleted());
+        assert_eq!(index.search("bad", 10, 0).hits.len(), 1);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn evicted_delta_modified_non_utf8_path_stays_findable() {
+        // Regression (issue 115): a Modified event for a non-UTF-8 path
+        // resolved the base record through lossy keys, so the queued
+        // insert stored lossy bytes and the fold left a dead record that
+        // shadowed the live one. Byte-keyed lookups keep the record live
+        // and metadata-correct.
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let base = temp_dir("evicted-modified-non-utf8");
+        let name = OsString::from_vec(b"m\xffd.txt".to_vec());
+        let file = base.join(&name);
+        fs::write(&file, b"small").unwrap();
+
+        let mut index = Index::new();
+        let config = ScanConfig::with_roots(vec![base.clone()]);
+        apply(&mut index, &FsEvent::Created(base.clone()), &config);
+        let by_path = PathIndex::build(index.records(), index.paths());
+
+        fs::write(&file, b"much longer contents").unwrap();
+        let mut delta = DeltaIndex::new();
+        assert!(apply_delta(
+            &mut delta,
+            &by_path,
+            index.records(),
+            index.paths(),
+            &FsEvent::Modified(file.clone()),
+            &config
+        ));
+        index.apply_delta(&delta);
+
+        let idx = index
+            .find(&file)
+            .expect("modified non-UTF-8 path not findable");
+        assert!(!index.record(idx).is_deleted());
+        assert_eq!(
+            index.record(idx).size as usize,
+            "much longer contents".len()
+        );
+        // Search by the lossy-visible prefix and require exactly one hit for
+        // the recreated path itself (the temp dir's own name may match the
+        // term too, so match on the path, not on the hit count).
+        let hits = index.search("m", 50, 0).hits;
+        assert_eq!(
+            hits.iter()
+                .filter(|h| h.path == file.to_string_lossy())
+                .count(),
+            1
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn modified_updates_size() {
         let base = temp_dir("modified");
         let file = base.join("grow.txt");
@@ -491,6 +630,47 @@ mod tests {
         fs::write(&file, b"much longer contents").unwrap();
         assert!(apply(&mut index, &FsEvent::Modified(file), &config));
         assert_eq!(index.search("grow.txt", 10, 0).hits[0].size, 20);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn modified_directory_keeps_evicted_children_after_fold() {
+        // A metadata event on an evicted directory queues a removal of the base
+        // record plus an insert at the same path. Folding that delta must move
+        // the live children onto the replacement, or removing the directory
+        // later leaves its children searchable forever.
+        let base = temp_dir("delta-modified-dir");
+        let dir = base.join("dir");
+        let child = dir.join("sub/child.txt");
+        fs::create_dir_all(child.parent().unwrap()).unwrap();
+        fs::write(&child, b"x").unwrap();
+
+        let mut index = Index::new();
+        let config = ScanConfig::with_roots(vec![base.clone()]);
+        apply(&mut index, &FsEvent::Created(base.clone()), &config);
+        let by_path = PathIndex::build(index.records(), index.paths());
+
+        let mut delta = DeltaIndex::new();
+        assert!(apply_delta(
+            &mut delta,
+            &by_path,
+            index.records(),
+            index.paths(),
+            &FsEvent::Modified(dir.clone()),
+            &config
+        ));
+        index.apply_delta(&delta);
+
+        let replacement = index.find(&dir).unwrap();
+        let sub_idx = index.find(&dir.join("sub")).unwrap();
+        assert_eq!(index.record(sub_idx).parent, replacement);
+        let child_idx = index.find(&child).unwrap();
+        assert_eq!(index.record(child_idx).parent, sub_idx);
+
+        assert!(index.remove(&dir));
+        assert!(index.find(&child).is_none());
+        assert_eq!(index.search("child.txt", 10, 0).total, 0);
 
         let _ = fs::remove_dir_all(&base);
     }

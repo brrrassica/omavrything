@@ -173,7 +173,25 @@ log "daemon running (pid $daemon_pid, log: $log_file)"
 # previously compiled component, so the shell process must restart for changed
 # QML to take effect.
 log "reinstalling shell plugin"
-plugin_dest="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/tech.alatcerdas.omavrything"
+# Resolve the invoking user's home even under sudo: the raw $HOME of an
+# elevated run may be unset, empty, or relative, and `install`/`mkdir -p`
+# would then target the filesystem root or the CWD (#125).
+plugin_home="${XDG_CONFIG_HOME:-}"
+if [[ -z "$plugin_home" || "$plugin_home" != /* ]]; then
+  plugin_home=""
+  target_user="${SUDO_USER:-${USER:-}}"
+  if [[ -n "$target_user" ]]; then
+    plugin_home="$(getent passwd "$target_user" | cut -d: -f6 || true)"
+  fi
+  if [[ -z "$plugin_home" || "$plugin_home" != /* ]]; then
+    die "could not resolve an absolute home directory for $target_user; not installing the plugin"
+  fi
+  plugin_home="$plugin_home/.config"
+fi
+plugin_dest="$plugin_home/omarchy/plugins/tech.alatcerdas.omavrything"
+if [[ -z "$plugin_dest" || "$plugin_dest" != /* ]]; then
+  die "plugin destination is not absolute: $plugin_dest"
+fi
 mkdir -p "$plugin_dest/shell/omavrything"
 install -m644 manifest.json "$plugin_dest/manifest.json"
 install -m644 shell/omavrything/*.qml "$plugin_dest/shell/omavrything/"

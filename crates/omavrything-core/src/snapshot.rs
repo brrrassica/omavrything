@@ -37,6 +37,10 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Write};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -230,14 +234,20 @@ pub fn encode(index: &Index, identities: &[RootIdentity]) -> Vec<u8> {
             mtime: 0,
         });
         let path_off = root_strings.len() as u64;
-        root_strings.extend_from_slice(root.path.as_bytes());
+        #[cfg(unix)]
+        let path_bytes: &[u8] = root.path.as_os_str().as_bytes();
+        #[cfg(not(unix))]
+        let path_string = root.path.to_string_lossy();
+        #[cfg(not(unix))]
+        let path_bytes: &[u8] = path_string.as_bytes();
+        root_strings.extend_from_slice(path_bytes);
         put_u8(&mut roots_section, fs_kind_code(root.fs_kind));
         roots_section.extend_from_slice(&[0u8; 7]);
         put_u64(&mut roots_section, id.device);
         put_u64(&mut roots_section, id.generation);
         put_u64(&mut roots_section, id.mtime);
         put_u64(&mut roots_section, path_off);
-        put_u32(&mut roots_section, root.path.len() as u32);
+        put_u32(&mut roots_section, path_bytes.len() as u32);
         roots_section.extend_from_slice(&[0u8; 4]);
     }
 
@@ -512,9 +522,16 @@ impl SectionMap {
             if end > root_strings.len() {
                 return Err(SnapshotError::Truncated);
             }
-            let path = std::str::from_utf8(&root_strings[path_off..end])
-                .map_err(|_| SnapshotError::InvalidUtf8)?
-                .to_string();
+            #[cfg(unix)]
+            let path = PathBuf::from(std::ffi::OsString::from_vec(
+                root_strings[path_off..end].to_vec(),
+            ));
+            #[cfg(not(unix))]
+            let path = PathBuf::from(
+                std::str::from_utf8(&root_strings[path_off..end])
+                    .map_err(|_| SnapshotError::InvalidUtf8)?
+                    .to_string(),
+            );
             roots.push(Root { path, fs_kind });
             identities.push(RootIdentity {
                 device,
@@ -888,7 +905,7 @@ pub fn warm_start_with(
     };
 
     // Map stored root path -> (fs_kind, identity).
-    let stored: HashMap<String, (FsKind, RootIdentity)> = index
+    let stored: HashMap<PathBuf, (FsKind, RootIdentity)> = index
         .roots()
         .iter()
         .zip(stored_ids.iter())
@@ -898,11 +915,10 @@ pub fn warm_start_with(
     let mut report = ScanReport::default();
     // Identity per configured root path, keyed by path so the final vector can be
     // emitted in `index.roots()` order (which may differ from the config order).
-    let mut id_by_path: HashMap<String, RootIdentity> = HashMap::new();
+    let mut id_by_path: HashMap<PathBuf, RootIdentity> = HashMap::new();
     let mut rescanned = 0usize;
 
     for (path, kind) in &roots {
-        let path_str = path.to_string_lossy().into_owned();
         // A root that no longer exists is dropped rather than registered as an
         // empty phantom root.
         let Some(current) = root_identity(path) else {
@@ -910,7 +926,7 @@ pub fn warm_start_with(
             continue;
         };
         let valid = stored
-            .get(&path_str)
+            .get(path)
             .is_some_and(|(stored_kind, stored_id)| current == *stored_id && kind == stored_kind);
         if !valid {
             // Drop the stale subtree and re-walk this root.
@@ -927,16 +943,16 @@ pub fn warm_start_with(
             report.errors += sub_report.errors;
             rescanned += 1;
         }
-        id_by_path.insert(path_str, current);
+        id_by_path.insert(path.clone(), current);
     }
 
     // Drop roots that are no longer configured (or no longer exist).
-    let keep: HashSet<String> = id_by_path.keys().cloned().collect();
+    let keep: HashSet<PathBuf> = id_by_path.keys().cloned().collect();
     let stale: Vec<PathBuf> = index
         .roots()
         .iter()
         .filter(|root| !keep.contains(&root.path))
-        .map(|root| PathBuf::from(&root.path))
+        .map(|root| root.path.clone())
         .collect();
     for path in &stale {
         index.remove(path);
@@ -1179,8 +1195,8 @@ mod tests {
         // A materialization from the cached layout equals the full parse.
         let back = sections.image(&bytes).unwrap();
         assert_eq!(back.records(), image.records());
-        let back_paths: Vec<&str> = back.roots().iter().map(|r| r.path.as_str()).collect();
-        let image_paths: Vec<&str> = image.roots().iter().map(|r| r.path.as_str()).collect();
+        let back_paths: Vec<_> = back.roots().iter().map(|r| r.path.as_path()).collect();
+        let image_paths: Vec<_> = image.roots().iter().map(|r| r.path.as_path()).collect();
         assert_eq!(back_paths, image_paths);
         assert_eq!(back.len(), image.len());
 
@@ -1327,10 +1343,10 @@ mod tests {
 
     #[test]
     fn encode_keeps_full_paths_when_a_parent_is_tombstoned() {
-        // A delta fold can replace a directory record while its children stay
-        // live. The encoder remaps the dead parent to the sentinel, so the child
-        // must be written with its full path, not the basename it stored while
-        // the parent was alive.
+        // A directory record can be tombstoned while its children stay live
+        // (e.g. an older fold left this split state). The encoder remaps the
+        // dead parent to the sentinel, so the child must be written with its
+        // full path, not the basename it stored while the parent was alive.
         let mut index = Index::new();
         index.add_root(Path::new("/"), FsKind::Other);
         index.insert(Path::new("/home"), true, 0, 0);
@@ -1339,8 +1355,8 @@ mod tests {
 
         let mut delta = DeltaIndex::new();
         delta.remove(dir);
-        delta.insert(Path::new("/home/dir"), true, false, 0, 0);
         index.apply_delta(&delta);
+        assert!(index.record(dir).is_deleted());
 
         let bytes = encode(&index, &[]);
         let (decoded, _) = decode(&bytes).unwrap();
@@ -1500,7 +1516,7 @@ mod tests {
         // Identities are aligned with the index's root order, not the config order.
         assert_eq!(warm.identities.len(), warm.index.roots().len());
         for (root, id) in warm.index.roots().iter().zip(warm.identities.iter()) {
-            assert_eq!(Some(*id), root_identity(Path::new(&root.path)));
+            assert_eq!(Some(*id), root_identity(root.path.as_path()));
         }
 
         let _ = fs::remove_dir_all(&dir);
@@ -1523,12 +1539,7 @@ mod tests {
             &ScanConfig::with_roots(vec![a.clone(), missing.clone()]),
             &snap,
         );
-        assert!(
-            warm.index
-                .roots()
-                .iter()
-                .all(|r| r.path != missing.to_string_lossy())
-        );
+        assert!(warm.index.roots().iter().all(|r| r.path != missing));
         assert_eq!(warm.identities.len(), warm.index.roots().len());
 
         let _ = fs::remove_dir_all(&dir);

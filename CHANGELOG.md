@@ -6,6 +6,29 @@ Notable changes to `omavrything`. The format follows
 
 ## [Unreleased]
 
+## [0.2.8] — 2026-11-21
+
+### Fixed
+
+- **`omavry status` now shows memory figures in MiB in human-readable output**
+  (issue #103). Byte-valued fields (e.g. `memory_bytes: 248303253`) were hard to
+  interpret without mental arithmetic. The plain-text output now also prints a
+  formatted counterpart (e.g. `memory_mib: 236.80`) for every `*_bytes` field,
+  while `--json` and the raw `*_bytes` keys keep exact values so
+  `scripts/benchmark.sh` keeps parsing them. Unit test:
+  `formats_mib_with_two_decimals`.
+
+- **Hotplug no longer remounts a writable NTFS volume read-only just because it
+  was indexed before.** `run_hotplug_monitor` treated a remembered UUID as
+  permission and passed `allow_remount = true`, so a volume first seen
+  read-only could be indexed automatically and then, when the desktop mounted
+  it writable, be remounted read-only even though `ntfs_remount_readonly` was
+  empty — taking write access away from desktop applications. Startup and
+  hotplug now share `automatic_remount_allowed`, which consults only the
+  explicit opt-in list: being remembered authorizes re-indexing, not
+  remounting. Regression test:
+  `a_remembered_uuid_does_not_authorize_an_automatic_remount`.
+
 ## [0.2.7] — 2026-11-14
 
 ### Changed

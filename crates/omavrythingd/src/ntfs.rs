@@ -22,6 +22,7 @@ use omavrything_core::index::{FsKind, Index};
 use omavrything_ntfs::{NtfsEntry, NtfsPartition, NtfsVolume};
 use tracing::{debug, info, warn};
 
+use crate::config::SharedConfig;
 use crate::manager::IndexManager;
 
 /// The private mount root used when udisks2 is unavailable.
@@ -157,6 +158,19 @@ fn pre_existing_mount_action(readonly: Option<bool>, allow_remount: bool) -> Pre
         Some(false) if allow_remount => PreexistingMount::Remount,
         Some(false) => PreexistingMount::Refuse,
     }
+}
+
+/// Whether automatic discovery (startup or the hotplug monitor) may remount
+/// this partition's pre-existing writable mount read-only.
+///
+/// Being **known** — its UUID is in the auto-mount policy because the daemon
+/// indexed it before — is not consent to change a mount the daemon does not
+/// own: that policy records which volumes to re-index, not which mounts the
+/// user allows to be remounted. Only an explicit `ntfs_remount_readonly` entry
+/// opts a volume in, so startup and hotplug share this decision and cannot
+/// drift apart.
+pub(crate) fn automatic_remount_allowed(config: &SharedConfig, partition: &NtfsPartition) -> bool {
+    config.may_remount_readonly(partition.uuid.as_deref())
 }
 
 /// Remount `mount_point` read-only (B12). Requires `CAP_SYS_ADMIN`, which the
@@ -767,6 +781,7 @@ pub fn reconcile_stale_mounts() {
 pub fn run_hotplug_monitor(
     index: Arc<IndexManager>,
     policy: Arc<Mutex<NtfsPolicy>>,
+    config: Arc<SharedConfig>,
     ownership: Arc<Mutex<MountOwnership>>,
 ) {
     // Only one monitor may run, even if NTFS is toggled on more than once.
@@ -778,7 +793,12 @@ pub fn run_hotplug_monitor(
     const POLL: Duration = Duration::from_secs(2);
     const FALLBACK: Duration = Duration::from_secs(30);
     const RETRY: Duration = Duration::from_secs(60);
-    let events = crate::udev::monitor().ok();
+    // Whether the udev monitor is (still) connected. The receiver dies
+    // permanently if the uevent thread hits a fatal `recv` error, so track it
+    // explicitly instead of treating a disconnected channel like a timeout —
+    // that would busy-spin the loop with no blocking wait and no sleep
+    // (issue 121).
+    let mut events = crate::udev::monitor().ok();
     if events.is_none() {
         warn!("ntfs: udev monitor unavailable; falling back to mount-table polling");
     }
@@ -806,7 +826,7 @@ pub fn run_hotplug_monitor(
             if index
                 .roots()
                 .iter()
-                .any(|root| Path::new(&root.path) == mount_point.as_path())
+                .any(|root| root.path.as_path() == mount_point.as_path())
             {
                 continue;
             }
@@ -829,9 +849,11 @@ pub fn run_hotplug_monitor(
             {
                 continue;
             }
-            // Hotplug only reaches this point for a partition that is *known*
-            // (the user indexed it before), so remounting its writable mount
-            // read-only is the consequence of that explicit earlier request.
+            // A known UUID (remembered from an earlier index) authorizes
+            // re-indexing, NOT remounting a mount the desktop owns. Automatic
+            // discovery may remount read-only only when the volume is
+            // explicitly listed in `ntfs_remount_readonly`.
+            let allow_remount = automatic_remount_allowed(config.as_ref(), &part);
             // A malformed volume makes the MFT parser (and the run-list decode
             // behind it) read attacker-controlled on-disk data. Contain a panic
             // here — as the startup pass does — so a crafted volume backs off
@@ -842,7 +864,7 @@ pub fn run_hotplug_monitor(
                     policy.as_ref(),
                     ownership.as_ref(),
                     &part,
-                    true,
+                    allow_remount,
                 )
             }) {
                 Ok(Ok(mount_point)) => {
@@ -870,8 +892,28 @@ pub fn run_hotplug_monitor(
                 }
             }
         }
-        match &events {
-            Some(rx) => crate::udev::wait_for_block_event(rx, FALLBACK),
+        match &mut events {
+            Some(rx) => {
+                if crate::udev::wait_for_block_event(rx, FALLBACK)
+                    == crate::udev::EventWait::Disconnected
+                {
+                    // The monitor thread died (fatal `recv` error). Try to
+                    // rebuild it; if that fails, poll the mount table until it
+                    // can be recreated rather than spinning on a dead
+                    // receiver (issue 121).
+                    match crate::udev::monitor() {
+                        Ok(rx) => events = Some(rx),
+                        Err(err) => {
+                            warn!(
+                                error = %err,
+                                "ntfs: udev monitor lost; falling back to mount-table polling"
+                            );
+                            events = None;
+                            std::thread::sleep(POLL);
+                        }
+                    }
+                }
+            }
             None => std::thread::sleep(POLL),
         }
     }
@@ -1186,9 +1228,10 @@ mod tests {
         // The startup/hotplug finding: a pre-existing writable NTFS mount (a
         // udisks2 auto-mount at login) must never be remounted read-only by
         // automatic discovery, because that takes write access away from a
-        // mount the daemon does not own. `allow_remount = false` is what
-        // `run_ntfs_startup` passes for every volume not listed in
-        // `ntfs_remount_readonly`.
+        // mount the daemon does not own. Both `run_ntfs_startup` and the
+        // hotplug monitor derive `allow_remount` from
+        // `automatic_remount_allowed`, which is false unless the volume is
+        // listed in `ntfs_remount_readonly`.
         assert_eq!(
             pre_existing_mount_action(Some(false), false),
             PreexistingMount::Refuse,
@@ -1219,6 +1262,58 @@ mod tests {
             pre_existing_mount_action(Some(false), true),
             PreexistingMount::Remount
         );
+    }
+
+    #[test]
+    fn a_remembered_uuid_does_not_authorize_an_automatic_remount() {
+        // Regression: the hotplug monitor used to pass `allow_remount = true`
+        // for every *known* volume. A volume that was first mounted read-only
+        // could be indexed and remembered automatically, and when the desktop
+        // later mounted it writable the monitor remounted it read-only even
+        // though `ntfs_remount_readonly` was empty. Being remembered authorizes
+        // re-indexing, never remounting.
+        use crate::config::{ConfigInit, SharedConfig};
+        use crate::config_file::FileConfig;
+        use crate::logging::LogLevel;
+        use omavrything_core::scan::ScanConfig;
+
+        let config = SharedConfig::new(ConfigInit {
+            scan: ScanConfig::default(),
+            scan_interval: 900,
+            snapshot_interval: 300,
+            evict_idle_secs: 120,
+            snapshot: None,
+            watch: true,
+            ntfs: true,
+            ntfs_remount_readonly: Vec::new(),
+            log_level: LogLevel::Info,
+            background_opacity: 0.75,
+            candidate_index: true,
+            state: FileConfig::default(),
+            state_path: None,
+        });
+        let partition = NtfsPartition {
+            device: PathBuf::from("/dev/sda1"),
+            uuid: Some("AAAA-BBBB".to_string()),
+            label: None,
+        };
+
+        assert!(!automatic_remount_allowed(&config, &partition));
+
+        // The auto-mount policy remembers the volume, but that is not consent
+        // to change a mount the daemon does not own.
+        let policy = NtfsPolicy {
+            known: HashSet::from(["AAAA-BBBB".to_string()]),
+            ..NtfsPolicy::default()
+        };
+        assert!(policy.is_known("AAAA-BBBB"));
+        assert!(!automatic_remount_allowed(&config, &partition));
+
+        // Only an explicit opt-in entry allows automatic remounting.
+        config
+            .set("ntfs_remount_readonly", "AAAA-BBBB")
+            .expect("valid config value");
+        assert!(automatic_remount_allowed(&config, &partition));
     }
 
     #[test]
@@ -1405,12 +1500,7 @@ mod tests {
         );
         // The root must be gone too, otherwise the volume still reports
         // `indexed` and the hotplug monitor skips the remount.
-        assert!(
-            manager
-                .roots()
-                .iter()
-                .all(|root| Path::new(&root.path) != mp)
-        );
+        assert!(manager.roots().iter().all(|root| root.path.as_path() != mp));
 
         // A mount point that is still live (any real mount, e.g. /) is kept.
         let mut index = Index::new();
@@ -1431,24 +1521,14 @@ mod tests {
         let manager = IndexManager::new(index, Vec::new(), None);
 
         assert!(drop_mount_entries(&manager, mp));
-        assert!(
-            manager
-                .roots()
-                .iter()
-                .all(|root| Path::new(&root.path) != mp)
-        );
+        assert!(manager.roots().iter().all(|root| root.path.as_path() != mp));
 
         // A remount re-adds the root and the file.
         manager.with_index_mut(|idx| {
             idx.add_root(mp, FsKind::Ntfs);
             idx.insert(&mp.join("cat-left-right.mp4"), false, 1, 0);
         });
-        assert!(
-            manager
-                .roots()
-                .iter()
-                .any(|root| Path::new(&root.path) == mp)
-        );
+        assert!(manager.roots().iter().any(|root| root.path.as_path() == mp));
         assert!(
             manager
                 .with_index_mut(|idx| idx.find(&mp.join("cat-left-right.mp4")))

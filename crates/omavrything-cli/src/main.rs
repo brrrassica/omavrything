@@ -201,10 +201,25 @@ fn status(json: bool) -> i32 {
                             }
                         }
                     } else {
+                        // Memory fields are byte counts that are hard to read
+                        // raw (issue #103); the human output adds MiB
+                        // counterparts while `--json` keeps the exact bytes so
+                        // scripts like benchmark.sh can keep parsing them.
                         let mut keys: Vec<&String> = status.keys().collect();
                         keys.sort();
                         for key in keys {
-                            print_line(&format!("{key}: {}", status[key]));
+                            let value = status[key].as_str();
+                            if let Some(base) = key.strip_suffix("_bytes") {
+                                if let Ok(bytes) = value.parse::<u64>() {
+                                    print_line(&format!("{key}: {bytes}"));
+                                    print_line(&format!(
+                                        "{base}_mib: {:.2}",
+                                        bytes as f64 / (1024.0 * 1024.0)
+                                    ));
+                                    continue;
+                                }
+                            }
+                            print_line(&format!("{key}: {value}"));
                         }
                     }
                     0
@@ -451,4 +466,22 @@ fn print_help() {
            -V, --version             Show the version\n\
            -h, --help                Show this help"
     ));
+}
+
+/// Format a byte count as MiB with two decimals.
+#[cfg(test)]
+fn format_mib(bytes: u64) -> String {
+    format!("{:.2}", bytes as f64 / (1024.0 * 1024.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_mib;
+
+    #[test]
+    fn formats_mib_with_two_decimals() {
+        assert_eq!(format_mib(248_303_253), "236.80");
+        assert_eq!(format_mib(0), "0.00");
+        assert_eq!(format_mib(1024 * 1024), "1.00");
+    }
 }

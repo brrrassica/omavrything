@@ -61,14 +61,18 @@ pub fn monitor() -> io::Result<Receiver<UdevEvent>> {
     }
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let mut buf = [0u8; 8192];
+        // A uevent batch can exceed this buffer; `MSG_TRUNC` makes `recv`
+        // report the real size instead of silently dropping the tail, and the
+        // event is discarded as oversized (ENOBUFS-class) rather than parsed
+        // from a truncated message.
+        let mut buf = vec![0u8; 8192];
         loop {
             let n = unsafe {
                 libc::recv(
                     fd.as_raw_fd(),
                     buf.as_mut_ptr() as *mut libc::c_void,
                     buf.len(),
-                    0,
+                    libc::MSG_TRUNC,
                 )
             };
             if n < 0 {
@@ -76,7 +80,22 @@ pub fn monitor() -> io::Result<Receiver<UdevEvent>> {
                 if err.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
+                if err.raw_os_error() == Some(libc::ENOBUFS) {
+                    // The kernel dropped events because the netlink receive
+                    // buffer overflowed (common during event storms). This is
+                    // not fatal: log and keep receiving; the hotplug loop's
+                    // polling fallback reconciles any missed events.
+                    eprintln!("udev: netlink buffer overflow; events dropped");
+                    continue;
+                }
+                eprintln!("udev: uevent receiver failed: {err}; monitor stopping");
                 break;
+            }
+            if n as usize > buf.len() {
+                // Truncated batch: the tail is missing, so parsing it could
+                // yield a garbled event. Drop it; the polling fallback
+                // reconciles the state.
+                continue;
             }
             let text = String::from_utf8_lossy(&buf[..n as usize]);
             if let Some(event) = parse_event(&text) {
@@ -114,18 +133,33 @@ fn parse_event(text: &str) -> Option<UdevEvent> {
     })
 }
 
-/// Wait for the next block event, or `timeout` if none arrives.
-pub fn wait_for_block_event(rx: &Receiver<UdevEvent>, timeout: Duration) {
+/// The result of [`wait_for_block_event`]: whether the event channel is still
+/// alive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventWait {
+    /// A block event arrived (or the timeout elapsed); the channel is alive.
+    Alive,
+    /// The sender is gone: the monitor thread has stopped and no further
+    /// events will ever arrive.
+    Disconnected,
+}
+
+/// Wait for the next block event, or `timeout` if none arrives. Returns
+/// [`EventWait::Disconnected`] when the monitor's sender has been dropped, so
+/// the caller can fall back (or rebuild the monitor) instead of busy-spinning
+/// on a dead channel (issue 121).
+pub fn wait_for_block_event(rx: &Receiver<UdevEvent>, timeout: Duration) -> EventWait {
     let deadline = Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return;
+            return EventWait::Alive;
         }
         match rx.recv_timeout(remaining) {
-            Ok(event) if event.is_block_event() => return,
+            Ok(event) if event.is_block_event() => return EventWait::Alive,
             Ok(_) => continue,
-            Err(_) => return,
+            Err(mpsc::RecvTimeoutError::Timeout) => return EventWait::Alive,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return EventWait::Disconnected,
         }
     }
 }

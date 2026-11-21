@@ -36,6 +36,9 @@ _site/
 /obsolete-plans
 /old-rc
 
+# Local diagnostic artifacts (memory investigation dumps, gdb scripts, traces)
+/diags
+
 # Editor / OS noise
 .DS_Store
 *.swp

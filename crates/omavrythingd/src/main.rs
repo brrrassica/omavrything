@@ -290,8 +290,17 @@ fn main() {
                     .name("omavry-conn".to_owned())
                     .stack_size(CONNECTION_STACK)
                     .spawn(move || {
-                        serve(stream, index, profile);
-                        active.fetch_sub(1, Ordering::Relaxed);
+                        // A panic in `serve` must not leak the connection
+                        // slot: the bare decrement that used to follow `serve`
+                        // is skipped by an unwind, so one slot of
+                        // `MAX_CONNECTIONS` would be gone for good and
+                        // repeated panics would permanently stop the daemon
+                        // accepting clients. The guard's `Drop` runs on unwind
+                        // too; containing the panic also matches the
+                        // job-runner defence (`contain_panic`) so one bad
+                        // request never kills the connection thread at all.
+                        let _guard = SlotGuard { active: &active };
+                        let _ = contain_panic(|| serve(stream, index, profile));
                     }) {
                     Ok(_join) => {}
                     Err(err) => {
@@ -349,7 +358,7 @@ fn run_startup(
             let identities = index
                 .roots()
                 .iter()
-                .filter_map(|r| snapshot::root_identity(Path::new(&r.path)))
+                .filter_map(|r| snapshot::root_identity(r.path.as_path()))
                 .collect();
             (index, report, identities, None)
         }
@@ -386,7 +395,7 @@ fn run_startup(
         ),
     }
     for root in built.roots() {
-        info!(path = %root.path, fs_kind = ?root.fs_kind, "root");
+        info!(path = %root.path.display(), fs_kind = ?root.fs_kind, "root");
     }
 
     // F10: honour the candidate-index preference before the index settles, so a
@@ -513,7 +522,7 @@ fn run_remembered_volumes(
         if index
             .roots()
             .iter()
-            .any(|r| Path::new(&r.path) == mount_point.as_path())
+            .any(|r| r.path.as_path() == mount_point.as_path())
         {
             continue;
         }
@@ -620,7 +629,7 @@ fn login1_idle_hint(rt: &tokio::runtime::Runtime) -> Option<bool> {
 /// newly added roots instead of re-walking every tree.
 fn watch_new_roots(watcher: &mut Watcher, index: &IndexManager, known: &mut HashSet<PathBuf>) {
     for root in index.roots() {
-        let path = PathBuf::from(&root.path);
+        let path = root.path.clone();
         if !known.insert(path.clone()) {
             continue;
         }
@@ -690,7 +699,7 @@ fn run_watcher(
         if excludes != known_excludes {
             watcher.set_excludes(GlobSet::new(&excludes));
             for root in index.roots() {
-                let path = PathBuf::from(&root.path);
+                let path = root.path.clone();
                 if let Err(err) = watcher.watch_dir(&path) {
                     warn!(
                         path = %path.display(),
@@ -934,7 +943,7 @@ pub(crate) fn run_ntfs_startup(
         // `ntfs_remount_readonly` is remounted read-only here; every other
         // writable mount is left untouched and the MFT path refuses it, so the
         // generic walker indexes it read-only instead.
-        let allow_remount = config.may_remount_readonly(part.uuid.as_deref());
+        let allow_remount = ntfs::automatic_remount_allowed(config.as_ref(), part);
         match contain_panic(|| {
             ntfs::mount_index_and_remember_with_ownership(
                 index.as_ref(),
@@ -992,9 +1001,15 @@ pub(crate) fn run_ntfs_startup(
     // toggled on again at runtime).
     let hotplug_index = Arc::clone(&index);
     let hotplug_policy = Arc::clone(&policy);
+    let hotplug_config = Arc::clone(&config);
     let hotplug_ownership = Arc::clone(&ownership);
     spawn_thread("omavry-ntfs-hotplug", CONTROL_STACK, move || {
-        ntfs::run_hotplug_monitor(hotplug_index, hotplug_policy, hotplug_ownership)
+        ntfs::run_hotplug_monitor(
+            hotplug_index,
+            hotplug_policy,
+            hotplug_config,
+            hotplug_ownership,
+        )
     });
 }
 
@@ -1045,18 +1060,22 @@ fn run_snapshot(index: Arc<IndexManager>, config: Arc<SharedConfig>, path: PathB
         // Encode and write while holding SNAPSHOT_LOCK, so a concurrent
         // eviction write cannot interleave with (and overwrite) this write's
         // bytes (issue 54). `evict()` takes the same lock around its encode and
-        // write, keeping one lock order everywhere.
+        // write, keeping one lock order everywhere. The state write lock is
+        // taken only for the compact and the encode; the write itself runs
+        // without it so a million-record save does not freeze socket searches
+        // for the duration (issue 117).
         let _guard = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ids = index.identities();
         let bytes = index.with_index_mut(|idx| {
             idx.compact();
             snapshot::encode(idx, &ids)
         });
+        drop(_guard);
         if let Err(e) = snapshot::write_atomic(&bytes, &path) {
             error!(error = %e, "snapshot save failed");
         }
-        drop(bytes);
         // The encoded snapshot is a large transient buffer; return its pages.
+        drop(bytes);
         trim_heap();
     }
 }
@@ -1133,15 +1152,24 @@ fn install_shutdown_handler(
             if index.is_loading() {
                 warn!("shutdown during startup; snapshot not written");
             } else {
-                // Encode and write under SNAPSHOT_LOCK (same order as
-                // `evict()` and `run_snapshot`) so a concurrent eviction
-                // cannot interleave and persist an older image (issue 54).
-                let _guard = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-                let bytes = index.encode();
+                // Encode while holding SNAPSHOT_LOCK, then release it before
+                // the write: the fixed temp path requires concurrent writers
+                // to serialize around the encode (issue 54), but holding the
+                // lock across `write_atomic`'s temp write, two `fsync`s, and
+                // rename would stall a concurrent evictor for the duration of
+                // the shutdown I/O (issue 122). This matches `run_snapshot`'s
+                // lock scope; the state write lock inside `index.encode()`
+                // covers only the encode.
+                let bytes;
+                {
+                    let _guard = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                    bytes = index.encode();
+                }
                 match snapshot::write_atomic(&bytes, path) {
                     Ok(()) => info!(path = %path.display(), "snapshot written"),
                     Err(e) => error!(error = %e, "snapshot save failed"),
                 }
+                drop(bytes);
             }
         }
         // B9: unmount every daemon-created private mount before exiting. Each
@@ -1361,6 +1389,19 @@ fn tune_allocator() {
 pub(crate) const CONTROL_STACK: usize = 1 << 20;
 /// Stack size for a per-connection thread.
 const CONNECTION_STACK: usize = 512 << 10;
+
+/// Releases the connection slot when the connection thread's body exits,
+/// including via a panic unwind. Drop-guard style, since `scopeguard` is not a
+/// workspace dependency.
+struct SlotGuard<'a> {
+    active: &'a AtomicUsize,
+}
+
+impl Drop for SlotGuard<'_> {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// Bound the rayon global pool used by the scan and the parallel search.
 ///
@@ -1845,10 +1886,25 @@ mod tests {
 
     #[test]
     fn contain_panic_turns_a_panic_into_an_error() {
-        // The NTFS startup pass uses this so that a malformed volume cannot unwind
-        // the thread and stop the remaining partitions from being indexed.
         assert_eq!(contain_panic(|| 7), Ok(7));
         assert!(contain_panic(|| panic!("malformed volume")).is_err());
+    }
+
+    #[test]
+    fn a_panicking_connection_still_releases_its_slot() {
+        // Issue #107: the spawn body wraps `serve` in `contain_panic` behind a
+        // `SlotGuard`; even if the unwind escaped the guard would drop, so the
+        // slot is released either way. Simulate the body's exact shape.
+        let active = Arc::new(AtomicUsize::new(1));
+        let handle = {
+            let active = Arc::clone(&active);
+            std::thread::spawn(move || {
+                let _guard = SlotGuard { active: &active };
+                let _ = contain_panic(|| panic!("malformed volume"));
+            })
+        };
+        handle.join().ok();
+        assert_eq!(active.load(Ordering::Relaxed), 0);
     }
 
     #[test]

@@ -608,15 +608,18 @@ pub fn apply_rescan(index: &mut Index, plan: RescanPlan) -> ScanReport {
     // Only records the walk actually established absent are stale: a subtree
     // it pruned (removable media or a nested mount) or a root whose traversal
     // was incomplete (deadline, cancellation, read failure) was not visited.
+    // Paths are rebuilt from raw bytes: a lossy `String` would not byte-match
+    // the stored record, so `established_absent` and `remove` would miss
+    // non-UTF-8 records and they would survive every rescan.
     let mut stale: Vec<PathBuf> = Vec::new();
-    let mut buf = String::new();
+    let mut buf = Vec::new();
     for (i, rec) in index.records().iter().enumerate() {
         if rec.is_deleted() || seen[i] {
             continue;
         }
         buf.clear();
-        index.write_path(i as u32, &mut buf);
-        let path = Path::new(&buf);
+        index.write_path_bytes(i as u32, &mut buf);
+        let path = Path::new(OsStr::from_bytes(&buf));
         if coverage.iter().any(|c| c.established_absent(path)) {
             stale.push(path.to_path_buf());
         }
@@ -1116,6 +1119,100 @@ mod tests {
         assert!(index.find(&base).is_some());
         assert_eq!(report.entries, 1); // new.txt
         assert_eq!(report.skipped, 1); // sub/b.txt
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn rescan_removes_stale_records_with_non_utf8_paths() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let base = temp_dir("rescan-nonutf8");
+        fs::create_dir_all(&base).unwrap();
+        let name = OsString::from_vec(b"bad\xff.txt".to_vec());
+        let path = base.join(&name);
+        fs::write(&path, b"x").unwrap();
+
+        let config = ScanConfig::with_roots(vec![base.clone()]);
+        let (mut index, _) = scan(&config);
+        let before = index
+            .iter()
+            .filter(|(i, r)| !r.is_dir() && index.name(*i).contains("bad"))
+            .count();
+        assert_eq!(before, 1, "non-UTF8 file should be indexed");
+
+        fs::remove_file(&path).unwrap();
+        let plan = plan_rescan(&config);
+        let rec_idx = index
+            .iter()
+            .find(|(i, r)| !r.is_dir() && index.name(*i).contains("bad"))
+            .map(|(i, _)| i)
+            .unwrap();
+        let mut buf = String::new();
+        index.write_path(rec_idx, &mut buf);
+        let absent = plan.coverage.iter().any(|c| c.established_absent(&path));
+        assert!(absent, "path {buf:?} should be established absent");
+        let removed = index.remove(&path);
+        assert!(removed, "remove should succeed for {buf:?}");
+        let after = index
+            .iter()
+            .filter(|(i, r)| !r.is_dir() && index.name(*i).contains("bad"))
+            .count();
+        assert_eq!(
+            after, 0,
+            "stale non-UTF8 record should be removed by rescan"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn rescan_of_non_utf8_path_does_not_duplicate_records() {
+        // Regression (issue 116): `insert_with_flags` used to store and key
+        // the record from `to_string_lossy()` bytes, so a non-UTF-8 entry
+        // inserted during a rescan never byte-matched the raw-byte lookups
+        // the rest of the index uses. Each rescan then inserted a duplicate
+        // and the stale loop tombstoned the *live* record's map entry,
+        // permanently losing the path. Byte-keyed inserts keep exactly one
+        // live record across repeated rescans.
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let base = temp_dir("rescan-nonutf8-dup");
+        fs::create_dir_all(&base).unwrap();
+        let name = OsString::from_vec(b"dup\xff.txt".to_vec());
+        let path = base.join(&name);
+        fs::write(&path, b"x").unwrap();
+
+        let config = ScanConfig::with_roots(vec![base.clone()]);
+        let (mut index, _) = scan(&config);
+        assert!(index.find(&path).is_some(), "initial scan finds raw path");
+
+        // A metadata change forces update_metadata through the raw-byte
+        // lookup on the next rescan.
+        fs::write(&path, b"longer contents").unwrap();
+        let report = rescan_into_index(&mut index, &config);
+        assert_eq!(report.entries, 0, "rescan must not duplicate the entry");
+
+        let live = index
+            .iter()
+            .filter(|(i, r)| !r.is_dir() && !r.is_deleted() && index.name(*i).contains("dup"))
+            .count();
+        assert_eq!(live, 1, "exactly one live record for the path");
+
+        // The by-path entry still resolves, so metadata updates hit the
+        // live record instead of creating another one.
+        let idx = index.find(&path).expect("by-path entry lost after rescan");
+        assert_eq!(index.record(idx).size as usize, "longer contents".len());
+
+        // And a second rescan is stable too.
+        rescan_into_index(&mut index, &config);
+        let live = index
+            .iter()
+            .filter(|(i, r)| !r.is_dir() && !r.is_deleted() && index.name(*i).contains("dup"))
+            .count();
+        assert_eq!(live, 1);
 
         let _ = fs::remove_dir_all(&base);
     }
