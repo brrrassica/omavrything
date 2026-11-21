@@ -500,6 +500,123 @@ mod tests {
     }
 
     #[test]
+    fn evicted_delta_remove_and_recreate_non_utf8_path_folds_correctly() {
+        // Regression (issue 115): while the base image is evicted, delta
+        // event lookups and `DeltaIndex` keys were built from lossy UTF-8
+        // strings, so a non-UTF-8 base record was never resolved: the
+        // removal missed the base record, and the recreated insert
+        // collided with the surviving tombstone at fold time, leaving
+        // the path permanently unsearchable. The whole evicted-delta
+        // path is byte-keyed now, so remove + recreate + fold must yield
+        // exactly one live record that `find` resolves by raw bytes.
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let base = temp_dir("evicted-delta-non-utf8");
+        let name = OsString::from_vec(b"bad\xff.txt".to_vec());
+        let file = base.join(&name);
+        fs::write(&file, b"first").unwrap();
+
+        // Build the base image as an evicted index would hold it.
+        let mut index = Index::new();
+        let config = ScanConfig::with_roots(vec![base.clone()]);
+        apply(&mut index, &FsEvent::Created(base.clone()), &config);
+        assert!(index.find(&file).is_some());
+        let by_path = PathIndex::build(index.records(), index.paths());
+
+        // Remove while evicted: the delta must tombstone the base record.
+        fs::remove_file(&file).unwrap();
+        let mut delta = DeltaIndex::new();
+        assert!(apply_delta(
+            &mut delta,
+            &by_path,
+            index.records(),
+            index.paths(),
+            &FsEvent::Removed(file.clone()),
+            &config
+        ));
+        index.apply_delta(&delta);
+        assert!(index.find(&file).is_none(), "removed record survived fold");
+        assert_eq!(index.search("bad", 10, 0).hits.len(), 0);
+
+        // Recreate the same non-UTF-8 path while evicted again, then fold.
+        fs::write(&file, b"second").unwrap();
+        let by_path = PathIndex::build(index.records(), index.paths());
+        let mut delta = DeltaIndex::new();
+        assert!(apply_delta(
+            &mut delta,
+            &by_path,
+            index.records(),
+            index.paths(),
+            &FsEvent::Created(file.clone()),
+            &config
+        ));
+        index.apply_delta(&delta);
+
+        let idx = index
+            .find(&file)
+            .expect("recreated non-UTF-8 path not findable");
+        assert!(!index.record(idx).is_deleted());
+        assert_eq!(index.search("bad", 10, 0).hits.len(), 1);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn evicted_delta_modified_non_utf8_path_stays_findable() {
+        // Regression (issue 115): a Modified event for a non-UTF-8 path
+        // resolved the base record through lossy keys, so the queued
+        // insert stored lossy bytes and the fold left a dead record that
+        // shadowed the live one. Byte-keyed lookups keep the record live
+        // and metadata-correct.
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let base = temp_dir("evicted-modified-non-utf8");
+        let name = OsString::from_vec(b"m\xffd.txt".to_vec());
+        let file = base.join(&name);
+        fs::write(&file, b"small").unwrap();
+
+        let mut index = Index::new();
+        let config = ScanConfig::with_roots(vec![base.clone()]);
+        apply(&mut index, &FsEvent::Created(base.clone()), &config);
+        let by_path = PathIndex::build(index.records(), index.paths());
+
+        fs::write(&file, b"much longer contents").unwrap();
+        let mut delta = DeltaIndex::new();
+        assert!(apply_delta(
+            &mut delta,
+            &by_path,
+            index.records(),
+            index.paths(),
+            &FsEvent::Modified(file.clone()),
+            &config
+        ));
+        index.apply_delta(&delta);
+
+        let idx = index
+            .find(&file)
+            .expect("modified non-UTF-8 path not findable");
+        assert!(!index.record(idx).is_deleted());
+        assert_eq!(
+            index.record(idx).size as usize,
+            "much longer contents".len()
+        );
+        // Search by the lossy-visible prefix and require exactly one hit for
+        // the recreated path itself (the temp dir's own name may match the
+        // term too, so match on the path, not on the hit count).
+        let hits = index.search("m", 50, 0).hits;
+        assert_eq!(
+            hits.iter()
+                .filter(|h| h.path == file.to_string_lossy())
+                .count(),
+            1
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn modified_updates_size() {
         let base = temp_dir("modified");
         let file = base.join("grow.txt");

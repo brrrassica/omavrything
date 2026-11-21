@@ -1168,6 +1168,56 @@ mod tests {
     }
 
     #[test]
+    fn rescan_of_non_utf8_path_does_not_duplicate_records() {
+        // Regression (issue 116): `insert_with_flags` used to store and key
+        // the record from `to_string_lossy()` bytes, so a non-UTF-8 entry
+        // inserted during a rescan never byte-matched the raw-byte lookups
+        // the rest of the index uses. Each rescan then inserted a duplicate
+        // and the stale loop tombstoned the *live* record's map entry,
+        // permanently losing the path. Byte-keyed inserts keep exactly one
+        // live record across repeated rescans.
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let base = temp_dir("rescan-nonutf8-dup");
+        fs::create_dir_all(&base).unwrap();
+        let name = OsString::from_vec(b"dup\xff.txt".to_vec());
+        let path = base.join(&name);
+        fs::write(&path, b"x").unwrap();
+
+        let config = ScanConfig::with_roots(vec![base.clone()]);
+        let (mut index, _) = scan(&config);
+        assert!(index.find(&path).is_some(), "initial scan finds raw path");
+
+        // A metadata change forces update_metadata through the raw-byte
+        // lookup on the next rescan.
+        fs::write(&path, b"longer contents").unwrap();
+        let report = rescan_into_index(&mut index, &config);
+        assert_eq!(report.entries, 0, "rescan must not duplicate the entry");
+
+        let live = index
+            .iter()
+            .filter(|(i, r)| !r.is_dir() && !r.is_deleted() && index.name(*i).contains("dup"))
+            .count();
+        assert_eq!(live, 1, "exactly one live record for the path");
+
+        // The by-path entry still resolves, so metadata updates hit the
+        // live record instead of creating another one.
+        let idx = index.find(&path).expect("by-path entry lost after rescan");
+        assert_eq!(index.record(idx).size as usize, "longer contents".len());
+
+        // And a second rescan is stable too.
+        rescan_into_index(&mut index, &config);
+        let live = index
+            .iter()
+            .filter(|(i, r)| !r.is_dir() && !r.is_deleted() && index.name(*i).contains("dup"))
+            .count();
+        assert_eq!(live, 1);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn rescan_preserves_records_under_pruned_subtrees() {
         let base = temp_dir("rescan-pruned");
         fs::create_dir_all(base.join("media/vol")).unwrap();
