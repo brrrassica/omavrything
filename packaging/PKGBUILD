@@ -55,7 +55,9 @@ source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 #
 # After tagging: `cd packaging && sudo pacman -S --needed pacman-contrib &&
 # updpkgsums` (or copy the value from the release job summary).
-sha256sums=('0000000000000000000000000000000000000000000000000000000000000000')
+# Verified against the real v0.2.8 tag tarball by the release workflow
+# (job summary + scripts/verify-release-metadata.sh):
+sha256sums=('9ad7fcadc6ae653431bd3d0900d49df9b40973d7bb93246624da889b081edb06')
 
 build() {
   cd "$pkgname-$pkgver"
