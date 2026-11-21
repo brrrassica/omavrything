@@ -793,7 +793,12 @@ pub fn run_hotplug_monitor(
     const POLL: Duration = Duration::from_secs(2);
     const FALLBACK: Duration = Duration::from_secs(30);
     const RETRY: Duration = Duration::from_secs(60);
-    let events = crate::udev::monitor().ok();
+    // Whether the udev monitor is (still) connected. The receiver dies
+    // permanently if the uevent thread hits a fatal `recv` error, so track it
+    // explicitly instead of treating a disconnected channel like a timeout —
+    // that would busy-spin the loop with no blocking wait and no sleep
+    // (issue 121).
+    let mut events = crate::udev::monitor().ok();
     if events.is_none() {
         warn!("ntfs: udev monitor unavailable; falling back to mount-table polling");
     }
@@ -887,8 +892,28 @@ pub fn run_hotplug_monitor(
                 }
             }
         }
-        match &events {
-            Some(rx) => crate::udev::wait_for_block_event(rx, FALLBACK),
+        match &mut events {
+            Some(rx) => {
+                if crate::udev::wait_for_block_event(rx, FALLBACK)
+                    == crate::udev::EventWait::Disconnected
+                {
+                    // The monitor thread died (fatal `recv` error). Try to
+                    // rebuild it; if that fails, poll the mount table until it
+                    // can be recreated rather than spinning on a dead
+                    // receiver (issue 121).
+                    match crate::udev::monitor() {
+                        Ok(rx) => events = Some(rx),
+                        Err(err) => {
+                            warn!(
+                                error = %err,
+                                "ntfs: udev monitor lost; falling back to mount-table polling"
+                            );
+                            events = None;
+                            std::thread::sleep(POLL);
+                        }
+                    }
+                }
+            }
             None => std::thread::sleep(POLL),
         }
     }

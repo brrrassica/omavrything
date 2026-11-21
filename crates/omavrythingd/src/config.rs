@@ -233,12 +233,19 @@ impl SharedConfig {
         let Some(path) = &self.state_path else {
             return Ok(());
         };
-        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
-        let volumes = state.volumes.get_or_insert_with(Vec::new);
-        if !volumes.iter().any(|v| v == device) {
-            volumes.push(device.to_string());
-        }
-        state.save(path)
+        let snapshot = {
+            let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+            let volumes = state.volumes.get_or_insert_with(Vec::new);
+            if !volumes.iter().any(|v| v == device) {
+                volumes.push(device.to_string());
+            }
+            state.clone()
+        };
+        // Save the clone outside the lock (issue 123): `save` performs
+        // `create_dir_all`, a temp-file write, `sync_all`, and `rename`, and
+        // holding the config write lock across that disk I/O would stall every
+        // concurrent config reader and writer on slow storage.
+        snapshot.save(path)
     }
 
     /// Forget an unmounted device in the state config.
@@ -246,11 +253,15 @@ impl SharedConfig {
         let Some(path) = &self.state_path else {
             return Ok(());
         };
-        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
-        if let Some(volumes) = &mut state.volumes {
-            volumes.retain(|v| v != device);
-        }
-        state.save(path)
+        let snapshot = {
+            let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+            if let Some(volumes) = &mut state.volumes {
+                volumes.retain(|v| v != device);
+            }
+            state.clone()
+        };
+        // Save outside the lock, as in `remember_volume` (issue 123).
+        snapshot.save(path)
     }
 
     /// Apply a configuration change and persist it. Returns an error for
@@ -327,9 +338,13 @@ impl SharedConfig {
         let Some(path) = &self.state_path else {
             return Ok(());
         };
-        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
-        state.set(key, value)?;
-        state.save(path)
+        let snapshot = {
+            let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+            state.set(key, value)?;
+            state.clone()
+        };
+        // Save outside the lock, as in `remember_volume` (issue 123).
+        snapshot.save(path)
     }
 
     /// The configuration as a string map, for `GetConfig`.
