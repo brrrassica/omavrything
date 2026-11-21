@@ -3567,6 +3567,118 @@ mod tests {
     }
 
     #[test]
+    fn remove_of_non_utf8_path_drops_the_record_and_map_entry() {
+        // Regression (issue 127): `remove_inner` used to derive its lookup key,
+        // subtree prefix, and path-map removal keys from lossy UTF-8 strings,
+        // so deleting a file (or directory) with invalid UTF-8 in its path was
+        // a silent no-op: the record stayed searchable and its byte-keyed
+        // `PathIndex` entry leaked, blocking re-insertion on the next rescan.
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let mut index = Index::new();
+        index.insert(Path::new("/home"), true, 0, 0);
+        index.insert(Path::new("/home/a.txt"), false, 1, 0);
+
+        // A file with invalid UTF-8 bytes in its basename.
+        let bad_file = Path::new(OsStr::from_bytes(b"/home/\xFF.txt"));
+        index.insert(bad_file, false, 3, 0);
+        assert!(index.find_bytes(b"/home/\xFF.txt").is_some());
+
+        assert!(index.remove(bad_file), "non-UTF8 file must be removed");
+        assert!(
+            index.find_bytes(b"/home/\xFF.txt").is_none(),
+            "record gone after removal"
+        );
+        assert_eq!(index.search("\u{FFFD}.txt", 10, 0).hits.len(), 0);
+        assert_eq!(index.len(), 2, "no leaked tombstone changes the live count");
+
+        // A directory with invalid UTF-8 in its path: the whole subtree must be
+        // tombstoned, and every descendant's map entry must be dropped.
+        let bad_dir = Path::new(OsStr::from_bytes(b"/home/d\xFFir"));
+        index.insert(bad_dir, true, 0, 0);
+        index.insert(
+            Path::new(OsStr::from_bytes(b"/home/d\xFFir/f.txt")),
+            false,
+            1,
+            0,
+        );
+        assert!(index.find_bytes(b"/home/d\xFFir/f.txt").is_some());
+
+        assert!(index.remove(bad_dir), "non-UTF8 directory must be removed");
+        assert!(index.find_bytes(b"/home/d\xFFir").is_none());
+        assert!(index.find_bytes(b"/home/d\xFFir/f.txt").is_none());
+        assert_eq!(index.search("f.txt", 10, 0).hits.len(), 0);
+        assert_eq!(index.len(), 2, "root + a.txt only");
+        assert!(index.find(Path::new("/home/a.txt")).is_some());
+    }
+
+    #[test]
+    fn rename_of_non_utf8_path_rekeys_the_map_by_raw_bytes() {
+        // Regression (issue 124): `rename` resolved the affected record through
+        // byte-reconstructed paths but rekeyed the path map through lossy
+        // UTF-8 strings. For a non-UTF-8 path the old key was never removed and
+        // the new key was stored as replacement-character bytes, so later
+        // `find`/`remove`/`update_metadata` on the real path missed the record
+        // and it stayed in the index after the file was gone.
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let mut index = Index::new();
+        index.insert(Path::new("/home"), true, 0, 0);
+
+        // Rename a file whose basename has invalid UTF-8 bytes.
+        let old = Path::new(OsStr::from_bytes(b"/home/old\xFF.txt"));
+        let new = Path::new(OsStr::from_bytes(b"/home/new\xFF.txt"));
+        let idx = index.insert(old, false, 5, 0);
+
+        assert!(index.rename(old, new), "non-UTF8 rename must succeed");
+        assert!(index.find_bytes(b"/home/old\xFF.txt").is_none());
+        assert_eq!(
+            index.find_bytes(b"/home/new\xFF.txt"),
+            Some(idx),
+            "renamed record must resolve by raw bytes"
+        );
+        assert_eq!(
+            index.path(idx),
+            String::from_utf8_lossy(b"/home/new\xFF.txt")
+        );
+
+        // The renamed record stays fully functional by raw path.
+        assert!(index.update_metadata(new, 9, 42));
+        assert_eq!(index.record(idx).size, 9);
+        assert!(index.remove(new));
+        assert!(index.find_bytes(b"/home/new\xFF.txt").is_none());
+        assert_eq!(index.len(), 1, "parent directory only");
+    }
+
+    #[test]
+    fn rename_non_utf8_directory_rekeys_descendants_by_raw_bytes() {
+        // The descendant suffix path must be preserved byte-for-byte, not
+        // round-tripped through a lossy string.
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let mut index = Index::new();
+        index.insert(Path::new("/home"), true, 0, 0);
+        let dir = Path::new(OsStr::from_bytes(b"/home/bad\xFF"));
+        index.insert(dir, true, 0, 0);
+        let child = Path::new(OsStr::from_bytes(b"/home/bad\xFF/f.txt"));
+        let child_idx = index.insert(child, false, 2, 0);
+
+        let moved = Path::new(OsStr::from_bytes(b"/home/moved\xFF"));
+        assert!(index.rename(dir, moved));
+        assert!(index.find_bytes(b"/home/bad\xFF").is_none());
+        assert!(index.find_bytes(b"/home/bad\xFF/f.txt").is_none());
+        assert_eq!(index.find_bytes(b"/home/moved\xFF/f.txt"), Some(child_idx));
+        assert_eq!(
+            index.path(child_idx),
+            String::from_utf8_lossy(b"/home/moved\xFF/f.txt")
+        );
+        assert_eq!(index.search("f.txt", 10, 0).hits.len(), 1);
+    }
+
+    #[test]
     fn rename_over_existing_with_indexed_parent_keeps_one_record() {
         let mut index = Index::new();
         index.insert(Path::new("/home/sam"), true, 0, 0);
