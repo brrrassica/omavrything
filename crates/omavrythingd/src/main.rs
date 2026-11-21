@@ -1152,15 +1152,24 @@ fn install_shutdown_handler(
             if index.is_loading() {
                 warn!("shutdown during startup; snapshot not written");
             } else {
-                // Encode and write under SNAPSHOT_LOCK (same order as
-                // `evict()` and `run_snapshot`) so a concurrent eviction
-                // cannot interleave and persist an older image (issue 54).
-                let _guard = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-                let bytes = index.encode();
+                // Encode while holding SNAPSHOT_LOCK, then release it before
+                // the write: the fixed temp path requires concurrent writers
+                // to serialize around the encode (issue 54), but holding the
+                // lock across `write_atomic`'s temp write, two `fsync`s, and
+                // rename would stall a concurrent evictor for the duration of
+                // the shutdown I/O (issue 122). This matches `run_snapshot`'s
+                // lock scope; the state write lock inside `index.encode()`
+                // covers only the encode.
+                let bytes;
+                {
+                    let _guard = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                    bytes = index.encode();
+                }
                 match snapshot::write_atomic(&bytes, path) {
                     Ok(()) => info!(path = %path.display(), "snapshot written"),
                     Err(e) => error!(error = %e, "snapshot save failed"),
                 }
+                drop(bytes);
             }
         }
         // B9: unmount every daemon-created private mount before exiting. Each
