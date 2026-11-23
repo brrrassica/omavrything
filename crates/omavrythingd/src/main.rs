@@ -233,7 +233,13 @@ fn main() {
         }
     };
     if let Err(err) = prepare_socket(&args.socket) {
-        warn!(socket = %args.socket.display(), error = %err, "could not secure socket");
+        error!(
+            socket = %args.socket.display(),
+            error = %err,
+            "could not secure socket"
+        );
+        let _ = std::fs::remove_file(&args.socket);
+        std::process::exit(1);
     }
     info!(socket = %args.socket.display(), "listening");
 
