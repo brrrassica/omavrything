@@ -31,7 +31,7 @@
 755  16404a5043bdcf2991953d0bf8d884732696184b1c4d0c58342a06409613bab9  scripts/bootstrap.sh
 755  b569f650bdbbf5f0f7e4d652073162703742b73f68824cb4f72f35ad9ed9bf6f  scripts/doctor.sh
 755  f4fd4432a2241a20d465fffdf514d7e32eadc56bfb03739618a579eae2ab77fa  scripts/fetch-daemon.sh
-755  f81459166c59cd5eb214c49abebba4a336799c38b8bafeefddad236506950fa1  scripts/install.sh
+755  7fe17c37e59dcdbf07007f414fd3da5be1d7edbf5a28ddb7bafd52e1ecbabef5  scripts/install.sh
 755  9fe9b9468d146cbdae440b9bc2e4f82a67199a0a97d4ac0314a684de5bd7215e  scripts/restart-all.sh
 755  f7cc0f505b6d92c8a42de67cbe698e1b681b4f4d61f4002b48a1230f72d17155  scripts/run-daemon.sh
 755  a5ec4e2b18b8b6c9e46e18febd47aa7a0ab4d01facc13f217f29f10f7277b37e  scripts/uninstall.sh

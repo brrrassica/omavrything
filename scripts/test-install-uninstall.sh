@@ -75,6 +75,18 @@ else
   bad "install.sh does not add the user to the group / apply the ACL bridge"
 fi
 
+# --- Issues #130/#134: upgrades keep the previous install until the new one is
+# complete. The old system/plugin trees must never be deleted up front; whole
+# trees are staged beside the live ones and swapped in atomically.
+if grep -qF 'atomic_dir_swap as_root' "$pkg/scripts/install.sh" &&
+  grep -qF 'atomic_dir_swap as_user' "$pkg/scripts/install.sh" &&
+  ! grep -qF 'rm -rf /usr/share/omavrything /usr/share/licenses/omavrything' "$pkg/scripts/install.sh" &&
+  ! grep -qF "as_user rm -rf \"\$plugin_dest\"" "$pkg/scripts/install.sh"; then
+  ok "install.sh swaps staged system/plugin trees instead of deleting them first"
+else
+  bad "install.sh still deletes the previous install before the replacement is ready"
+fi
+
 # --- C3: uninstall.sh is system-only (no --user mode) -----------------------
 # The unified installer is system-only, so the uninstaller is too: it must
 # reject the removed --user mode and refuse to run as a non-root user.
@@ -193,6 +205,24 @@ else
   else
     bad "doctor.sh did not flag the missing install"
   fi
+fi
+
+# --- Issues #135/#137: release trust artifacts are replaced atomically -------
+# The old archive and pin must survive a failed build/list. Look for the temp
+# names and publish-after-verification moves, not an in-place redirect/delete.
+if grep -qF "rm -f \"\$archive\"" scripts/package-release.sh; then
+  bad "package-release.sh still deletes the previous archive before building"
+elif grep -qF "new_archive=\"\$dist/\$name.zip.new-\$\$\"" scripts/package-release.sh &&
+  grep -qF "mv -f \"\$new_archive\" \"\$archive\"" scripts/package-release.sh; then
+  ok "package-release.sh publishes the archive only after it is verified"
+else
+  bad "package-release.sh does not stage the archive before publishing"
+fi
+if grep -qF "mktemp \"\${inputs_pin}.XXXXXX\"" scripts/checksums-add.sh &&
+  grep -qF "mv -f \"\$inputs_tmp\" \"\$inputs_pin\"" scripts/checksums-add.sh; then
+  ok "checksums-add.sh replaces the archive-input pin atomically"
+else
+  bad "checksums-add.sh still truncates the archive-input pin in place"
 fi
 
 # --- C1/C6/C11: the release archive ships the expected files ----------------

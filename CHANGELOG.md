@@ -6,6 +6,17 @@ Notable changes to `omavrything`. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **Upgrades and release generation no longer destroy the last good copy before
+  the replacement exists** (issues #130, #134, #135, #137). `install.sh` stages
+  the shared/plugin/docs trees and swaps them into place only after every new
+  file is ready, removing obsolete files afterwards. `package-release.sh` builds
+  and verifies the zip under a temp name before replacing the published
+  archive, and `checksums-add.sh` writes `archive-inputs.txt` via temp-then-
+  rename. A failed install, missing `zip`, failed reproducibility check, or
+  failed archive-input listing now leaves the previous artifact intact.
+
 ## [0.2.8] — 2026-11-21
 
 ### Fixed

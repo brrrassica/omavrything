@@ -148,8 +148,13 @@ See docs/install.md for the full setup, including the optional D-Bus control
 interface and the hardened systemd service.
 EOF
 
-# Zip the staging directory. The archive contains a single top-level directory
-# named after the release so it extracts cleanly.
+# Zip the staging directory into a temporary sibling first. The previous
+# archive stays untouched until the new one has been built twice identically,
+# so a missing `zip`, an interrupted run, or a non-reproducible tree can never
+# destroy the last good artifact for this version+arch.
+#
+# The archive contains a single top-level directory named after the release so
+# it extracts cleanly.
 #
 # The archive is built deterministically, so the digest pinned in
 # scripts/daemon-checksums.txt can be reproduced by rebuilding the same tree.
@@ -169,32 +174,52 @@ EOF
 # This makes the archive reproducible on a given toolchain. The release workflow
 # still publishes the exact file it built and pins that file's digest, so the
 # pin and the downloaded asset can never diverge.
-rm -f "$archive"
+# Fail before any destructive step: a missing zip binary must not cost the
+# previous archive.
 if ! command -v zip >/dev/null 2>&1; then
   echo "error: 'zip' is required to build the release archive" >&2
   exit 1
 fi
+
+new_archive="$dist/$name.zip.new-$$"
+repro="$dist/$name.zip.repro-$$"
+sha_tmp="$dist/$name.zip.sha256.new-$$"
+sha_file="$dist/$name.zip.sha256"
+# A crash between runs can leave a temp file with the same PID behind; `zip`
+# would UPDATE it instead of starting fresh, so clear stale paths first.
+rm -f "$new_archive" "$repro" "$sha_tmp"
+cleanup_archive_temps() {
+  rm -f "$new_archive" "$repro" "$sha_tmp" || true
+}
+trap cleanup_archive_temps EXIT
+
 find "$stage" -exec touch -h -d '1980-01-01 00:00:00 UTC' {} +
-( cd "$dist" && find "$name" -print | LC_ALL=C sort | TZ=UTC zip -X -q "$name.zip" -@ )
+( cd "$dist" && find "$name" -print | LC_ALL=C sort | TZ=UTC zip -X -q "$(basename "$new_archive")" -@ )
 
 # Fail loudly if the archive is not reproducible: rebuilding the same staging
 # tree must produce the same bytes. This catches a non-deterministic input
-# (e.g. a generated file carrying a timestamp) before the digest is published.
-repro="$dist/$name.zip.repro"
+# (e.g. a generated file carrying a timestamp) before the digest is published
+# or the previous archive is replaced.
 ( cd "$dist" && find "$name" -print | LC_ALL=C sort | TZ=UTC zip -X -q "$(basename "$repro")" -@ )
-if ! cmp -s "$archive" "$repro"; then
+if ! cmp -s "$new_archive" "$repro"; then
   echo "error: release archive is not reproducible" >&2
   echo "       two builds of the same staging tree produced different zip files" >&2
-  rm -f "$repro"
+  echo "       $archive was NOT modified" >&2
   exit 1
 fi
-rm -f "$repro"
 
 # The .sha256 asset published alongside the archive, for manual verification.
 # The plugin bootstrap does NOT trust it: it verifies against the digest pinned
 # in scripts/daemon-checksums.txt (see scripts/fetch-daemon.sh), because the
-# archive and this asset live in the same mutable release.
-( cd "$dist" && sha256sum "$name.zip" > "$name.zip.sha256" )
+# archive and this asset live in the same mutable release. Write it under a temp
+# name too, with the FINAL archive name in the checksum line, then publish both.
+digest="$(sha256sum "$new_archive" | awk '{print $1}')"
+printf '%s  %s\n' "$digest" "$name.zip" > "$sha_tmp"
+
+# Only now replace the published artifacts. Each `mv` is atomic on the same
+# filesystem, so a reader never sees a half-written zip or checksum file.
+mv -f "$new_archive" "$archive"
+mv -f "$sha_tmp" "$sha_file"
 
 # Append the archive digest to the pinned file. This entry cannot be inside the
 # archive (it would be circular), so it is added after zipping; the archive's
@@ -202,7 +227,6 @@ rm -f "$repro"
 # dist/daemon-checksums.txt to scripts/daemon-checksums.txt on the default
 # branch; a missing entry makes fetch-daemon.sh fail closed rather than trust
 # the release's own checksum.
-digest="$(sha256sum "$archive" | awk '{print $1}')"
 printf '%s  %s\n' "$digest" "$name.zip" >> "$checksums"
 
 echo "Wrote $archive"

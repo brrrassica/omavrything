@@ -101,14 +101,25 @@ done
 # tree even though one runs on the release branch and the other on the merge
 # commit.
 inputs_pin="scripts/archive-inputs.txt"
+# Never truncate the pinned fingerprint in place: --list must succeed before the
+# old pin is replaced, or the pre-tag gate would fail closed with an empty pin.
+# Same-filesystem temp + rename keeps either the complete old pin or the
+# complete new one, even if this script is interrupted.
+inputs_tmp="$(mktemp "${inputs_pin}.XXXXXX")"
+trap 'rm -f "$inputs_tmp"' EXIT
 {
   echo "# Fingerprint of every file that goes into the release archive."
   echo "# Regenerate with scripts/checksums-add.sh after scripts/package-release.sh."
   echo "# Verify with scripts/archive-inputs.sh --check."
   echo "# Format: <mode>  <sha256>  <path>"
   echo "#"
-  scripts/archive-inputs.sh --list
-} > "$inputs_pin"
+} > "$inputs_tmp"
+if ! scripts/archive-inputs.sh --list >> "$inputs_tmp"; then
+  echo "error: could not list archive inputs; $inputs_pin was NOT modified" >&2
+  exit 1
+fi
+chmod 0644 "$inputs_tmp"
+mv -f "$inputs_tmp" "$inputs_pin"
 echo "Wrote $inputs_pin (archive input fingerprint)"
 
 echo ""

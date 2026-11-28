@@ -272,6 +272,16 @@ expect_grep "install.sh verifies the pinned digests" scripts/install.sh "daemon-
 expect_grep "install.sh applies the ACL bridge" scripts/install.sh "setfacl"
 expect_grep "install.sh installs the per-user plugin" scripts/install.sh \
   "plugins/tech.alatcerdas.omavrything"
+expect_grep "install.sh stages system directory swaps" scripts/install.sh \
+  "atomic_dir_swap as_root"
+expect_grep "install.sh stages the per-user plugin swap" scripts/install.sh \
+  "atomic_dir_swap as_user"
+expect_no_grep_re "install.sh does not remove the previous install up front" \
+  scripts/install.sh 'rm -f /usr/bin/omavrythingd'
+expect_grep "package-release.sh publishes the archive atomically" \
+  scripts/package-release.sh "mv -f \"\$new_archive\" \"\$archive\""
+expect_grep "checksums-add.sh writes the archive pin atomically" \
+  scripts/checksums-add.sh "mktemp \"\${inputs_pin}.XXXXXX\""
 
 # 2. The usage contract of the installed binaries. Every binary must support
 # --version, and every usage error must exit 2 with a diagnostic.

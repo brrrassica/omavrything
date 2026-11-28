@@ -70,6 +70,46 @@ die() {
   exit 1
 }
 
+# Directories staged for the atomic swaps below. Cleared as soon as a swap
+# succeeds, so the EXIT trap never removes the tree that was just installed.
+share_stage=""
+doc_stage=""
+plugin_new=""
+
+cleanup_staging() {
+  if [[ -n "$share_stage" ]]; then rm -rf "$share_stage" || true; fi
+  if [[ -n "$doc_stage" ]]; then rm -rf "$doc_stage" || true; fi
+  if [[ -n "$plugin_new" ]]; then rm -rf "$plugin_new" || true; fi
+}
+trap cleanup_staging EXIT
+
+# Install a fully staged directory by renaming the old tree aside and the new
+# one into its place. A failure at any point restores the old tree, so the host
+# is never left without the previous directory (issues #130 and #134).
+# Usage: atomic_dir_swap <runner> <staged-dir> <destination>
+# The runner is `as_user` for the per-user plugin and `as_root` for system dirs.
+as_root() { "$@"; }
+atomic_dir_swap() {
+  local runner="$1" staged="$2" dest="$3"
+  local old="${dest}.old-$$"
+  local moved_old=0
+
+  if [[ -e "$dest" || -L "$dest" ]]; then
+    "$runner" rm -rf "$old" || return 1
+    "$runner" mv -T "$dest" "$old" || return 1
+    moved_old=1
+  fi
+  if ! "$runner" mv -T "$staged" "$dest"; then
+    if [[ "$moved_old" -eq 1 ]]; then
+      "$runner" mv -T "$old" "$dest" || true
+    fi
+    return 1
+  fi
+  if [[ "$moved_old" -eq 1 ]]; then
+    "$runner" rm -rf "$old" || true
+  fi
+}
+
 # Locate the release binaries. They live in bin/ at the top level, the same
 # layout the release archive ships; a source checkout populates it with
 # scripts/build.sh. --bindir overrides the location (the bootstrap passes a
@@ -110,20 +150,11 @@ else
   warn "skipping binary verification (--no-verify); only use this for a local build"
 fi
 
-# Remove any previous installation first so an upgrade leaves nothing stale
-# behind (e.g. the 0.1.4 `omavrything-install-plugin` helper, or QML files that
-# a newer version dropped). This mirrors the uninstaller's file list but keeps
-# the config, the dedicated user, and the cached index, which an upgrade
-# preserves. The binaries are located and verified above, so a missing or
-# unverifiable build fails before anything is removed.
-log "removing any previous installation"
-rm -f /usr/bin/omavrythingd /usr/bin/omavry /usr/bin/omavrything-install-plugin
-rm -f /usr/lib/systemd/system/omavrythingd.service
-rm -f /usr/lib/sysusers.d/omavrything.conf
-rm -f /usr/share/dbus-1/system.d/tech.alatcerdas.omavrything.conf
-rm -f /usr/share/polkit-1/actions/tech.alatcerdas.omavrything.policy
-rm -f /usr/share/man/man8/omavrythingd.8
-rm -rf /usr/share/omavrything /usr/share/licenses/omavrything /usr/share/doc/omavrything
+# The previous installation is NOT removed up front. New files are installed
+# (or staged and swapped for whole trees) first, and only files that current
+# versions no longer ship are deleted at the end of this section. A failure in
+# between therefore cannot strip the host of its working install (issue #130).
+# The config, the dedicated user, and the cached index are preserved on upgrade.
 
 # The user the shell plugin is installed for. Under sudo this is the real
 # invoker; under pkexec (the plugin bootstrap) it is $PKEXEC_UID. Running as
@@ -220,25 +251,39 @@ else
   log "keeping existing /etc/omavrything/config.toml"
 fi
 
-# The shell plugin, installed system-wide; the per-user copy is made below.
-install -d /usr/share/omavrything/shell/omavrything
-install -m644 "$here/manifest.json" /usr/share/omavrything/manifest.json
+# The shell plugin and docs are whole trees: stage them completely, then swap
+# them into place. This clears files dropped by a newer version without ever
+# deleting the old tree before its replacement exists.
+share_stage="/usr/share/omavrything.new-$$"
+doc_stage="/usr/share/doc/omavrything.new-$$"
+rm -rf "$share_stage" "$doc_stage"
+install -d -m755 "$share_stage/shell/omavrything"
+install -m644 "$here/manifest.json" "$share_stage/manifest.json"
 install -m644 "$here/shell/omavrything/SearchBar.qml" \
   "$here/shell/omavrything/SearchOverlay.qml" \
   "$here/shell/omavrything/Service.qml" \
-  /usr/share/omavrything/shell/omavrything/
+  "$share_stage/shell/omavrything/"
 
 install -Dm644 "$here/LICENSE" /usr/share/licenses/omavrything/LICENSE
-install -d /usr/share/doc/omavrything
-install -m644 "$here/README.md" /usr/share/doc/omavrything/README.md
+install -d -m755 "$doc_stage"
+install -m644 "$here/README.md" "$doc_stage/README.md"
 # docs/README.md is the documentation index; install it under a distinct name
 # so it does not collide with the project README (install refuses to overwrite
 # a file it just created in the same invocation).
 for doc in "$here"/docs/*.md; do
   name="$(basename "$doc")"
   [[ "$name" == "README.md" ]] && name="docs-index.md"
-  install -m644 "$doc" "/usr/share/doc/omavrything/$name"
+  install -m644 "$doc" "$doc_stage/$name"
 done
+
+atomic_dir_swap as_root "$share_stage" /usr/share/omavrything
+share_stage=""
+atomic_dir_swap as_root "$doc_stage" /usr/share/doc/omavrything
+doc_stage=""
+
+# Only now that every replacement is in place, drop files shipped by older
+# versions but no longer part of the install.
+rm -f /usr/bin/omavrything-install-plugin
 
 # 2. Create the dedicated user/group from the sysusers drop-in. This must
 # succeed: without it the service cannot start, and a silent failure is exactly
@@ -351,22 +396,28 @@ if [[ -n "$target_user" ]]; then
   else
     log "installing the shell plugin for $target_user"
     plugin_dest="$user_home/.config/omarchy/plugins/tech.alatcerdas.omavrything"
-    # Replace the plugin tree wholesale so a newer version's dropped files do not
-    # linger next to the freshly installed ones.
-    as_user rm -rf "$plugin_dest"
-    as_user mkdir -p "$plugin_dest/shell/omavrything"
-    as_user install -m644 "$here/manifest.json" "$plugin_dest/manifest.json"
-    as_user install -m644 "$here"/shell/omavrything/*.qml "$plugin_dest/shell/omavrything/"
+    # Build the complete replacement beside the live plugin. A dropped QML file
+    # still goes away (the whole tree is swapped), but a failed copy, validate,
+    # or swap leaves the previously working plugin in place (issue #134).
+    plugin_new="$plugin_dest.new-$$"
+    as_user rm -rf "$plugin_new"
+    as_user install -d -m755 "$plugin_new/shell/omavrything"
+    as_user install -m644 "$here/manifest.json" "$plugin_new/manifest.json"
+    as_user install -m644 "$here"/shell/omavrything/*.qml "$plugin_new/shell/omavrything/"
 
-    # Validate the plugin with omarchy when available. The plugin folder is a
-    # required argument: bare `omarchy plugin validate` prints usage and exits 0.
+    # Validate the staged plugin with omarchy when available. The plugin folder
+    # is a required argument: bare `omarchy plugin validate` prints usage and
+    # exits 0.
     if as_user sh -c 'command -v omarchy >/dev/null 2>&1'; then
-      if as_user omarchy plugin validate "$plugin_dest" >/dev/null 2>&1; then
+      if as_user omarchy plugin validate "$plugin_new" >/dev/null 2>&1; then
         log "validated the plugin with 'omarchy plugin validate'"
       else
-        warn "'omarchy plugin validate' rejected the installed plugin"
+        warn "'omarchy plugin validate' rejected the staged plugin"
       fi
     fi
+
+    atomic_dir_swap as_user "$plugin_new" "$plugin_dest"
+    plugin_new=""
 
     # Restart the shell FIRST so the freshly copied plugin is discovered and
     # registered. `omarchy plugin enable` talks to the running shell
