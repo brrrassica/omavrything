@@ -17,6 +17,16 @@ Notable changes to `omavrything`. The format follows
   rename. A failed install, missing `zip`, failed reproducibility check, or
   failed archive-input listing now leaves the previous artifact intact.
 
+- **A corrupt or racing snapshot no longer crashes the daemon or loses live
+  changes** (issues #129, #133, #136). Materializing an evicted image that can
+  no longer be parsed now logs the corruption and recovers via the `.prev`
+  snapshot fallback (or an empty index) instead of panicking. The evicted fast
+  path skips records with out-of-range parents or path ranges, so a corrupted
+  mmap drops the affected event. Periodic and shutdown saves now pair encoded
+  bytes with the mutation generation and discard them if the index changed
+  before publication, so a checksum-valid stale snapshot cannot hide a newer
+  image behind the `.prev` fallback.
+
 ## [0.2.8] — 2026-11-21
 
 ### Fixed

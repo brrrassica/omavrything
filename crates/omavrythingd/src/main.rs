@@ -1063,22 +1063,26 @@ fn run_snapshot(index: Arc<IndexManager>, config: Arc<SharedConfig>, path: PathB
         if index.is_evicted() && !index.has_pending_delta() {
             continue;
         }
-        // Encode and write while holding SNAPSHOT_LOCK, so a concurrent
-        // eviction write cannot interleave with (and overwrite) this write's
-        // bytes (issue 54). `evict()` takes the same lock around its encode and
-        // write, keeping one lock order everywhere. The state write lock is
-        // taken only for the compact and the encode; the write itself runs
-        // without it so a million-record save does not freeze socket searches
-        // for the duration (issue 117).
-        let _guard = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let ids = index.identities();
-        let bytes = index.with_index_mut(|idx| {
-            idx.compact();
-            snapshot::encode(idx, &ids)
-        });
-        drop(_guard);
-        if let Err(e) = snapshot::write_atomic(&bytes, &path) {
-            error!(error = %e, "snapshot save failed");
+        // Encode under SNAPSHOT_LOCK (snapshot lock before the state lock, as
+        // `evict()` does), but release it before publishing. The state write
+        // lock is held only for the compact and encode, so a million-record
+        // save does not freeze socket searches (issue 117). Capture the
+        // generation with the encoded bytes: an event landing between encode
+        // and write must discard these bytes rather than overwrite a newer
+        // image (issue 133). `write_snapshot_if_current` re-acquires the lock
+        // and re-checks immediately before the write.
+        let (bytes, generation) = {
+            let _guard = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let ids = index.identities();
+            index.with_index_mut_generation(|idx| {
+                idx.compact();
+                snapshot::encode(idx, &ids)
+            })
+        };
+        match index.write_snapshot_if_current(&bytes, generation, &path) {
+            Ok(true) => {}
+            Ok(false) => debug!("skipping stale snapshot save; the index changed during encode"),
+            Err(e) => error!(error = %e, "snapshot save failed"),
         }
         // The encoded snapshot is a large transient buffer; return its pages.
         drop(bytes);
@@ -1158,21 +1162,21 @@ fn install_shutdown_handler(
             if index.is_loading() {
                 warn!("shutdown during startup; snapshot not written");
             } else {
-                // Encode while holding SNAPSHOT_LOCK, then release it before
-                // the write: the fixed temp path requires concurrent writers
-                // to serialize around the encode (issue 54), but holding the
-                // lock across `write_atomic`'s temp write, two `fsync`s, and
-                // rename would stall a concurrent evictor for the duration of
-                // the shutdown I/O (issue 122). This matches `run_snapshot`'s
-                // lock scope; the state write lock inside `index.encode()`
-                // covers only the encode.
-                let bytes;
+                // Encode under SNAPSHOT_LOCK (snapshot lock before the state
+                // lock, as `evict()` does), then release it. Capture the
+                // generation inside the lock so an event between encode and
+                // publication discards the stale bytes instead of hiding a
+                // newer image behind a checksum-valid write (issue 133).
+                // `write_snapshot_if_current` re-acquires the lock and
+                // re-checks immediately before writing.
+                let (bytes, generation);
                 {
                     let _guard = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-                    bytes = index.encode();
+                    (bytes, generation) = index.encode_with_generation();
                 }
-                match snapshot::write_atomic(&bytes, path) {
-                    Ok(()) => info!(path = %path.display(), "snapshot written"),
+                match index.write_snapshot_if_current(&bytes, generation, path) {
+                    Ok(true) => info!(path = %path.display(), "snapshot written"),
+                    Ok(false) => debug!("skipping stale shutdown snapshot; the index changed"),
                     Err(e) => error!(error = %e, "snapshot save failed"),
                 }
                 drop(bytes);

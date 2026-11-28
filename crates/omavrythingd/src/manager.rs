@@ -8,7 +8,8 @@
 //! again when idle.
 
 use std::fs::File;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
@@ -20,6 +21,7 @@ use omavrything_core::index::{
 use omavrything_core::live::{self, FsEvent};
 use omavrything_core::scan::ScanConfig;
 use omavrything_core::snapshot::{self, RootIdentity, SectionMap};
+use tracing::warn;
 
 use crate::SNAPSHOT_LOCK;
 
@@ -263,12 +265,22 @@ impl IndexManager {
     /// which are user activity. User-driven callers must call [`touch`] at
     /// their entry point.
     pub fn with_index_mut<R>(&self, f: impl FnOnce(&mut Index) -> R) -> R {
+        self.with_index_mut_generation(f).0
+    }
+
+    /// As [`Self::with_index_mut`], but also return the generation after `f`.
+    ///
+    /// The generation is read while the state write lock is still held, so an
+    /// event cannot land between the mutation and the read and make bytes that
+    /// omit it look current (issue 133). Snapshot writers use this to pair
+    /// encoded bytes with the generation they must re-check before publishing.
+    pub fn with_index_mut_generation<R>(&self, f: impl FnOnce(&mut Index) -> R) -> (R, u64) {
         let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
         if matches!(&*state, State::Image { .. }) {
             let owned = self.materialize(&state);
             *state = State::Owned(Box::new(owned));
         }
-        match &mut *state {
+        let result = match &mut *state {
             State::Owned(index) => {
                 let result = f(index);
                 // The index may have changed under `f`; a concurrent
@@ -277,18 +289,33 @@ impl IndexManager {
                 result
             }
             State::Image { .. } => unreachable!("materialized above"),
-        }
+        };
+        let generation = self.mutations.load(Ordering::Relaxed);
+        (result, generation)
     }
 
     /// Build an owned index from the evicted image, folding the delta in.
+    ///
+    /// The layout was validated at eviction, but the mapping is a file another
+    /// process (or bit rot) can corrupt afterwards. A failed re-parse must not
+    /// panic the daemon: recover from the snapshot file's `.prev` fallback, or
+    /// start from an empty index while keeping the pending delta (issue 129).
     fn materialize(&self, state: &State) -> Index {
         let State::Image { mmap, sections, .. } = state else {
             unreachable!("materialize called on an owned index");
         };
         // The checksum was verified when `sections` was built at eviction;
         // re-parse from the cached layout instead of re-hashing (issue 55).
-        let image = sections.image(&mmap[..]).expect("evicted image is valid");
-        let mut index = image.to_index();
+        let mut index = match sections.image(&mmap[..]) {
+            Ok(image) => image.to_index(),
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "evicted snapshot image is corrupt; recovering"
+                );
+                self.recover_evicted_index()
+            }
+        };
         let delta = self.delta.read().unwrap_or_else(|e| e.into_inner());
         index.apply_delta(&delta);
         drop(delta);
@@ -297,6 +324,27 @@ impl IndexManager {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         index
+    }
+
+    /// Last-resort recovery when the evicted mapping can no longer be parsed.
+    /// `snapshot::load` tries the primary file and then its `.prev` copy, so a
+    /// good previous generation is preferred over losing the index entirely.
+    fn recover_evicted_index(&self) -> Index {
+        if let Some(path) = &self.snapshot_path {
+            match snapshot::load(path) {
+                Ok((index, _)) => {
+                    warn!(path = %path.display(), "recovered index from the snapshot fallback");
+                    return index;
+                }
+                Err(err) => warn!(
+                    error = %err,
+                    path = %path.display(),
+                    "snapshot fallback could not be loaded"
+                ),
+            }
+        }
+        warn!("evicted image could not be recovered; starting from an empty index");
+        Index::new()
     }
 
     /// Evict the owned index to a memory-mapped snapshot. Returns whether the
@@ -523,14 +571,35 @@ impl IndexManager {
         }
     }
 
-    /// Encode the current index (folding the delta) into a snapshot byte string.
-    pub fn encode(&self) -> Vec<u8> {
+    /// Publish `bytes` only if no mutation landed after `generation`.
+    ///
+    /// Holds `SNAPSHOT_LOCK` across the write so an eviction cannot interleave
+    /// on the fixed temp path, then re-checks the generation immediately before
+    /// writing. A stale snapshot is checksum-valid but permanently omits the
+    /// newer event, and its `.prev` rename hides the better copy (issue 133), so
+    /// discarding it is the only safe outcome.
+    pub fn write_snapshot_if_current(
+        &self,
+        bytes: &[u8],
+        generation: u64,
+        path: &Path,
+    ) -> io::Result<bool> {
+        let _snapshot_guard = SNAPSHOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if self.mutations.load(Ordering::Relaxed) != generation {
+            return Ok(false);
+        }
+        snapshot::write_atomic(bytes, path)?;
+        Ok(true)
+    }
+
+    /// Encode the snapshot and return it with the generation it reflects.
+    pub fn encode_with_generation(&self) -> (Vec<u8>, u64) {
         let ids = self
             .identities
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        self.with_index_mut(|index| snapshot::encode(index, &ids))
+        self.with_index_mut_generation(|index| snapshot::encode(index, &ids))
     }
 
     /// The root identities.
@@ -562,6 +631,29 @@ mod tests {
         index.insert(Path::new("/home/report.pdf"), false, 10, 1);
         index.insert(Path::new("/home/notes.md"), false, 20, 2);
         index
+    }
+
+    // The snapshot section table layout, mirrored here so the test can corrupt
+    // a record in the mmap the same way bit rot would (parent = out of range).
+    fn set_record_parent(bytes: &mut [u8], record: usize, parent: u32) {
+        const HEADER_FIXED: usize = 20;
+        const SECTION_ENTRY: usize = 24;
+        const SECTION_RECORDS: u32 = 2;
+        const RECORD_BYTES: usize = 20;
+        let count = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+        for i in 0..count {
+            let base = HEADER_FIXED + i * SECTION_ENTRY;
+            let kind = u32::from_le_bytes(bytes[base..base + 4].try_into().unwrap());
+            if kind != SECTION_RECORDS {
+                continue;
+            }
+            let offset =
+                u64::from_le_bytes(bytes[base + 8..base + 16].try_into().unwrap()) as usize;
+            let field = offset + 8 + record * RECORD_BYTES + 8;
+            bytes[field..field + 4].copy_from_slice(&parent.to_le_bytes());
+            return;
+        }
+        panic!("snapshot has no records section");
     }
 
     #[test]
@@ -830,6 +922,84 @@ mod tests {
 
         // A second call is a no-op: the index is already evicted.
         assert!(!manager.evict_if_idle(1));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_corrupt_evicted_image_materializes_without_panicking() {
+        // Issue 129: the checksum was checked at eviction, but the mapped file
+        // can be corrupted afterwards. `expect("evicted image is valid")` used
+        // to panic the daemon thread on the next mutation.
+        let dir = temp_dir("corrupt-evict");
+        let snap = dir.join("index.snapshot");
+        let manager = IndexManager::new(sample(), Vec::new(), Some(snap.clone()));
+        manager.evict();
+        assert!(manager.is_evicted());
+
+        // Break parent links in the mapping without changing the file length.
+        let mut bytes = std::fs::read(&snap).unwrap();
+        set_record_parent(&mut bytes, 1, u32::MAX - 1);
+        set_record_parent(&mut bytes, 2, u32::MAX - 2);
+        std::fs::write(&snap, &bytes).unwrap();
+
+        // The O(1) evicted event path must drop the corrupt record, not panic
+        // while rebuilding its full path (issue 136).
+        let config = ScanConfig::with_roots(vec![PathBuf::from("/")]);
+        manager.apply_event(&FsEvent::Removed(PathBuf::from("/home/notes.md")), &config);
+        assert!(
+            manager.is_evicted(),
+            "a dropped corrupt event leaves the image"
+        );
+
+        // Materialization must also recover instead of panicking (issue 129).
+        let len = manager.with_index_mut(|index| index.len());
+        assert!(!manager.is_evicted(), "the bad image must be dropped");
+        assert!(
+            len <= 3,
+            "recovery may be empty or from .prev, never larger"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_snapshot_bytes_are_not_published() {
+        // Issue 133: an event between encode and write used to be lost in a
+        // checksum-valid snapshot, whose .prev rename also hid the better copy.
+        let dir = temp_dir("stale-snapshot");
+        let snap = dir.join("index.snapshot");
+        let manager = IndexManager::new(sample(), Vec::new(), Some(snap.clone()));
+
+        let ids = manager.identities();
+        let (stale, generation) =
+            manager.with_index_mut_generation(|index| snapshot::encode(index, &ids));
+
+        // A mutation lands after the encode.
+        let config = ScanConfig::with_roots(vec![PathBuf::from("/")]);
+        assert!(manager.apply_event(&FsEvent::Removed(PathBuf::from("/home/notes.md")), &config));
+
+        assert!(
+            !manager
+                .write_snapshot_if_current(&stale, generation, &snap)
+                .unwrap(),
+            "stale bytes must be discarded"
+        );
+        assert!(
+            snapshot::load(&snap).is_err(),
+            "no snapshot should have been published"
+        );
+
+        // A fresh encode with the current generation is published normally.
+        let ids = manager.identities();
+        let (fresh, generation) =
+            manager.with_index_mut_generation(|index| snapshot::encode(index, &ids));
+        assert!(
+            manager
+                .write_snapshot_if_current(&fresh, generation, &snap)
+                .unwrap()
+        );
+        assert!(snapshot::load(&snap).is_ok());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

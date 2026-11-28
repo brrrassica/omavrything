@@ -254,11 +254,22 @@ impl PathIndex {
         let key = key.as_ref();
         let h = fnv1a32(key);
         if let Some(&idx) = self.main.get(&h) {
-            if record_path_eq(&records[idx as usize], records, paths, key) {
+            if records
+                .get(idx as usize)
+                .is_some_and(|rec| record_path_eq(rec, records, paths, key))
+            {
                 return Some(idx);
             }
         }
-        self.collisions.get(key).copied()
+        if let Some(&idx) = self.collisions.get(key) {
+            if records
+                .get(idx as usize)
+                .is_some_and(|rec| record_path_eq(rec, records, paths, key))
+            {
+                return Some(idx);
+            }
+        }
+        None
     }
 
     /// Build the map from a record/path arena (e.g. a snapshot image).
@@ -274,7 +285,11 @@ impl PathIndex {
                 continue;
             }
             buf.clear();
-            write_full_path_bytes(rec, records, paths, &mut buf);
+            if !write_full_path_bytes(rec, records, paths, &mut buf) {
+                // A corrupted evicted image: skip the record rather than
+                // indexing a partial path (issue 136).
+                continue;
+            }
             map.insert_bytes(&buf, i as u32, records, paths);
         }
         map
@@ -294,7 +309,9 @@ impl PathIndex {
     fn insert_bytes(&mut self, key: &[u8], idx: u32, records: &[FileRecord], paths: &[u8]) {
         let h = fnv1a32(key);
         let collides = self.main.get(&h).copied().is_some_and(|existing| {
-            !record_path_eq(&records[existing as usize], records, paths, key)
+            !records
+                .get(existing as usize)
+                .is_some_and(|rec| record_path_eq(rec, records, paths, key))
         });
         if collides {
             self.collisions.insert(key.to_vec(), idx);
@@ -309,7 +326,10 @@ impl PathIndex {
         let key = key.as_ref();
         let h = fnv1a32(key);
         if let Some(&idx) = self.main.get(&h) {
-            if record_path_eq(&records[idx as usize], records, paths, key) {
+            if records
+                .get(idx as usize)
+                .is_some_and(|rec| record_path_eq(rec, records, paths, key))
+            {
                 self.main.remove(&h);
                 return;
             }
@@ -490,6 +510,9 @@ impl SubtreeIndex {
         // record forever, doubling one Vec<u32> until it eats all memory.
         let push_budget = records.len().saturating_sub(cursor);
         let mut pushed = 0usize;
+        if records.get(root as usize).is_none() {
+            return;
+        }
         out.push(root);
         while cursor < out.len() {
             let dir = out[cursor];
@@ -507,7 +530,10 @@ impl SubtreeIndex {
                 if hops > records.len() {
                     break;
                 }
-                if records[child as usize].parent == dir {
+                if records
+                    .get(child as usize)
+                    .is_some_and(|rec| rec.parent == dir)
+                {
                     out.push(child);
                     pushed += 1;
                     if pushed > push_budget {
@@ -548,12 +574,18 @@ impl SubtreeIndex {
             if Some(i) == root {
                 continue;
             }
-            let rec = &records[i as usize];
+            let Some(rec) = records.get(i as usize) else {
+                continue;
+            };
             if rec.is_deleted() {
                 continue;
             }
             buf.clear();
-            write_full_path_bytes(rec, records, paths, &mut buf);
+            if !write_full_path_bytes(rec, records, paths, &mut buf) {
+                // Corrupt path range in an evicted image: drop this orphan
+                // instead of matching a partial path (issue 136).
+                continue;
+            }
             if buf == key || buf.starts_with(prefix) {
                 self.collect_subtree(records, i, out);
             }
@@ -680,60 +712,98 @@ fn stores_full_path(rec: &FileRecord) -> bool {
 /// The stored bytes of a record: the full path for directories and parentless
 /// records, the basename for files with a parent.
 fn stored_bytes<'a>(rec: &FileRecord, paths: &'a [u8]) -> &'a [u8] {
-    let start = rec.path_off as usize;
-    &paths[start..start + rec.path_len as usize]
+    stored_bytes_checked(rec, paths).unwrap_or(&[])
 }
 
-/// Write a record's full path into `out`.
+/// A range-checked form of [`stored_bytes`].
+///
+/// The evicted fast path borrows records directly from the mmap without
+/// re-validating them (issue 55). If the file is corrupted after the eviction
+/// check, `path_off`/`path_len` can be out of range; an empty slice is the
+/// sentinel callers use to drop that record instead of panicking the indexing
+/// thread.
+fn stored_bytes_checked<'a>(rec: &FileRecord, paths: &'a [u8]) -> Option<&'a [u8]> {
+    let end = (rec.path_off as usize).checked_add(rec.path_len as usize)?;
+    paths.get(rec.path_off as usize..end)
+}
+
+/// Write a record's full path into `out`. Returns `false` (leaving `out`
+/// untouched) when the record references an out-of-range parent or path range.
 pub(crate) fn write_full_path_bytes(
     rec: &FileRecord,
     records: &[FileRecord],
     paths: &[u8],
     out: &mut Vec<u8>,
-) {
+) -> bool {
     if stores_full_path(rec) {
-        out.extend_from_slice(stored_bytes(rec, paths));
+        let Some(path) = stored_bytes_checked(rec, paths) else {
+            return false;
+        };
+        out.extend_from_slice(path);
     } else {
-        let parent = &records[rec.parent as usize];
-        let p = stored_bytes(parent, paths);
+        let Some(parent) = records.get(rec.parent as usize) else {
+            return false;
+        };
+        let (Some(p), Some(name)) = (
+            stored_bytes_checked(parent, paths),
+            stored_bytes_checked(rec, paths),
+        ) else {
+            return false;
+        };
         out.extend_from_slice(p);
         // The filesystem root "/" already ends with a separator.
         if !p.ends_with(b"/") {
             out.push(b'/');
         }
-        out.extend_from_slice(stored_bytes(rec, paths));
+        out.extend_from_slice(name);
     }
+    true
 }
 
 /// Whether `rec`'s full path equals `key` byte-for-byte.
 fn record_path_eq(rec: &FileRecord, records: &[FileRecord], paths: &[u8], key: &[u8]) -> bool {
     let mut buf = Vec::new();
-    write_full_path_bytes(rec, records, paths, &mut buf);
-    buf == key
+    write_full_path_bytes(rec, records, paths, &mut buf) && buf == key
 }
 
 /// Whether `rec`'s lossy-decoded full path equals `key`.
 #[allow(dead_code)]
 fn record_path_eq_lossy(rec: &FileRecord, records: &[FileRecord], paths: &[u8], key: &str) -> bool {
     let mut buf = String::new();
-    write_full_path_lossy(rec, records, paths, &mut buf);
-    buf == key
+    write_full_path_lossy(rec, records, paths, &mut buf) && buf == key
 }
 
-/// Write a record's lossy-decoded full path into `out`.
+/// Write a record's lossy-decoded full path into `out`. Returns `false` when the
+/// record's parent or path range is corrupt.
 #[allow(dead_code)]
-fn write_full_path_lossy(rec: &FileRecord, records: &[FileRecord], paths: &[u8], out: &mut String) {
+fn write_full_path_lossy(
+    rec: &FileRecord,
+    records: &[FileRecord],
+    paths: &[u8],
+    out: &mut String,
+) -> bool {
     if stores_full_path(rec) {
-        out.push_str(&String::from_utf8_lossy(stored_bytes(rec, paths)));
+        let Some(path) = stored_bytes_checked(rec, paths) else {
+            return false;
+        };
+        out.push_str(&String::from_utf8_lossy(path));
     } else {
-        let parent = &records[rec.parent as usize];
-        let p = String::from_utf8_lossy(stored_bytes(parent, paths));
-        out.push_str(&p);
-        if !p.ends_with('/') {
+        let Some(parent) = records.get(rec.parent as usize) else {
+            return false;
+        };
+        let (Some(p), Some(name)) = (
+            stored_bytes_checked(parent, paths),
+            stored_bytes_checked(rec, paths),
+        ) else {
+            return false;
+        };
+        out.push_str(&String::from_utf8_lossy(p));
+        if !p.ends_with(b"/") {
             out.push('/');
         }
-        out.push_str(&String::from_utf8_lossy(stored_bytes(rec, paths)));
+        out.push_str(&String::from_utf8_lossy(name));
     }
+    true
 }
 
 /// The basename bytes of a record, derived from its stored bytes.
@@ -2952,6 +3022,48 @@ mod tests {
         // path_len (2) + depth (1) + flags (1). The basename is derived from the
         // path, so no name offset/length is stored.
         assert_eq!(std::mem::size_of::<FileRecord>(), 20);
+    }
+
+    #[test]
+    fn corrupt_evicted_records_do_not_panic_path_resolution() {
+        // Issue 136: `SectionMap::view` borrows records from the mmap without
+        // re-validating them. If those bytes are corrupted after eviction, an
+        // event must be dropped, not panic the indexing thread.
+        let rec = |parent, path_off, path_len, flags| FileRecord {
+            size: 0,
+            mtime: 0,
+            parent,
+            path_off,
+            path_len,
+            depth: 1,
+            flags,
+        };
+        let records = [
+            rec(u32::MAX, 0, 1, FLAG_DIR), // "/"
+            rec(99, 0, 1, 0),              // parent out of range
+            rec(0, u32::MAX, 9, 0),        // path offset beyond the arena
+            rec(0, 64, 9, 0),              // path range beyond the arena
+        ];
+        let paths = b"/";
+
+        // Building the resident path map skips corrupt records.
+        let by_path = PathIndex::build(&records, paths);
+        assert!(by_path.get(b"/x", &records, paths).is_none());
+
+        // Subtree collection still finds the valid root but never links a
+        // record whose parent is out of range.
+        let subtree = SubtreeIndex::build_image(&records);
+        let mut descendants = Vec::new();
+        subtree.collect_under_path(&records, paths, None, b"/", b"/", &mut descendants);
+        assert!(descendants.contains(&0));
+        assert!(!descendants.contains(&1));
+
+        // Direct path writes report failure without leaving a partial path.
+        for bad in [&records[1], &records[2], &records[3]] {
+            let mut buf = Vec::new();
+            assert!(!write_full_path_bytes(bad, &records, paths, &mut buf));
+            assert!(buf.is_empty());
+        }
     }
 
     #[test]
